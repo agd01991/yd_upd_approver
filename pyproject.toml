@@ -1,0 +1,42 @@
+[project]
+name = "yd-upd-approver"
+version = "0.1.0"
+description = "Telegram approval bot for administrator-owned Yandex Disk uploads"
+requires-python = ">=3.12"
+dependencies = [
+  "aiogram>=3.7,<4",
+  "SQLAlchemy[asyncio]>=2.0,<3",
+  "asyncpg>=0.29,<1",
+  "alembic>=1.13,<2",
+  "httpx>=0.27,<1",
+  "pydantic-settings>=2.2,<3",
+  "python-dotenv>=1.0,<2",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8,<9",
+  "pytest-asyncio>=0.23,<1",
+  "ruff>=0.5,<1",
+]
+
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "ASYNC", "S"]
+ignore = ["S101", "E501", "ASYNC230", "ASYNC240"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**/*.py" = ["S105", "S106"]
+"alembic/**/*.py" = ["S608"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+pythonpath = ["."]
