@@ -1,4 +1,5 @@
 from datetime import UTC, datetime
+from pathlib import Path
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -11,8 +12,16 @@ from app.services.yandex_disk import ConflictError, YandexDiskClient
 async def upload_approved_request(
     session: AsyncSession, request: UploadRequest, client: YandexDiskClient, overwrite: bool = False
 ) -> None:
-    require_transition(request.status, UploadStatus.uploading)
+    if request.status != UploadStatus.approved:
+        require_transition(request.status, UploadStatus.uploading)
+    if not request.local_path or not Path(request.local_path).exists():
+        request.status = UploadStatus.failed
+        request.error_message = "Temporary file not found. User must upload the file again."
+        await session.flush()
+        return
+
     request.status = UploadStatus.uploading
+    request.error_message = None
     await session.flush()
     try:
         await client.mkdir_recursive(request.target_folder)

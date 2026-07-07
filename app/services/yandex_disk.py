@@ -56,6 +56,8 @@ class YandexDiskClient:
         response = await self.client.get(
             API, params={"path": path, "limit": limit}, headers=self.headers
         )
+        if response.status_code == 404:
+            raise FileNotFoundError(path)
         response.raise_for_status()
         return response.json().get("_embedded", {}).get("items", [])
 

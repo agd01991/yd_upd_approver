@@ -2,7 +2,7 @@ import logging
 import re
 
 TOKEN_PATTERNS = [
-    re.compile(r"(Authorization:\s*Bearer\s+)[^\s]+", re.I),
+    re.compile(r"(Authorization[\'\"]?\s*:?\s*[\'\"]?(?:Bearer|OAuth)\s+)[^\'\"\s,}]+", re.I),
     re.compile(r"\d{8,}:[\w-]+"),
 ]
 
