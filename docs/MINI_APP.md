@@ -56,3 +56,9 @@ Security notes for local testing:
 - Protected temp-file downloads are performed by `fetch` with the `X-Telegram-Init-Data` header; no bot token or Yandex token is exposed to the frontend.
 - The regular `/api/uploads` response does not expose the administrator's internal Yandex Disk `target_path`.
 - Admin folder changes are selected from `/api/admin/uploads/{request_id}/allowed-folders` and are still validated server-side against `user.allowed_folders`.
+
+## Yandex Disk root setting
+
+Mini App admin approval uses the runtime Yandex Disk root stored in the database. If the setting has not been changed yet, the backend falls back to `YANDEX_DISK_ROOT` from `.env`.
+
+Admins configure the root through the Telegram bot: `/diskroot` shows the current value and `/setdiskroot disk:/Telegram Uploads` changes it after validation and successful Yandex Disk folder creation. The change affects only newly approved users; existing users remain in their previously assigned folders. The Yandex OAuth token is not exposed to the Mini App frontend.

@@ -1,3 +1,4 @@
+import json
 from collections.abc import Iterable
 from functools import lru_cache
 from pathlib import Path
@@ -34,6 +35,8 @@ class Settings(BaseSettings):
         if isinstance(value, str):
             if not value:
                 return []
+            if value.strip().startswith("["):
+                return [int(v) for v in json.loads(value)]
             return [int(part.strip()) for part in value.split(",") if part.strip()]
         if not value:
             return []
@@ -50,6 +53,8 @@ class Settings(BaseSettings):
         if isinstance(value, str):
             if not value:
                 return []
+            if value.strip().startswith("["):
+                return [str(part).strip() for part in json.loads(value) if str(part).strip()]
             return [part.strip() for part in value.split(",") if part.strip()]
         if not value:
             return []
