@@ -19,6 +19,7 @@ from app.bot.keyboards import (
 from app.config import Settings
 from app.db.models import AuditLog, UploadRequest, UploadStatus, User, UserStatus
 from app.db.repositories import approve_user, pending_requests
+from app.services.app_settings import get_yandex_disk_root
 from app.services.audit import write_audit
 from app.services.naming import join_disk_path, sanitize_filename
 from app.services.yandex_disk import YandexDiskClient, YandexDiskError
@@ -125,7 +126,13 @@ async def user_callback(
         return
     old_status = user.status.value
     if callback_data.action == "approve":
-        await approve_user(session, user, callback.from_user.id, settings.yandex_disk_root)
+        if user.status != UserStatus.pending:
+            await callback.answer(
+                f"Пользователь уже обработан: {user.status.value}", show_alert=True
+            )
+            return
+        disk_root = await get_yandex_disk_root(session, settings)
+        await approve_user(session, user, callback.from_user.id, disk_root)
         client = YandexDiskClient(settings.yandex_disk_token)
         try:
             await client.mkdir_recursive(user.root_folder)

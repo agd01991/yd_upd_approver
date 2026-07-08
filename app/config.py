@@ -5,6 +5,8 @@ from pathlib import Path
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from app.services.disk_paths import validate_yandex_disk_root
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
@@ -36,6 +38,11 @@ class Settings(BaseSettings):
         if not value:
             return []
         return [int(v) for v in value]
+
+    @field_validator("yandex_disk_root")
+    @classmethod
+    def validate_disk_root(cls, value: str) -> str:
+        return validate_yandex_disk_root(value)
 
     @field_validator("cors_origins", mode="before")
     @classmethod
