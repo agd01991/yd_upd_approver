@@ -7,6 +7,13 @@ import httpx
 from app.services.naming import copy_filename, join_disk_path
 
 API = "https://cloud-api.yandex.net/v1/disk/resources"
+CHUNK_SIZE = 1024 * 1024
+
+
+async def _iter_file(path: Path) -> AsyncIterator[bytes]:
+    with path.open("rb") as file:
+        while chunk := file.read(CHUNK_SIZE):
+            yield chunk
 
 
 class YandexDiskError(RuntimeError):
@@ -115,7 +122,7 @@ class YandexDiskClient:
     async def upload_file(self, local_path: str, target_path: str, overwrite: bool = False) -> None:
         upload_url = await self.get_upload_url(target_path, overwrite=overwrite)
         try:
-            response = await self.client.put(upload_url, content=self._file_chunks(local_path))
+            response = await self.client.put(upload_url, content=_iter_file(Path(local_path)))
         except httpx.TimeoutException as exc:
             raise YandexNetworkError("Yandex Disk upload timed out") from exc
         except httpx.NetworkError as exc:
