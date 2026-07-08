@@ -20,6 +20,7 @@ class Settings(BaseSettings):
     max_file_size_mb: int = 20
     allow_user_downloads: bool = False
     allow_user_folder_selection: bool = True
+    rejected_retention_days: int = 7
 
     @field_validator("telegram_admin_ids", mode="before")
     @classmethod

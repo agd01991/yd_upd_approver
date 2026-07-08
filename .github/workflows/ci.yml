@@ -1,0 +1,74 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - master
+      - codex/-telegram-axakw6
+      - codex/fix-ci-issues-in-pr-#4
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: bot
+          POSTGRES_USER: bot
+          POSTGRES_PASSWORD: bot
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U bot -d bot"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      DATABASE_URL: postgresql+asyncpg://bot:bot@localhost:5432/bot
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip setuptools wheel
+          pip install -e ".[dev]"
+
+      - name: Format check
+        run: ruff format --check .
+
+      - name: Lint
+        run: ruff check .
+
+      - name: Check database connection
+        run: |
+          python - <<'PY'
+          import asyncio
+          import os
+          import sqlalchemy as sa
+          from sqlalchemy.ext.asyncio import create_async_engine
+
+          async def main():
+              url = os.environ["DATABASE_URL"]
+              engine = create_async_engine(url)
+              async with engine.connect() as conn:
+                  result = await conn.execute(sa.text("select 1"))
+                  print("DB OK:", result.scalar())
+              await engine.dispose()
+
+          asyncio.run(main())
+          PY
+
+      - name: Migrations
+        run: alembic upgrade head
+
+      - name: Tests
+        run: pytest

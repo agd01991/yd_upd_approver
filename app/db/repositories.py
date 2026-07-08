@@ -1,6 +1,7 @@
 from datetime import UTC, datetime
+from secrets import token_hex
 
-from sqlalchemy import func, select
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.models import UploadRequest, UploadStatus, User, UserStatus
@@ -28,8 +29,15 @@ async def get_or_create_user(
 
 
 async def next_request_code(session: AsyncSession) -> str:
-    max_id = await session.scalar(select(func.max(UploadRequest.id)))
-    return f"REQ-{(max_id or 0) + 1:06d}"
+    for _ in range(10):
+        candidate = f"REQ-{datetime.now(UTC):%Y%m%d}-{token_hex(4).upper()}"
+        exists = await session.scalar(
+            select(UploadRequest.id).where(UploadRequest.request_code == candidate)
+        )
+        if not exists:
+            return candidate
+    msg = "Could not generate unique request code"
+    raise RuntimeError(msg)
 
 
 async def approve_user(session: AsyncSession, user: User, admin_id: int, disk_root: str) -> User:

@@ -39,7 +39,7 @@ class FakeSession:
         self.committed = True
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_document_upload_active_user_downloads_and_notifies_admin(
     monkeypatch, tmp_path
 ) -> None:
@@ -87,7 +87,7 @@ async def test_document_upload_active_user_downloads_and_notifies_admin(
     assert bot.messages[0][2] is not None
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 @pytest.mark.parametrize("status", [UserStatus.pending, UserStatus.blocked, UserStatus.rejected])
 async def test_document_upload_denies_not_active(monkeypatch, tmp_path, status) -> None:  # noqa: ANN001
     async def fake_get_user(session, telegram_id):  # noqa: ANN001

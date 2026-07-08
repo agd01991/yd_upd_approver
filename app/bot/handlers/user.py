@@ -3,8 +3,10 @@ from aiogram.filters import Command
 from aiogram.types import Message
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.config import Settings
 from app.db.repositories import get_user_by_tg, list_user_requests
-from app.services.yandex_disk import YandexDiskClient
+from app.services.yandex_disk import YandexDiskClient, YandexDiskError
+from app.utils.formatting import format_folder_items
 
 router = Router()
 
@@ -34,15 +36,21 @@ async def status(message: Message, session: AsyncSession) -> None:
 
 
 @router.message(Command("myfiles"))
-async def myfiles(
-    message: Message, session: AsyncSession, yandex_client: YandexDiskClient | None = None
-) -> None:
+async def myfiles(message: Message, session: AsyncSession, settings: Settings) -> None:
     user = await get_user_by_tg(session, message.from_user.id)
     if not user or not user.root_folder:
         await message.answer("Папка ещё не назначена")
         return
-    if not yandex_client:
-        await message.answer(f"Ваша папка: {user.root_folder}")
-        return
-    files = await yandex_client.list_files(user.root_folder)
-    await message.answer("\n".join(item.get("name", "?") for item in files) or "Папка пуста")
+    client = YandexDiskClient(settings.yandex_disk_token)
+    try:
+        try:
+            files = await client.list_files(user.root_folder)
+        except FileNotFoundError:
+            await message.answer("Папка ещё не создана")
+            return
+        except YandexDiskError as exc:
+            await message.answer(f"Не удалось получить список файлов: {exc}")
+            return
+    finally:
+        await client.close()
+    await message.answer(format_folder_items(user.root_folder, files))
