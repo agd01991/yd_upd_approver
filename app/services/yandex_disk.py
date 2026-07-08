@@ -113,6 +113,12 @@ class YandexDiskClient:
         self._raise_for_status(response, path)
         return response.json()["href"]
 
+    @staticmethod
+    async def _file_chunks(local_path: str, chunk_size: int = 1024 * 1024) -> AsyncIterator[bytes]:
+        with Path(local_path).open("rb") as file:
+            while chunk := file.read(chunk_size):
+                yield chunk
+
     async def upload_file(self, local_path: str, target_path: str, overwrite: bool = False) -> None:
         upload_url = await self.get_upload_url(target_path, overwrite=overwrite)
         try:

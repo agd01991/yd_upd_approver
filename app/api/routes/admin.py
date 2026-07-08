@@ -7,7 +7,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import admin_user_dep, bot_dep, get_db, settings_dep
-from app.api.schemas import RejectBody, UploadPatch
+from app.api.schemas import AllowedFoldersResponse, RejectBody, UploadPatch
 from app.api.security import TelegramWebAppUser
 from app.config import Settings
 from app.db.models import AuditLog, UploadRequest, UploadStatus, User, UserStatus
@@ -50,6 +50,10 @@ def req_json(r: UploadRequest, user: User | None = None) -> dict:
         "created_at": r.created_at,
         "uploaded_at": r.uploaded_at,
     }
+
+
+def _folder_label(path: str) -> str:
+    return path.rstrip("/").rsplit("/", 1)[-1] or path
 
 
 @router.get("/users")
@@ -135,6 +139,17 @@ async def download_temp(request_id: int, session: AsyncSession = Depends(get_db)
     if not r or not r.local_path or not Path(r.local_path).exists():
         raise HTTPException(404, "Temp file not found")
     return FileResponse(r.local_path, filename=r.safe_filename)
+
+
+@router.get("/uploads/{request_id}/allowed-folders", response_model=AllowedFoldersResponse)
+async def allowed_folders(request_id: int, session: AsyncSession = Depends(get_db)) -> dict:
+    r = await session.get(UploadRequest, request_id)
+    user = await session.get(User, r.user_id) if r else None
+    if not r or not user:
+        raise HTTPException(404, "Request not found")
+    return {
+        "items": [{"path": path, "label": _folder_label(path)} for path in user.allowed_folders]
+    }
 
 
 @router.get("/uploads/{request_id}/folder-items")

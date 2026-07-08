@@ -18,6 +18,7 @@ Every frontend request sends `X-Telegram-Init-Data` from `window.Telegram.WebApp
 - `POST /api/admin/users/{user_id}/approve|reject|block`
 - `GET /api/admin/uploads`, `GET /api/admin/uploads/{request_id}`
 - `GET /api/admin/uploads/{request_id}/download-temp`
+- `GET /api/admin/uploads/{request_id}/allowed-folders`
 - `GET /api/admin/uploads/{request_id}/folder-items`
 - `POST /api/admin/uploads/{request_id}/approve|copy|overwrite|retry|reject`
 - `PATCH /api/admin/uploads/{request_id}`
@@ -38,3 +39,20 @@ Deploy the API behind HTTPS, set `WEBAPP_URL`, keep `CORS_ORIGINS` restricted to
 ## Limitations
 
 The vanilla UI is intentionally lightweight. Richer batch actions and folder browsing can be improved later without changing the security model.
+
+
+## Local verification
+
+Check the backend health endpoint:
+
+```bash
+curl http://localhost:8000/health
+```
+
+To test the Mini App locally, run the API, publish it through `ngrok` or `cloudflared`, and configure Telegram with a `WEBAPP_URL` that points to the public `/app` URL. Open the Mini App from Telegram so requests include signed WebApp `initData`.
+
+Security notes for local testing:
+
+- Protected temp-file downloads are performed by `fetch` with the `X-Telegram-Init-Data` header; no bot token or Yandex token is exposed to the frontend.
+- The regular `/api/uploads` response does not expose the administrator's internal Yandex Disk `target_path`.
+- Admin folder changes are selected from `/api/admin/uploads/{request_id}/allowed-folders` and are still validated server-side against `user.allowed_folders`.
