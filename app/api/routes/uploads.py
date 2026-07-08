@@ -25,7 +25,6 @@ def upload_json(upload) -> dict:
             "size_bytes",
             "sha256",
             "caption",
-            "target_path",
             "error_message",
             "reject_reason",
             "created_at",

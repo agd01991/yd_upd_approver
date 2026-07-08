@@ -13,6 +13,7 @@ async def test_yandex_client_upload_and_list(tmp_path) -> None:
         if str(request.url).startswith("https://cloud-api.yandex.net/v1/disk/resources/upload"):
             return httpx.Response(200, json={"href": "https://upload.example/put"})
         if str(request.url).startswith("https://upload.example/put"):
+            assert request.stream is not None
             return httpx.Response(201)
         if request.method == "GET":
             return httpx.Response(200, json={"_embedded": {"items": [{"name": "a.txt"}]}})
