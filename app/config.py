@@ -21,6 +21,9 @@ class Settings(BaseSettings):
     allow_user_downloads: bool = False
     allow_user_folder_selection: bool = True
     rejected_retention_days: int = 7
+    webapp_url: str = ""
+    webapp_auth_max_age_seconds: int = 86400
+    cors_origins: list[str] = Field(default_factory=list)
 
     @field_validator("telegram_admin_ids", mode="before")
     @classmethod
@@ -30,6 +33,15 @@ class Settings(BaseSettings):
         if not value:
             return []
         return [int(part.strip()) for part in value.split(",") if part.strip()]
+
+    @field_validator("cors_origins", mode="before")
+    @classmethod
+    def parse_cors_origins(cls, value: str | list[str]) -> list[str]:
+        if isinstance(value, list):
+            return value
+        if not value:
+            return []
+        return [part.strip() for part in value.split(",") if part.strip()]
 
     @property
     def max_file_size_bytes(self) -> int:

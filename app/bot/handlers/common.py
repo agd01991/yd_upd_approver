@@ -1,6 +1,6 @@
 from aiogram import Bot, Router
 from aiogram.filters import Command
-from aiogram.types import Message
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, Message, WebAppInfo
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.bot.keyboards import user_moderation_keyboard
@@ -10,6 +10,20 @@ from app.db.repositories import get_or_create_user
 from app.utils.formatting import format_user_card
 
 router = Router()
+
+
+def webapp_keyboard(settings: Settings) -> InlineKeyboardMarkup | None:
+    if not settings.webapp_url:
+        return None
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="Открыть приложение", web_app=WebAppInfo(url=settings.webapp_url)
+                )
+            ]
+        ]
+    )
 
 
 @router.message(Command("start"))
@@ -23,7 +37,9 @@ async def start(message: Message, bot: Bot, session: AsyncSession, settings: Set
     await session.commit()
 
     if user.status == UserStatus.active:
-        await message.answer("Вы уже одобрены. Можете отправлять файлы.")
+        await message.answer(
+            "Вы уже одобрены. Можете отправлять файлы.", reply_markup=webapp_keyboard(settings)
+        )
         return
     if user.status == UserStatus.blocked:
         await message.answer("Ваш доступ заблокирован. Обратитесь к администратору.")
@@ -39,7 +55,18 @@ async def start(message: Message, bot: Bot, session: AsyncSession, settings: Set
                 format_user_card(user),
                 reply_markup=user_moderation_keyboard(user.id),
             )
-    await message.answer("Вы зарегистрированы. Дождитесь одобрения администратора.")
+    await message.answer(
+        "Вы зарегистрированы. Дождитесь одобрения администратора.",
+        reply_markup=webapp_keyboard(settings),
+    )
+
+
+@router.message(Command("app"))
+async def app_cmd(message: Message, settings: Settings) -> None:
+    if not settings.webapp_url:
+        await message.answer("Mini App URL не настроен.")
+        return
+    await message.answer("Откройте Mini App:", reply_markup=webapp_keyboard(settings))
 
 
 @router.message(Command("help"))

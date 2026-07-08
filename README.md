@@ -135,3 +135,45 @@ python -m app.scripts.cleanup_temp
 ## Ручная проверка
 
 Подробный чеклист первого запуска и ручного QA находится в `docs/MANUAL_QA.md`.
+
+## Telegram Mini App
+
+The project now includes a Telegram Mini App: FastAPI serves `/api/*` and the static mobile-first frontend from `app/webapp`. Users can open the app in Telegram, see their status, upload files, view requests, and list files from their assigned Yandex Disk folder. Administrators can moderate users, review upload requests, approve/copy/overwrite/retry/reject uploads, edit target filename/folder, and inspect the audit log.
+
+### Configuration
+
+Add the Mini App settings to `.env`:
+
+```env
+WEBAPP_URL=https://your-public-url
+WEBAPP_AUTH_MAX_AGE_SECONDS=86400
+CORS_ORIGINS=https://your-public-url
+```
+
+`WEBAPP_URL` must be a public HTTPS URL for Telegram. For local development, run the API locally and expose it with an HTTPS tunnel such as:
+
+```bash
+ngrok http 8000
+```
+
+or any equivalent cloudflared/ngrok-style tunnel, then put the public URL into `WEBAPP_URL`.
+
+### Running
+
+```bash
+docker compose up --build
+```
+
+The API is available at `http://localhost:8000/` for a local browser smoke test. Inside Telegram, use `/app` to receive an “Открыть приложение” WebApp button when `WEBAPP_URL` is configured. You can also configure a persistent Mini App/Menu Button manually in BotFather.
+
+### Manual scenario
+
+1. Open the Mini App or send `/start`.
+2. A new user appears as `pending`.
+3. An admin approves the user.
+4. The active user uploads a file through the Mini App.
+5. The admin approves the request through the Mini App.
+6. The file appears on Yandex Disk.
+7. `/myfiles` and the Mini App files screen show the same assigned-folder contents.
+
+The Mini App validates Telegram `initData`; it does not accept a frontend-provided user ID, does not expose Yandex or Telegram tokens, and does not create public Yandex Disk links.

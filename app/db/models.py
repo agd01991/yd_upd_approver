@@ -16,6 +16,11 @@ class UserStatus(StrEnum):
     blocked = "blocked"
 
 
+class UploadSource(StrEnum):
+    telegram = "telegram"
+    mini_app = "mini_app"
+
+
 class UploadStatus(StrEnum):
     new = "new"
     stored = "stored"
@@ -55,7 +60,10 @@ class UploadRequest(Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     request_code: Mapped[str] = mapped_column(String(32), unique=True, index=True)
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
-    telegram_file_id: Mapped[str] = mapped_column(String(512))
+    source: Mapped[UploadSource] = mapped_column(
+        Enum(UploadSource), default=UploadSource.telegram, index=True
+    )
+    telegram_file_id: Mapped[str | None] = mapped_column(String(512))
     telegram_file_unique_id: Mapped[str | None] = mapped_column(String(512))
     original_filename: Mapped[str] = mapped_column(String(512))
     safe_filename: Mapped[str] = mapped_column(String(512))

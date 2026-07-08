@@ -11,6 +11,9 @@ dependencies = [
   "httpx>=0.27,<1",
   "pydantic-settings>=2.2,<3",
   "python-dotenv>=1.0,<2",
+  "fastapi>=0.111,<1",
+  "uvicorn[standard]>=0.30,<1",
+  "python-multipart>=0.0.9,<1",
 ]
 
 [project.optional-dependencies]
@@ -29,10 +32,11 @@ target-version = "py312"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "ASYNC", "S"]
-ignore = ["S101", "E501", "ASYNC230", "ASYNC240"]
+ignore = ["S101", "E501", "ASYNC230", "ASYNC240", "B008"]
 
 [tool.ruff.lint.per-file-ignores]
 "tests/**/*.py" = ["S105", "S106"]
+"tests/unit/test_mini_app_security.py" = ["E402", "S105"]
 "alembic/**/*.py" = ["S608"]
 
 [tool.pytest.ini_options]
