@@ -5,8 +5,6 @@ on:
   push:
     branches:
       - master
-      - codex/-telegram-axakw6
-      - codex/fix-ci-issues-in-pr-#4
 
 jobs:
   test:

@@ -13,6 +13,7 @@ async def test_yandex_client_upload_and_list(tmp_path) -> None:
         if str(request.url).startswith("https://cloud-api.yandex.net/v1/disk/resources/upload"):
             return httpx.Response(200, json={"href": "https://upload.example/put"})
         if str(request.url).startswith("https://upload.example/put"):
+            assert await request.aread() == b"hello"
             return httpx.Response(201)
         if request.method == "GET":
             return httpx.Response(200, json={"_embedded": {"items": [{"name": "a.txt"}]}})
@@ -25,6 +26,25 @@ async def test_yandex_client_upload_and_list(tmp_path) -> None:
     files = await client.list_files("disk:/root")
     assert files[0]["name"] == "a.txt"
     assert any(method == "PUT" and url == "https://upload.example/put" for method, url in calls)
+
+
+@pytest.mark.anyio
+async def test_yandex_upload_streams_without_read_bytes(tmp_path, monkeypatch) -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if str(request.url).startswith("https://cloud-api.yandex.net/v1/disk/resources/upload"):
+            return httpx.Response(200, json={"href": "https://upload.example/put"})
+        assert await request.aread() == b"streamed"
+        return httpx.Response(201)
+
+    def fail_read_bytes(self):
+        raise AssertionError("upload_file must not read the whole file with Path.read_bytes()")
+
+    monkeypatch.setattr("pathlib.Path.read_bytes", fail_read_bytes)
+    path = tmp_path / "streamed.txt"
+    path.write_bytes(b"streamed")
+    client = YandexDiskClient("token", httpx.AsyncClient(transport=httpx.MockTransport(handler)))
+
+    await client.upload_file(str(path), "disk:/root/streamed.txt")
 
 
 @pytest.mark.anyio

@@ -8,3 +8,12 @@ class UploadPatch(BaseModel):
 
 class RejectBody(BaseModel):
     reason: str = "Отклонено администратором"
+
+
+class AllowedFolder(BaseModel):
+    path: str
+    label: str
+
+
+class AllowedFoldersResponse(BaseModel):
+    items: list[AllowedFolder]
