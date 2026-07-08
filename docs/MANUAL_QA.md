@@ -94,3 +94,14 @@ python -m app.main
 1. Выполните `/audit` админом.
 2. Проверьте последние действия.
 3. Выполните `/audit` обычным пользователем и проверьте отсутствие доступа.
+
+## Runtime Yandex Disk root QA
+
+1. As a non-admin Telegram user, send `/diskroot` and `/setdiskroot disk:/Nope`; the bot must not change settings.
+2. As an admin from `TELEGRAM_ADMIN_IDS`, send `/diskroot`; verify it shows either the admin-defined setting or fallback `.env` value.
+3. Send `/setdiskroot` without arguments; verify the bot asks for `disk:/Telegram Uploads`, then send a valid path such as `disk:/Telegram Uploads/Test`.
+4. Verify the bot creates the folder on Yandex Disk before saving. If Yandex Disk returns an error, the setting must not be saved.
+5. Approve a new user and verify their folder is created inside the new root.
+6. Verify users approved before the change keep their old assigned folders and uploads still use `user.root_folder`.
+
+For Docker `.env`, use `postgres` and `redis` hostnames and JSON arrays for `TELEGRAM_ADMIN_IDS` and `CORS_ORIGINS`. For non-Docker local runs, `localhost` is appropriate for PostgreSQL and Redis.

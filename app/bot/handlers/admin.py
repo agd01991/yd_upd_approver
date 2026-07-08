@@ -44,6 +44,10 @@ class UploadEditStates(StatesGroup):
     waiting_for_custom_reject_reason = State()
 
 
+class AdminSettingsStates(StatesGroup):
+    waiting_for_yandex_disk_root = State()
+
+
 @router.message(Command("admin"))
 async def admin_panel(message: Message, settings: Settings) -> None:
     if not is_admin(message.from_user.id, settings):
