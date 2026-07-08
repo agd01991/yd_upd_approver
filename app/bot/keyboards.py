@@ -46,3 +46,41 @@ def upload_keyboard(request_id: int) -> InlineKeyboardMarkup:
         for t, a in actions
     ]
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def folder_selection_keyboard(request_id: int, folders: list[str]) -> InlineKeyboardMarkup:
+    rows = [
+        [
+            InlineKeyboardButton(
+                text=folder[-60:],
+                callback_data=UploadModerationCallback(
+                    action=f"folder_{index}", request_id=request_id
+                ).pack(),
+            )
+        ]
+        for index, folder in enumerate(folders)
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def reject_reason_keyboard(request_id: int) -> InlineKeyboardMarkup:
+    reasons = [
+        ("Дубликат", "reject_duplicate"),
+        ("Неверный файл", "reject_wrong_file"),
+        ("Плохое качество", "reject_bad_quality"),
+        ("Не та папка", "reject_wrong_folder"),
+        ("Другое", "reject_other"),
+    ]
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text=text,
+                    callback_data=UploadModerationCallback(
+                        action=action, request_id=request_id
+                    ).pack(),
+                )
+            ]
+            for text, action in reasons
+        ]
+    )

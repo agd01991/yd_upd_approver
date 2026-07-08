@@ -40,7 +40,7 @@ def make_request(path: Path):
     )
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_upload_worker_success_deletes_temp(tmp_path) -> None:
     file_path = tmp_path / "a.txt"
     file_path.write_text("hello")
@@ -50,7 +50,7 @@ async def test_upload_worker_success_deletes_temp(tmp_path) -> None:
     assert not file_path.exists()
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_upload_worker_failed_keeps_temp(tmp_path) -> None:
     file_path = tmp_path / "a.txt"
     file_path.write_text("hello")
@@ -61,7 +61,7 @@ async def test_upload_worker_failed_keeps_temp(tmp_path) -> None:
     assert request.error_message == "boom"
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_upload_worker_missing_file_fails(tmp_path) -> None:
     request = make_request(tmp_path / "missing.txt")
     await upload_approved_request(FakeSession(), request, FakeClient())

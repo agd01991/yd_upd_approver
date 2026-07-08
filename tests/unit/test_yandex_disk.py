@@ -4,7 +4,7 @@ import pytest
 from app.services.yandex_disk import ConflictError, YandexDiskClient
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_yandex_client_upload_and_list(tmp_path) -> None:
     calls = []
 
@@ -27,7 +27,7 @@ async def test_yandex_client_upload_and_list(tmp_path) -> None:
     assert any(method == "PUT" and url == "https://upload.example/put" for method, url in calls)
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_yandex_conflict() -> None:
     async def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(409)
@@ -35,3 +35,25 @@ async def test_yandex_conflict() -> None:
     client = YandexDiskClient("token", httpx.AsyncClient(transport=httpx.MockTransport(handler)))
     with pytest.raises(ConflictError):
         await client.get_upload_url("disk:/root/a.txt")
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("status", "expected"),
+    [
+        (401, "YandexAuthError"),
+        (403, "YandexAuthError"),
+        (404, "FileNotFoundError"),
+        (409, "ConflictError"),
+        (507, "InsufficientStorageError"),
+    ],
+)
+async def test_yandex_error_mapping(status: int, expected: str) -> None:
+    from app.services import yandex_disk
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(status, json={"message": "error"})
+
+    client = YandexDiskClient("token", httpx.AsyncClient(transport=httpx.MockTransport(handler)))
+    with pytest.raises(getattr(yandex_disk, expected, FileNotFoundError)):
+        await client.list_files("disk:/missing")
