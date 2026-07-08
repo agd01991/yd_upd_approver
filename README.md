@@ -188,3 +188,25 @@ curl http://localhost:8000/health
 ```
 
 For local Telegram Mini App testing, expose the API with `ngrok` or `cloudflared`, set `WEBAPP_URL` to the public `/app` URL used by Telegram, and open the app from Telegram so WebApp `initData` is available. Protected temp-file downloads in the Mini App use `fetch` with the `X-Telegram-Init-Data` header instead of query tokens or unauthenticated links. The user uploads API intentionally does not return internal Yandex Disk `target_path`; admins still see moderation paths in the admin API. Admin folder edits must choose one of the user's allowed folders and the backend validates the folder again before saving.
+
+### Runtime Yandex Disk root
+
+`YANDEX_DISK_ROOT` is now the fallback/default root for the first run. Administrators listed in `TELEGRAM_ADMIN_IDS` can view the active root with `/diskroot` and change it with `/setdiskroot disk:/Telegram Uploads` in the Telegram bot. The bot validates the path and creates the folder on Yandex Disk before saving the setting; if folder creation fails, the setting is not saved.
+
+The change affects only newly approved users. Existing active users keep their already assigned `user.root_folder` and uploads continue to use that per-user folder.
+
+The Docker-oriented `.env.example` uses service hostnames:
+
+```env
+DATABASE_URL=postgresql+asyncpg://bot:bot@postgres:5432/bot
+REDIS_URL=redis://redis:6379/0
+TELEGRAM_ADMIN_IDS=[123456789]
+CORS_ORIGINS=[]
+```
+
+For non-Docker local runs you can use localhost instead:
+
+```env
+DATABASE_URL=postgresql+asyncpg://bot:bot@localhost:5432/bot
+REDIS_URL=redis://localhost:6379/0
+```

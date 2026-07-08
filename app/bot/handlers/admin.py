@@ -19,7 +19,13 @@ from app.bot.keyboards import (
 from app.config import Settings
 from app.db.models import AuditLog, UploadRequest, UploadStatus, User, UserStatus
 from app.db.repositories import approve_user, pending_requests
+from app.services.app_settings import (
+    get_yandex_disk_root,
+    get_yandex_disk_root_setting,
+    set_yandex_disk_root,
+)
 from app.services.audit import write_audit
+from app.services.disk_paths import DiskPathValidationError, validate_yandex_disk_root
 from app.services.naming import join_disk_path, sanitize_filename
 from app.services.yandex_disk import YandexDiskClient, YandexDiskError
 from app.utils.formatting import format_folder_items, format_upload_card, format_upload_result
@@ -42,11 +48,108 @@ class UploadEditStates(StatesGroup):
     waiting_for_custom_reject_reason = State()
 
 
+class AdminSettingsStates(StatesGroup):
+    waiting_for_yandex_disk_root = State()
+
+
 @router.message(Command("admin"))
 async def admin_panel(message: Message, settings: Settings) -> None:
     if not is_admin(message.from_user.id, settings):
         return
-    await message.answer("Админ-панель: /queue, /users, /audit")
+    await message.answer(
+        "Админ-панель:\n"
+        "/queue — очередь заявок\n"
+        "/users — пользователи\n"
+        "/audit — аудит\n"
+        "/diskroot — текущая корневая папка Яндекс.Диска\n"
+        "/setdiskroot disk:/Telegram Uploads — изменить корневую папку для новых пользователей"
+    )
+
+
+def _command_argument(message: Message) -> str:
+    parts = (message.text or "").split(maxsplit=1)
+    return parts[1].strip() if len(parts) > 1 else ""
+
+
+async def _apply_yandex_disk_root_change(
+    message: Message, session: AsyncSession, settings: Settings, root: str
+) -> None:
+    try:
+        normalized = validate_yandex_disk_root(root)
+    except DiskPathValidationError as exc:
+        await message.answer(f"Некорректная корневая папка Яндекс.Диска: {exc}")
+        return
+
+    current = await get_yandex_disk_root_setting(session, settings)
+    client = YandexDiskClient(settings.yandex_disk_token)
+    try:
+        await client.mkdir_recursive(normalized)
+    except Exception as exc:
+        await message.answer(f"Не удалось создать папку Яндекс.Диска: {exc}")
+        return
+    finally:
+        await client.close()
+
+    saved = await set_yandex_disk_root(session, normalized, message.from_user.id)
+    await write_audit(
+        session,
+        actor_telegram_id=message.from_user.id,
+        action="settings_yandex_disk_root_change",
+        old_value={"yandex_disk_root": current.value},
+        new_value={"yandex_disk_root": saved},
+    )
+    await session.commit()
+    await message.answer(
+        f"Корневая папка обновлена:\n{saved}\n\n"
+        "Новые пользователи будут получать папки внутри неё.\n"
+        "Уже одобренные пользователи остаются в своих старых папках."
+    )
+
+
+@router.message(Command("diskroot"))
+async def diskroot(message: Message, session: AsyncSession, settings: Settings) -> None:
+    if not is_admin(message.from_user.id, settings):
+        return
+    current = await get_yandex_disk_root_setting(session, settings)
+    source = (
+        "значение по умолчанию из .env"
+        if current.is_default
+        else "настройка, заданная администратором"
+    )
+    await message.answer(
+        f"Текущая корневая папка Яндекс.Диска:\n{current.value}\n\n"
+        f"Источник: {source}\n\n"
+        "Новые пользователи будут получать папки внутри этой папки.\n"
+        "Уже одобренные пользователи остаются в своих текущих папках."
+    )
+
+
+@router.message(Command("setdiskroot"))
+async def setdiskroot(
+    message: Message, state: FSMContext, session: AsyncSession, settings: Settings
+) -> None:
+    if not is_admin(message.from_user.id, settings):
+        await state.clear()
+        return
+    root = _command_argument(message)
+    if not root:
+        await state.set_state(AdminSettingsStates.waiting_for_yandex_disk_root)
+        await message.answer(
+            "Отправьте новую корневую папку Яндекс.Диска, например:\ndisk:/Telegram Uploads"
+        )
+        return
+    await _apply_yandex_disk_root_change(message, session, settings, root)
+
+
+@router.message(AdminSettingsStates.waiting_for_yandex_disk_root)
+async def setdiskroot_from_state(
+    message: Message, state: FSMContext, session: AsyncSession, settings: Settings
+) -> None:
+    if not is_admin(message.from_user.id, settings):
+        await state.clear()
+        return
+    await _apply_yandex_disk_root_change(message, session, settings, message.text or "")
+    await state.clear()
 
 
 @router.message(Command("queue"))
@@ -125,7 +228,8 @@ async def user_callback(
         return
     old_status = user.status.value
     if callback_data.action == "approve":
-        await approve_user(session, user, callback.from_user.id, settings.yandex_disk_root)
+        disk_root = await get_yandex_disk_root(session, settings)
+        await approve_user(session, user, callback.from_user.id, disk_root)
         client = YandexDiskClient(settings.yandex_disk_token)
         try:
             await client.mkdir_recursive(user.root_folder)
