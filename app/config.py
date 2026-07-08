@@ -1,3 +1,4 @@
+from collections.abc import Iterable
 from functools import lru_cache
 from pathlib import Path
 
@@ -27,21 +28,25 @@ class Settings(BaseSettings):
 
     @field_validator("telegram_admin_ids", mode="before")
     @classmethod
-    def parse_admin_ids(cls, value: str | list[int]) -> list[int]:
-        if isinstance(value, list):
-            return [int(v) for v in value]
+    def parse_admin_ids(cls, value: str | Iterable[int | str]) -> list[int]:
+        if isinstance(value, str):
+            if not value:
+                return []
+            return [int(part.strip()) for part in value.split(",") if part.strip()]
         if not value:
             return []
-        return [int(part.strip()) for part in value.split(",") if part.strip()]
+        return [int(v) for v in value]
 
     @field_validator("cors_origins", mode="before")
     @classmethod
-    def parse_cors_origins(cls, value: str | list[str]) -> list[str]:
-        if isinstance(value, list):
-            return value
+    def parse_cors_origins(cls, value: str | Iterable[str]) -> list[str]:
+        if isinstance(value, str):
+            if not value:
+                return []
+            return [part.strip() for part in value.split(",") if part.strip()]
         if not value:
             return []
-        return [part.strip() for part in value.split(",") if part.strip()]
+        return [str(part).strip() for part in value if str(part).strip()]
 
     @property
     def max_file_size_bytes(self) -> int:
