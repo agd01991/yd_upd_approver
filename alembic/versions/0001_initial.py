@@ -17,8 +17,10 @@ depends_on = None
 
 
 def upgrade() -> None:
-    user_status = sa.Enum("pending", "active", "rejected", "blocked", name="userstatus")
-    upload_status = sa.Enum(
+    user_status = postgresql.ENUM(
+        "pending", "active", "rejected", "blocked", name="userstatus", create_type=False
+    )
+    upload_status = postgresql.ENUM(
         "new",
         "stored",
         "pending_approval",
@@ -30,6 +32,7 @@ def upgrade() -> None:
         "cancelled",
         "deleted_temp",
         name="uploadstatus",
+        create_type=False,
     )
     user_status.create(op.get_bind(), checkfirst=True)
     upload_status.create(op.get_bind(), checkfirst=True)
