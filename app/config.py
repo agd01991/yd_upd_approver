@@ -1,9 +1,12 @@
+import json
 from collections.abc import Iterable
 from functools import lru_cache
 from pathlib import Path
 
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+from app.services.disk_paths import validate_yandex_disk_root
 
 
 class Settings(BaseSettings):
@@ -32,10 +35,17 @@ class Settings(BaseSettings):
         if isinstance(value, str):
             if not value:
                 return []
+            if value.strip().startswith("["):
+                return [int(v) for v in json.loads(value)]
             return [int(part.strip()) for part in value.split(",") if part.strip()]
         if not value:
             return []
         return [int(v) for v in value]
+
+    @field_validator("yandex_disk_root")
+    @classmethod
+    def validate_disk_root(cls, value: str) -> str:
+        return validate_yandex_disk_root(value)
 
     @field_validator("cors_origins", mode="before")
     @classmethod
@@ -43,6 +53,8 @@ class Settings(BaseSettings):
         if isinstance(value, str):
             if not value:
                 return []
+            if value.strip().startswith("["):
+                return [str(part).strip() for part in json.loads(value) if str(part).strip()]
             return [part.strip() for part in value.split(",") if part.strip()]
         if not value:
             return []

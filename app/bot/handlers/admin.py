@@ -25,6 +25,7 @@ from app.services.app_settings import (
     set_yandex_disk_root,
 )
 from app.services.audit import write_audit
+from app.services.disk_paths import DiskPathValidationError, validate_yandex_disk_root
 from app.services.naming import join_disk_path, sanitize_filename
 from app.services.yandex_disk import YandexDiskClient, YandexDiskError
 from app.utils.formatting import format_folder_items, format_upload_card, format_upload_result
@@ -45,6 +46,10 @@ REJECT_REASONS = {
 class UploadEditStates(StatesGroup):
     waiting_for_rename = State()
     waiting_for_custom_reject_reason = State()
+
+
+class AdminSettingsStates(StatesGroup):
+    waiting_for_yandex_disk_root = State()
 
 
 @router.message(Command("admin"))

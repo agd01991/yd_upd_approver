@@ -214,3 +214,67 @@ async def test_folder_selection_only_uses_allowed_folders() -> None:
     assert request.target_folder == "disk:/root/u/docs/"
     assert request.target_path == "disk:/root/u/docs/file.txt"
     assert callback.message.answers[0][1] is not None
+
+
+class FakeSettingsSession:
+    def __init__(self, setting=None) -> None:  # noqa: ANN001
+        self.setting = setting
+        self.added = []
+        self.committed = False
+        self.flushes = 0
+
+    async def scalar(self, statement):  # noqa: ANN001
+        return self.setting
+
+    def add(self, obj) -> None:  # noqa: ANN001
+        self.added.append(obj)
+        if obj.__class__.__name__ == "AppSetting":
+            self.setting = obj
+
+    async def flush(self) -> None:
+        self.flushes += 1
+
+    async def commit(self) -> None:
+        self.committed = True
+
+
+@pytest.mark.anyio
+async def test_diskroot_shows_fallback_source() -> None:
+    message = FakeTextMessage("/diskroot")
+    await admin.diskroot(
+        message,
+        FakeSettingsSession(),
+        Settings(telegram_admin_ids=[1], yandex_disk_root="disk:/Fallback Root"),
+    )
+    assert "disk:/Fallback Root" in message.answers[0][0]
+    assert "значение по умолчанию из .env" in message.answers[0][0]
+
+
+@pytest.mark.anyio
+async def test_setdiskroot_creates_remote_folder_and_saves(monkeypatch) -> None:  # noqa: ANN001
+    created = []
+
+    class FakeRootClient:
+        def __init__(self, token: str) -> None:
+            self.token = token
+
+        async def mkdir_recursive(self, path: str) -> None:
+            created.append(path)
+
+        async def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(admin, "YandexDiskClient", FakeRootClient)
+    message = FakeTextMessage("/setdiskroot disk:/Runtime Root")
+    session = FakeSettingsSession()
+    await admin.setdiskroot(
+        message,
+        FakeState(),
+        session,
+        Settings(telegram_admin_ids=[1], yandex_disk_root="disk:/Fallback Root"),
+    )
+    assert created == ["disk:/Runtime Root"]
+    assert session.setting.value == "disk:/Runtime Root"
+    assert session.setting.updated_by == 1
+    assert session.committed
+    assert "Корневая папка обновлена" in message.answers[0][0]
