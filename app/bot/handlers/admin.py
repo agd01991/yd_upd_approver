@@ -19,6 +19,11 @@ from app.bot.keyboards import (
 from app.config import Settings
 from app.db.models import AuditLog, UploadRequest, UploadStatus, User, UserStatus
 from app.db.repositories import approve_user, pending_requests
+from app.services.app_settings import (
+    get_yandex_disk_root,
+    get_yandex_disk_root_setting,
+    set_yandex_disk_root,
+)
 from app.services.audit import write_audit
 from app.services.naming import join_disk_path, sanitize_filename
 from app.services.yandex_disk import YandexDiskClient, YandexDiskError
@@ -46,7 +51,33 @@ class UploadEditStates(StatesGroup):
 async def admin_panel(message: Message, settings: Settings) -> None:
     if not is_admin(message.from_user.id, settings):
         return
-    await message.answer("Админ-панель: /queue, /users, /audit")
+    await message.answer("Админ-панель: /queue, /users, /audit, /diskroot, /setdiskroot")
+
+
+@router.message(Command("diskroot"))
+async def diskroot(message: Message, session: AsyncSession, settings: Settings) -> None:
+    if not is_admin(message.from_user.id, settings):
+        return
+    root = await get_yandex_disk_root_setting(session, settings)
+    source = "default" if root.is_default else "runtime"
+    await message.answer(f"Yandex Disk root: {root.value}\nSource: {source}")
+
+
+@router.message(Command("setdiskroot"))
+async def setdiskroot(message: Message, session: AsyncSession, settings: Settings) -> None:
+    if not is_admin(message.from_user.id, settings):
+        return
+    _, _, root = (message.text or "").partition(" ")
+    if not root.strip():
+        await message.answer("Использование: /setdiskroot disk:/Root")
+        return
+    try:
+        normalized = await set_yandex_disk_root(session, root, message.from_user.id)
+    except ValueError as exc:
+        await message.answer(f"Некорректный путь: {exc}")
+        return
+    await session.commit()
+    await message.answer(f"Yandex Disk root updated: {normalized}")
 
 
 @router.message(Command("queue"))
@@ -125,7 +156,11 @@ async def user_callback(
         return
     old_status = user.status.value
     if callback_data.action == "approve":
-        await approve_user(session, user, callback.from_user.id, settings.yandex_disk_root)
+        if user.status != UserStatus.pending:
+            await callback.answer(f"Пользователь уже обработан: {user.status.value}")
+            return
+        disk_root = await get_yandex_disk_root(session, settings)
+        await approve_user(session, user, callback.from_user.id, disk_root)
         client = YandexDiskClient(settings.yandex_disk_token)
         try:
             await client.mkdir_recursive(user.root_folder)
