@@ -184,6 +184,7 @@ async function loadAdmin(tab) {
   try {
     if (tab === "users") return await renderAdminUsers();
     if (tab === "audit") return await renderAudit();
+    if (tab === "disk-root") return await renderDiskRootSettings();
     await renderAdminUploads();
   } catch (err) { showAdminError(err.message); }
 }
@@ -214,7 +215,7 @@ function adminUploadCard(r) {
     <div class="muted">${escapeHtml(r.caption || r.error_message || r.reject_reason || "")}</div>
     <div class="actions"><div><b>Основные</b><button data-download-id="${r.id}" data-download-name="${escapeHtml(r.safe_filename || "file")}">Открыть файл</button><button onclick="uploadAction(${r.id}, 'approve')">${uploadActionLabel("approve")}</button></div>
     <div><b>Конфликт/повтор</b>${["copy", "overwrite", "retry"].map((a) => `<button onclick="uploadAction(${r.id}, '${a}')">${uploadActionLabel(a)}</button>`).join("")}</div>
-    <div><b>Редактирование</b><button onclick="changeStem(${r.id})">Изменить имя</button><button onclick="changeExtension(${r.id})">Изменить расширение</button><button onclick="changeFolder(${r.id})">Сменить папку</button></div>
+    <div><b>Редактирование</b><button onclick="changeStem(${r.id})">Изменить имя</button><button onclick="changeExtension(${r.id})">Изменить расширение</button><button onclick="changeFolder(${r.id})">Сменить папку этой заявки</button></div>
     <div><b>Опасное</b><button class="danger" onclick="rejectUpload(${r.id})">Отклонить</button></div></div>
   </div>`;
 }
@@ -238,6 +239,35 @@ async function renderAdminUsers() {
       <div class="meta">@${escapeHtml(u.username || "—")} · ID Telegram: ${escapeHtml(u.telegram_id)}</div>
       <div class="row">${u.status === "pending" ? ["approve", "reject", "block"].map((a) => `<button onclick="moderateUser(${u.id}, '${a}')">${userActionLabel(a)}</button>`).join("") : ""}</div>
     </div>`).join("") || '<div class="card empty">Пользователей пока нет.</div>';
+}
+
+
+async function renderDiskRootSettings() {
+  const current = await api("/api/admin/disk-root");
+  const source = current.source === "env" ? ".env" : "задано администратором";
+  adminContent.innerHTML = `
+    <div id="admin-error" class="muted"></div>
+    <div class="card">
+      <h3>Корневая папка</h3>
+      <div class="meta">Текущая корневая папка: <b>${escapeHtml(current.value)}</b></div>
+      <div class="meta">Источник: ${escapeHtml(source)}</div>
+      <p class="muted">Это общая папка, внутри которой создаются папки пользователей.<br>
+      После изменения новые загрузки всех пользователей будут идти в папки внутри новой корневой папки.<br>
+      Если папки пользователя там ещё нет, она будет создана повторно.<br>
+      Старые файлы не переносятся.</p>
+      <label>Новая корневая папка<input id="disk-root-input" value="${escapeHtml(current.value)}" placeholder="disk:/Telegram Uploads"></label>
+      <button id="save-disk-root">Сохранить корневую папку</button>
+      <div id="disk-root-message" class="status-message"></div>
+    </div>`;
+  document.querySelector("#save-disk-root").onclick = async () => {
+    const msg = document.querySelector("#disk-root-message");
+    try {
+      const root = document.querySelector("#disk-root-input").value;
+      await api("/api/admin/disk-root", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ root }) });
+      msg.textContent = "Корневая папка сохранена.";
+      await renderDiskRootSettings();
+    } catch (err) { showAdminError(err.message); }
+  };
 }
 
 async function renderAudit() {
@@ -265,7 +295,7 @@ async function uploadAction(id, action) { await api(`/api/admin/uploads/${id}/${
 async function rejectUpload(id) { const reason = prompt("Причина", "Отклонено администратором"); if (reason) await api(`/api/admin/uploads/${id}/reject`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ reason }) }); await loadAdmin("uploads"); }
 async function changeStem(id) { try { const filenameStem = prompt("Введите новое имя файла без расширения. Текущее расширение будет сохранено."); if (!filenameStem) return; await api(`/api/admin/uploads/${id}`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ filename_stem: filenameStem }) }); await loadAdmin("uploads"); } catch (err) { showAdminError(err.message); } }
 async function changeExtension(id) { try { const filenameExtension = prompt("Введите новое расширение файла, например: pdf или .pdf"); if (!filenameExtension) return; await api(`/api/admin/uploads/${id}`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ filename_extension: filenameExtension }) }); await loadAdmin("uploads"); } catch (err) { showAdminError(err.message); } }
-async function changeFolder(id) { try { const folders = await api(`/api/admin/uploads/${id}/allowed-folders`); const choices = folders.items.map((f, index) => `${index + 1}. ${f.label}`).join("\n"); const selected = prompt(`Выберите новую папку по номеру:\n${choices}`); if (!selected) return; const index = Number.parseInt(selected, 10) - 1; if (!folders.items[index]) throw new Error("Выберите номер папки из списка"); await api(`/api/admin/uploads/${id}`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ target_folder: folders.items[index].path }) }); await loadAdmin("uploads"); } catch (err) { showAdminError(err.message); } }
+async function changeFolder(id) { try { const folders = await api(`/api/admin/uploads/${id}/allowed-folders`); const choices = folders.items.map((f, index) => `${index + 1}. ${f.label}`).join("\n"); const selected = prompt(`Выберите новую папку только для этой заявки:\n${choices}\n\nОбщая корневая папка меняется во вкладке «Корневая папка».`); if (!selected) return; const index = Number.parseInt(selected, 10) - 1; if (!folders.items[index]) throw new Error("Выберите номер папки из списка"); await api(`/api/admin/uploads/${id}`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ target_folder: folders.items[index].path }) }); await loadAdmin("uploads"); } catch (err) { showAdminError(err.message); } }
 
 async function load() {
   try {

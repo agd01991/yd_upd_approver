@@ -68,10 +68,14 @@ async def test_document_upload_active_user_downloads_and_notifies_admin(
         created.update(kwargs)
         return upload
 
+    async def fake_ensure(session, ensured_user, settings, client):  # noqa: ANN001
+        return ensured_user.root_folder
+
     monkeypatch.setattr(files, "get_user_by_tg", fake_get_user)
     monkeypatch.setattr(files, "next_request_code", fake_next_code)
     monkeypatch.setattr(files, "download_file", fake_download)
     monkeypatch.setattr(files, "create_upload_request", fake_create)
+    monkeypatch.setattr(files, "ensure_user_folder_for_current_root", fake_ensure)
 
     message = FakeMessage()
     bot = FakeBot()

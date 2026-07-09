@@ -22,7 +22,6 @@ from app.db.repositories import approve_user, pending_requests
 from app.services.app_settings import (
     get_yandex_disk_root,
     get_yandex_disk_root_setting,
-    set_yandex_disk_root,
 )
 from app.services.audit import write_audit
 from app.services.disk_paths import DiskPathValidationError, validate_yandex_disk_root
@@ -31,7 +30,9 @@ from app.services.naming import (
     change_filename_extension,
     change_filename_stem,
     join_disk_path,
+    user_folder,
 )
+from app.services.user_folders import change_yandex_disk_root_for_active_users
 from app.services.yandex_disk import YandexDiskClient, YandexDiskError
 from app.utils.formatting import (
     format_audit_action,
@@ -71,7 +72,7 @@ async def admin_panel(message: Message, settings: Settings) -> None:
         "/users — пользователи\n"
         "/audit — аудит\n"
         "/diskroot — текущая корневая папка Яндекс.Диска\n"
-        "/setdiskroot disk:/Telegram Uploads — изменить корневую папку для новых пользователей"
+        "/setdiskroot disk:/Telegram Uploads — изменить активную корневую папку для новых загрузок"
     )
 
 
@@ -89,8 +90,10 @@ async def diskroot(message: Message, session: AsyncSession, settings: Settings) 
         "Текущая корневая папка Яндекс.Диска:\n"
         f"{current.value}\n\n"
         f"Источник: {source}\n\n"
-        "Новые пользователи будут получать папки внутри этой папки.\n"
-        "Уже одобренные пользователи остаются в своих текущих папках."
+        "Корневая папка Яндекс.Диска используется для создания папок пользователей и новых загрузок.\n"
+        "После изменения новые загрузки будут идти в папки пользователей внутри новой корневой папки.\n"
+        "Если папки пользователя там ещё нет, она будет создана повторно.\n"
+        "Старые файлы не переносятся."
     )
 
 
@@ -98,35 +101,30 @@ async def _save_diskroot_change(
     message: Message, session: AsyncSession, settings: Settings, root: str
 ) -> None:
     admin_id = message.from_user.id
-    old_root = await get_yandex_disk_root(session, settings)
     try:
-        normalized = validate_yandex_disk_root(root)
+        validate_yandex_disk_root(root)
     except DiskPathValidationError as exc:
         await message.answer(f"Некорректный путь Яндекс.Диска: {exc}")
         return
     client = YandexDiskClient(settings.yandex_disk_token)
     try:
-        await client.mkdir_recursive(normalized)
+        new_root = await change_yandex_disk_root_for_active_users(
+            session, settings, client, root, admin_id
+        )
+        await session.commit()
     except Exception as exc:
-        await session.rollback()
-        await message.answer(f"Не удалось создать папку Яндекс.Диска: {exc}")
+        if hasattr(session, "rollback"):
+            await session.rollback()
+        await message.answer(f"Не удалось создать папку/папки Яндекс.Диска: {exc}")
         return
     finally:
         await client.close()
-    new_root = await set_yandex_disk_root(session, normalized, admin_id)
-    await write_audit(
-        session,
-        actor_telegram_id=admin_id,
-        action="settings_yandex_disk_root_change",
-        old_value={"yandex_disk_root": old_root},
-        new_value={"yandex_disk_root": new_root},
-    )
-    await session.commit()
     await message.answer(
         "Корневая папка Яндекс.Диска обновлена:\n"
         f"{new_root}\n\n"
-        "Новые пользователи будут получать папки внутри неё.\n"
-        "Уже одобренные пользователи остаются в своих старых папках."
+        "Новые загрузки всех пользователей будут идти в папки внутри неё.\n"
+        "Если папки пользователя там ещё нет, она будет создана повторно.\n"
+        "Старые файлы не переносятся."
     )
 
 
@@ -243,12 +241,14 @@ async def user_callback(
             )
             return
         disk_root = await get_yandex_disk_root(session, settings)
-        await approve_user(session, user, callback.from_user.id, disk_root)
+        folder = user_folder(disk_root, user.telegram_id, user.full_name, user.username)
         client = YandexDiskClient(settings.yandex_disk_token)
         try:
-            await client.mkdir_recursive(user.root_folder)
+            await client.mkdir_recursive(folder)
+            await approve_user(session, user, callback.from_user.id, disk_root)
         except Exception as exc:
-            await session.rollback()
+            if hasattr(session, "rollback"):
+                await session.rollback()
             await callback.answer(f"Не удалось создать папку Яндекс.Диска: {exc}", show_alert=True)
             return
         finally:
