@@ -12,6 +12,7 @@ from app.api.security import TelegramWebAppUser
 from app.config import Settings
 from app.db.models import AuditLog, UploadRequest, UploadStatus, User, UserStatus
 from app.db.repositories import approve_user
+from app.services.app_settings import get_yandex_disk_root
 from app.services.audit import write_audit
 from app.services.file_policy import folder_allowed
 from app.services.naming import join_disk_path, sanitize_filename
@@ -74,7 +75,10 @@ async def _moderate_user(
         raise HTTPException(404, "User not found")
     old = user.status.value
     if action == "approve":
-        await approve_user(session, user, actor, settings.yandex_disk_root)
+        if user.status != UserStatus.pending:
+            raise HTTPException(400, "User is already processed")
+        disk_root = await get_yandex_disk_root(session, settings)
+        await approve_user(session, user, actor, disk_root)
         client = YandexDiskClient(settings.yandex_disk_token)
         try:
             await client.mkdir_recursive(user.root_folder)
