@@ -62,6 +62,7 @@ def test_webapp_displays_user_folder_name_safely():
 
     assert "function userFolderLabel" in app_js
     assert "user?.folder_name || user?.root_folder_label" in app_js
+    assert "user?.folder_name || user?.root_folder_label ||" in app_js
     assert 'user?.root_folder_assigned ? "назначена" : "не назначена"' in app_js
     assert (
         'Папка на Яндекс.Диске: ${me.root_folder_assigned ? "назначена" : "не назначена"}'

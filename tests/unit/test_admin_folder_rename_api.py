@@ -146,3 +146,26 @@ def test_user_moderation_actions_keep_existing_static_contract() -> None:
 
     assert '["approve", "reject", "block"]' in js
     assert "`/api/admin/users/${id}/${action}`" in js
+
+
+def test_admin_user_json_exposes_root_folder_label_for_legacy_user() -> None:
+    from app.api.routes.admin import user_json
+    from app.db.models import User, UserStatus
+
+    data = user_json(
+        User(
+            id=2,
+            telegram_id=200,
+            username="user",
+            full_name="Test User",
+            status=UserStatus.active,
+            root_folder="disk:/Root/Legacy Folder/",
+            folder_name=None,
+        )
+    )
+
+    assert data["root_folder_assigned"] is True
+    assert data["root_folder_label"] == "Legacy Folder"
+    assert data["folder_name"] is None
+    assert "yandex_disk_token" not in data
+    assert "telegram_bot_token" not in data
