@@ -78,3 +78,12 @@ Security notes for local testing:
 - `Сменить папку` отправляет только `target_folder`, который повторно проверяется на принадлежность `user.allowed_folders`.
 
 `original_filename`, `local_path` и временный файл не изменяются. После каждого допустимого изменения `target_path` безопасно пересобирается из разрешённой папки и безопасного имени файла. Интерфейс Mini App использует русские пользовательские подписи и русские названия статусов; машинные значения API остаются внутренними.
+
+
+## UI filters and multi-file upload
+
+The Mini App uses vanilla HTML/CSS/JS and Telegram theme variables with fallback colors. User-provided and server-provided values rendered through `innerHTML` are escaped in the frontend before display.
+
+Users can choose multiple files in the upload card. The selected-file list shows the order, file name, and size before sending. Files are uploaded one by one through the existing `POST /api/uploads` endpoint, so every selected file creates its own request. The comment textarea is shared and is attached to every uploaded file. If one file fails validation or upload, the UI records that error and continues with the next file.
+
+The user request list has status chips: all, pending review, uploaded, failed, and rejected. Filtering is performed in the frontend over `/api/uploads`. The admin upload list has chips for all, pending review, uploaded, failed, rejected, and requests waiting for action. Admin status filters use optional query parameters on `GET /api/admin/uploads` where possible. The admin search field calls the same endpoint with `user_query` and matches Telegram ID, username, or full name without changing authorization rules.

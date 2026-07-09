@@ -8,6 +8,64 @@ const userEl = document.querySelector("#user");
 const adminEl = document.querySelector("#admin");
 const adminContent = document.querySelector("#admin-content");
 
+let userUploads = [];
+let userStatusFilter = "all";
+let adminStatusFilter = "all";
+let adminUserQuery = "";
+let adminSearchTimer;
+
+const STATUS_LABELS = {
+  pending: "ожидает одобрения",
+  active: "активен",
+  rejected: "отклонён",
+  blocked: "заблокирован",
+  stored: "сохранён временно",
+  new: "новый",
+  pending_approval: "на проверке",
+  approved: "одобрено",
+  uploading: "загружается",
+  uploaded: "загружено",
+  failed: "ошибка",
+  cancelled: "отменено",
+  deleted_temp: "временный файл удалён",
+};
+const UPLOAD_ACTION_LABELS = { approve: "Загрузить", copy: "Загрузить как копию", overwrite: "Перезаписать", retry: "Повторить", reject: "Отклонить" };
+const USER_ACTION_LABELS = { approve: "Одобрить", reject: "Отклонить", block: "Заблокировать" };
+const AUDIT_LABELS = { upload_filename_stem_change: "изменение имени файла", upload_filename_extension_change: "изменение расширения файла", upload_patch: "изменение заявки", upload_folder_change: "изменение папки" };
+const USER_FILTERS = [
+  ["all", "Все"],
+  ["pending_approval", "На проверке"],
+  ["uploaded", "Загружены"],
+  ["failed", "Ошибка"],
+  ["rejected", "Отклонены"],
+];
+const ADMIN_FILTERS = [
+  ["all", "Все"],
+  ["pending_approval", "На проверке"],
+  ["uploaded", "Загружены"],
+  ["failed", "Ошибка"],
+  ["rejected", "Отклонены"],
+  ["needs_action", "Ожидают действия"],
+];
+const NEEDS_ACTION_STATUSES = new Set(["pending_approval", "failed"]);
+
+function escapeHtml(value) {
+  return String(value ?? "").replace(/[&<>'"]/g, (char) => ({
+    "&": "&amp;",
+    "<": "&lt;",
+    ">": "&gt;",
+    "'": "&#39;",
+    '"': "&quot;",
+  })[char]);
+}
+
+function statusLabel(value) { return STATUS_LABELS[value] || value || "—"; }
+function uploadActionLabel(value) { return UPLOAD_ACTION_LABELS[value] || value; }
+function userActionLabel(value) { return USER_ACTION_LABELS[value] || value; }
+function auditLabel(value) { return AUDIT_LABELS[value] || value; }
+function fmtSize(n) { return n ? `${(n / 1048576).toFixed(2)} MB` : "—"; }
+function shortSha(value) { return value ? value.slice(0, 12) : "—"; }
+
 async function readError(response) {
   try {
     const data = await response.json();
@@ -20,262 +78,204 @@ async function readError(response) {
 async function api(path, opts = {}) {
   opts.headers = { ...(opts.headers || {}), "X-Telegram-Init-Data": initData };
   const response = await fetch(path, opts);
-  if (response.status === 401) {
-    throw new Error("Откройте приложение через Telegram");
-  }
-  if (!response.ok) {
-    throw new Error(await readError(response));
-  }
+  if (response.status === 401) throw new Error("Откройте приложение через Telegram");
+  if (!response.ok) throw new Error(await readError(response));
   return response.json();
 }
 
-
-const STATUS_LABELS = { pending: "ожидает одобрения", active: "активен", rejected: "отклонён", blocked: "заблокирован", stored: "сохранён временно", new: "новый", pending_approval: "ожидает проверки", approved: "одобрено", uploading: "загружается", uploaded: "загружено", failed: "ошибка загрузки", cancelled: "отменено", deleted_temp: "временный файл удалён" };
-const UPLOAD_ACTION_LABELS = { approve: "Загрузить", copy: "Загрузить как копию", overwrite: "Перезаписать", retry: "Повторить", reject: "Отклонить" };
-const USER_ACTION_LABELS = { approve: "Одобрить", reject: "Отклонить", block: "Заблокировать" };
-const AUDIT_LABELS = { upload_filename_stem_change: "изменение имени файла", upload_filename_extension_change: "изменение расширения файла", upload_patch: "изменение заявки", upload_folder_change: "изменение папки" };
-function statusLabel(value) { return STATUS_LABELS[value] || value || "—"; }
-function uploadActionLabel(value) { return UPLOAD_ACTION_LABELS[value] || value; }
-function userActionLabel(value) { return USER_ACTION_LABELS[value] || value; }
-function auditLabel(value) { return AUDIT_LABELS[value] || value; }
-
-function fmtSize(n) {
-  return n ? `${(n / 1048576).toFixed(2)} MB` : "—";
+function chipHtml(filters, current, prefix) {
+  return `<div class="chips">${filters.map(([value, label]) =>
+    `<button class="chip ${value === current ? "active" : ""}" data-${prefix}-filter="${value}">${label}</button>`
+  ).join("")}</div>`;
 }
 
 function showAdminError(message) {
   const error = document.querySelector("#admin-error");
-  if (error) {
-    error.textContent = message;
-  } else {
-    alert(message);
-  }
+  if (error) error.textContent = message; else alert(message);
 }
 
 async function renderUser(me) {
   if (me.status === "pending") {
-    userEl.innerHTML = '<div class="card">Доступ ожидает одобрения администратора.</div>';
+    userEl.innerHTML = '<div class="card empty">Доступ ожидает одобрения администратора.</div>';
     return;
   }
   if (["blocked", "rejected"].includes(me.status)) {
-    userEl.innerHTML = '<div class="card">Загрузка файлов для аккаунта недоступна.</div>';
+    userEl.innerHTML = '<div class="card empty">Загрузка файлов для аккаунта недоступна.</div>';
     return;
   }
   userEl.innerHTML = `
-    <div class="card">
-      <h2>Загрузить файл</h2>
+    <div class="card upload-card">
+      <h2>Загрузить файлы</h2>
       <form id="up">
-        <input type="file" name="file" required>
-        <textarea name="caption" placeholder="Комментарий"></textarea>
-        <button>Отправить</button>
+        <label class="file-picker">Выберите один или несколько файлов<input type="file" name="file" multiple></label>
+        <div id="selected-files" class="file-list muted">Файлы не выбраны</div>
+        <textarea name="caption" placeholder="Общий комментарий для всех файлов"></textarea>
+        <button type="submit">Отправить</button>
       </form>
-      <div id="upmsg"></div>
+      <div id="upmsg" class="status-message"></div>
     </div>
-    <div class="card"><h2>Мои заявки</h2><div id="reqs"></div></div>
+    <div class="card"><h2>Мои заявки</h2>${chipHtml(USER_FILTERS, userStatusFilter, "user")}<div id="reqs"></div></div>
     <div class="card"><h2>Файлы</h2><div id="files"></div></div>`;
-  document.querySelector("#up").onsubmit = async (event) => {
-    event.preventDefault();
-    const fd = new FormData(event.target);
-    document.querySelector("#upmsg").textContent = "Файл загружается...";
+  const form = document.querySelector("#up");
+  const input = form.querySelector('input[type="file"]');
+  input.onchange = () => renderSelectedFiles(input.files);
+  form.onsubmit = async (event) => uploadSelectedFiles(event, form, input);
+  document.querySelectorAll("[data-user-filter]").forEach((button) => {
+    button.onclick = () => { userStatusFilter = button.dataset.userFilter; renderUserRequests(); };
+  });
+  await loadUserLists();
+}
+
+function renderSelectedFiles(files) {
+  const list = document.querySelector("#selected-files");
+  if (!files || files.length === 0) { list.textContent = "Файлы не выбраны"; return; }
+  list.innerHTML = `<b>Файлы выбраны: ${files.length}</b>` + Array.from(files).map((file, index) =>
+    `<div class="file-row"><span>${index + 1}. ${escapeHtml(file.name)}</span><span>${fmtSize(file.size)}</span></div>`
+  ).join("");
+}
+
+async function uploadSelectedFiles(event, form, input) {
+  event.preventDefault();
+  const files = Array.from(input.files || []);
+  const msg = document.querySelector("#upmsg");
+  if (files.length === 0) { msg.textContent = "Выберите хотя бы один файл."; return; }
+  const caption = form.querySelector("textarea").value;
+  const results = [];
+  for (const [index, file] of files.entries()) {
+    msg.textContent = `Загружается ${index + 1} из ${files.length}: ${file.name}`;
+    const fd = new FormData();
+    fd.append("file", file);
+    fd.append("caption", caption);
     try {
       const result = await api("/api/uploads", { method: "POST", body: fd });
-      document.querySelector("#upmsg").textContent = `Создана заявка ${result.request_code}`;
-      await loadUserLists();
+      results.push(`✅ ${file.name}: создана заявка ${result.request_code}`);
     } catch (err) {
-      document.querySelector("#upmsg").textContent = err.message;
+      results.push(`❌ ${file.name}: ${err.message}`);
     }
-  };
+  }
+  msg.innerHTML = `<b>Готово</b>${results.map((item) => `<div>${escapeHtml(item)}</div>`).join("")}`;
+  form.reset();
+  renderSelectedFiles([]);
   await loadUserLists();
 }
 
 async function loadUserLists() {
-  const reqs = await api("/api/uploads");
-  document.querySelector("#reqs").innerHTML = reqs.map((r) => `
-    <div class="card">
-      <b>${r.request_code}</b> ${statusLabel(r.status)}<br>
-      ${r.safe_filename}<br>
-      <span class="muted">${r.reject_reason || r.error_message || ""}</span>
-    </div>`).join("") || "Нет заявок";
-
+  userUploads = await api("/api/uploads");
+  renderUserRequests();
   const files = await api("/api/files");
   document.querySelector("#files").innerHTML = (files.items || []).map((f) =>
-    `<div>${f.type === "dir" ? "📁" : "📄"} ${f.name} ${fmtSize(f.size)}</div>`
-  ).join("") || (files.message || "Пусто");
+    `<div class="file-row"><span>${f.type === "dir" ? "📁" : "📄"} ${escapeHtml(f.name)}</span><span>${fmtSize(f.size)}</span></div>`
+  ).join("") || `<div class="empty">${escapeHtml(files.message || "Файлов пока нет")}</div>`;
+}
+
+function renderUserRequests() {
+  const visible = userStatusFilter === "all" ? userUploads : userUploads.filter((r) => r.status === userStatusFilter);
+  document.querySelectorAll("[data-user-filter]").forEach((b) => b.classList.toggle("active", b.dataset.userFilter === userStatusFilter));
+  document.querySelector("#reqs").innerHTML = visible.map((r) => `
+    <div class="request-card">
+      <div class="card-head"><b>${escapeHtml(r.request_code)}</b><span class="badge status-${escapeHtml(r.status)}">${escapeHtml(statusLabel(r.status))}</span></div>
+      <div class="filename">${escapeHtml(r.safe_filename)}</div>
+      <div class="muted">${escapeHtml(r.reject_reason || r.error_message || "")}</div>
+    </div>`).join("") || '<div class="empty">Заявок с таким статусом пока нет.</div>';
 }
 
 async function loadAdmin(tab) {
   adminContent.innerHTML = '<div id="admin-error" class="muted"></div>';
   try {
-    if (tab === "users") {
-      await renderAdminUsers();
-      return;
-    }
-    if (tab === "audit") {
-      await renderAudit();
-      return;
-    }
+    if (tab === "users") return await renderAdminUsers();
+    if (tab === "audit") return await renderAudit();
     await renderAdminUploads();
-  } catch (err) {
-    showAdminError(err.message);
-  }
+  } catch (err) { showAdminError(err.message); }
 }
 
 async function renderAdminUploads() {
-  const rows = await api("/api/admin/uploads");
-  adminContent.innerHTML = '<div id="admin-error" class="muted"></div>' + rows.map((r) => `
-    <div class="card" id="upload-${r.id}">
-      <b>${r.request_code}</b> ${statusLabel(r.status)}<br>
-      ${r.safe_filename} (${fmtSize(r.size_bytes)})<br>
-      Пользователь: ${r.user?.telegram_id || "—"}<br>
-      SHA-256: ${(r.sha256 || "").slice(0, 12)}<br>
-      <span class="small">${r.target_path}</span><br>
-      <span class="muted">${r.caption || r.error_message || r.reject_reason || ""}</span>
-      <div class="row">
-        <button onclick="downloadTemp(${r.id}, decodeURIComponent('${encodeURIComponent(r.safe_filename)}'))">Открыть файл</button>
-        ${["approve", "copy", "overwrite", "retry"].map((a) =>
-          `<button onclick="uploadAction(${r.id}, '${a}')">${uploadActionLabel(a)}</button>`
-        ).join("")}
-        <button class="danger" onclick="rejectUpload(${r.id})">Отклонить</button>
-        <button onclick="changeStem(${r.id})">Изменить имя</button>
-        <button onclick="changeExtension(${r.id})">Изменить расширение</button>
-        <button onclick="changeFolder(${r.id})">Сменить папку</button>
-      </div>
-    </div>`).join("");
+  const params = new URLSearchParams();
+  if (adminStatusFilter !== "all" && adminStatusFilter !== "needs_action") params.set("status", adminStatusFilter);
+  if (adminUserQuery.trim()) params.set("user_query", adminUserQuery.trim());
+  let rows = await api(`/api/admin/uploads${params.toString() ? `?${params}` : ""}`);
+  if (adminStatusFilter === "needs_action") rows = rows.filter((r) => NEEDS_ACTION_STATUSES.has(r.status));
+  adminContent.innerHTML = `
+    <div id="admin-error" class="muted"></div>
+    <div class="admin-tools">${chipHtml(ADMIN_FILTERS, adminStatusFilter, "admin")}
+      <div class="search-row"><input id="admin-search" value="${escapeHtml(adminUserQuery)}" placeholder="Поиск по Telegram ID, username или имени"><button id="clear-search" class="secondary">Очистить</button></div>
+    </div>` + (rows.map(adminUploadCard).join("") || '<div class="card empty">Заявки не найдены.</div>');
+  bindAdminUploadControls();
+}
+
+function adminUploadCard(r) {
+  const user = r.user || {};
+  const userTitle = `${user.telegram_id || "—"} · @${user.username || "—"} · ${user.full_name || "—"}`;
+  return `<div class="card upload-admin-card" id="upload-${r.id}">
+    <div class="card-head"><b>${escapeHtml(r.request_code)}</b><span class="badge status-${escapeHtml(r.status)}">${escapeHtml(statusLabel(r.status))}</span></div>
+    <div class="filename">${escapeHtml(r.safe_filename)} <span class="muted">${fmtSize(r.size_bytes)}</span></div>
+    <div class="meta">Пользователь: ${escapeHtml(userTitle)}</div>
+    <div class="meta">SHA-256: ${escapeHtml(shortSha(r.sha256))}</div>
+    <div class="path">${escapeHtml(r.target_path || "—")}</div>
+    <div class="muted">${escapeHtml(r.caption || r.error_message || r.reject_reason || "")}</div>
+    <div class="actions"><div><b>Основные</b><button data-download-id="${r.id}" data-download-name="${escapeHtml(r.safe_filename || "file")}">Открыть файл</button><button onclick="uploadAction(${r.id}, 'approve')">${uploadActionLabel("approve")}</button></div>
+    <div><b>Конфликт/повтор</b>${["copy", "overwrite", "retry"].map((a) => `<button onclick="uploadAction(${r.id}, '${a}')">${uploadActionLabel(a)}</button>`).join("")}</div>
+    <div><b>Редактирование</b><button onclick="changeStem(${r.id})">Изменить имя</button><button onclick="changeExtension(${r.id})">Изменить расширение</button><button onclick="changeFolder(${r.id})">Сменить папку</button></div>
+    <div><b>Опасное</b><button class="danger" onclick="rejectUpload(${r.id})">Отклонить</button></div></div>
+  </div>`;
+}
+
+function bindAdminUploadControls() {
+  document.querySelectorAll("[data-admin-filter]").forEach((button) => {
+    button.onclick = () => { adminStatusFilter = button.dataset.adminFilter; renderAdminUploads(); };
+  });
+  document.querySelectorAll("[data-download-id]").forEach((button) => {
+    button.onclick = () => downloadTemp(Number.parseInt(button.dataset.downloadId, 10), button.dataset.downloadName || "file");
+  });
+  const search = document.querySelector("#admin-search");
+  search.oninput = () => { clearTimeout(adminSearchTimer); adminSearchTimer = setTimeout(() => { adminUserQuery = search.value; renderAdminUploads(); }, 300); };
+  document.querySelector("#clear-search").onclick = () => { adminUserQuery = ""; renderAdminUploads(); };
 }
 
 async function renderAdminUsers() {
   const rows = await api("/api/admin/users");
   adminContent.innerHTML = '<div id="admin-error" class="muted"></div>' + rows.map((u) => `
-    <div class="card">
-      <b>${u.full_name || "—"}</b> @${u.username || "—"}<br>
-      ID Telegram: ${u.telegram_id}; ${statusLabel(u.status)}
-      <div class="row">
-        ${u.status === "pending" ? ["approve", "reject", "block"].map((a) =>
-          `<button onclick="moderateUser(${u.id}, '${a}')">${userActionLabel(a)}</button>`
-        ).join("") : ""}
-      </div>
-    </div>`).join("");
+    <div class="card user-card"><div class="card-head"><b>${escapeHtml(u.full_name || "—")}</b><span class="badge">${escapeHtml(statusLabel(u.status))}</span></div>
+      <div class="meta">@${escapeHtml(u.username || "—")} · ID Telegram: ${escapeHtml(u.telegram_id)}</div>
+      <div class="row">${u.status === "pending" ? ["approve", "reject", "block"].map((a) => `<button onclick="moderateUser(${u.id}, '${a}')">${userActionLabel(a)}</button>`).join("") : ""}</div>
+    </div>`).join("") || '<div class="card empty">Пользователей пока нет.</div>';
 }
 
 async function renderAudit() {
   const rows = await api("/api/admin/audit");
   adminContent.innerHTML = '<div id="admin-error" class="muted"></div>' + rows.map((a) => `
-    <div class="card">
-      <b>${auditLabel(a.action)}</b><br>
-      Администратор: ${a.actor_telegram_id}; заявка: ${a.request_id || "—"}<br>
-      <span class="small">${JSON.stringify(a.new_value)}</span>
-    </div>`).join("");
+    <div class="card audit-card"><b>${escapeHtml(auditLabel(a.action))}</b><br>
+      <span class="meta">Администратор: ${escapeHtml(a.actor_telegram_id)}; заявка: ${escapeHtml(a.request_id || "—")}</span>
+      <pre>${escapeHtml(JSON.stringify(a.new_value, null, 2))}</pre>
+    </div>`).join("") || '<div class="card empty">Аудит пока пуст.</div>';
 }
 
 async function downloadTemp(id, filename) {
   try {
-    const response = await fetch(`/api/admin/uploads/${id}/download-temp`, {
-      headers: { "X-Telegram-Init-Data": initData },
-    });
-    if (!response.ok) {
-      throw new Error(await readError(response));
-    }
+    const response = await fetch(`/api/admin/uploads/${id}/download-temp`, { headers: { "X-Telegram-Init-Data": initData } });
+    if (!response.ok) throw new Error(await readError(response));
     const blob = await response.blob();
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
-    a.href = url;
-    a.download = filename || "file";
-    document.body.appendChild(a);
-    a.click();
-    a.remove();
-    URL.revokeObjectURL(url);
-  } catch (err) {
-    showAdminError(err.message);
-  }
+    a.href = url; a.download = filename || "file"; document.body.appendChild(a); a.click(); a.remove(); URL.revokeObjectURL(url);
+  } catch (err) { showAdminError(err.message); }
 }
 
-async function moderateUser(id, action) {
-  await api(`/api/admin/users/${id}/${action}`, { method: "POST" });
-  await loadAdmin("users");
-}
-
-async function uploadAction(id, action) {
-  await api(`/api/admin/uploads/${id}/${action}`, { method: "POST" });
-  await loadAdmin("uploads");
-}
-
-async function rejectUpload(id) {
-  const reason = prompt("Причина", "Отклонено администратором");
-  if (reason) {
-    await api(`/api/admin/uploads/${id}/reject`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ reason }),
-    });
-  }
-  await loadAdmin("uploads");
-}
-
-async function changeStem(id) {
-  try {
-    const filenameStem = prompt("Введите новое имя файла без расширения. Текущее расширение будет сохранено.");
-    if (!filenameStem) return;
-    await api(`/api/admin/uploads/${id}`, {
-      method: "PATCH",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ filename_stem: filenameStem }),
-    });
-    await loadAdmin("uploads");
-  } catch (err) {
-    showAdminError(err.message);
-  }
-}
-
-async function changeExtension(id) {
-  try {
-    const filenameExtension = prompt("Введите новое расширение файла, например: pdf или .pdf");
-    if (!filenameExtension) return;
-    await api(`/api/admin/uploads/${id}`, {
-      method: "PATCH",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ filename_extension: filenameExtension }),
-    });
-    await loadAdmin("uploads");
-  } catch (err) {
-    showAdminError(err.message);
-  }
-}
-
-async function changeFolder(id) {
-  try {
-    const folders = await api(`/api/admin/uploads/${id}/allowed-folders`);
-    const choices = folders.items.map((f, index) => `${index + 1}. ${f.label}`).join("\n");
-    const selected = prompt(`Выберите новую папку по номеру:\n${choices}`);
-    if (!selected) return;
-    const index = Number.parseInt(selected, 10) - 1;
-    if (!folders.items[index]) throw new Error("Выберите номер папки из списка");
-    await api(`/api/admin/uploads/${id}`, {
-      method: "PATCH",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ target_folder: folders.items[index].path }),
-    });
-    await loadAdmin("uploads");
-  } catch (err) {
-    showAdminError(err.message);
-  }
-}
+async function moderateUser(id, action) { await api(`/api/admin/users/${id}/${action}`, { method: "POST" }); await loadAdmin("users"); }
+async function uploadAction(id, action) { await api(`/api/admin/uploads/${id}/${action}`, { method: "POST" }); await loadAdmin("uploads"); }
+async function rejectUpload(id) { const reason = prompt("Причина", "Отклонено администратором"); if (reason) await api(`/api/admin/uploads/${id}/reject`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ reason }) }); await loadAdmin("uploads"); }
+async function changeStem(id) { try { const filenameStem = prompt("Введите новое имя файла без расширения. Текущее расширение будет сохранено."); if (!filenameStem) return; await api(`/api/admin/uploads/${id}`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ filename_stem: filenameStem }) }); await loadAdmin("uploads"); } catch (err) { showAdminError(err.message); } }
+async function changeExtension(id) { try { const filenameExtension = prompt("Введите новое расширение файла, например: pdf или .pdf"); if (!filenameExtension) return; await api(`/api/admin/uploads/${id}`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ filename_extension: filenameExtension }) }); await loadAdmin("uploads"); } catch (err) { showAdminError(err.message); } }
+async function changeFolder(id) { try { const folders = await api(`/api/admin/uploads/${id}/allowed-folders`); const choices = folders.items.map((f, index) => `${index + 1}. ${f.label}`).join("\n"); const selected = prompt(`Выберите новую папку по номеру:\n${choices}`); if (!selected) return; const index = Number.parseInt(selected, 10) - 1; if (!folders.items[index]) throw new Error("Выберите номер папки из списка"); await api(`/api/admin/uploads/${id}`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ target_folder: folders.items[index].path }) }); await loadAdmin("uploads"); } catch (err) { showAdminError(err.message); } }
 
 async function load() {
   try {
     const me = await api("/api/me");
-    auth.innerHTML = `<b>${me.full_name || me.username || me.telegram_id}</b><br>Статус: ${statusLabel(me.status)}<br>Папка на Яндекс.Диске: ${me.root_folder_assigned ? "назначена" : "не назначена"}`;
+    const title = escapeHtml(me.full_name || me.username || me.telegram_id);
+    auth.innerHTML = `<div class="card-head"><b>${title}</b><span class="badge">${escapeHtml(statusLabel(me.status))}</span></div><div class="muted">Папка на Яндекс.Диске: ${me.root_folder_assigned ? "назначена" : "не назначена"}</div>`;
     await renderUser(me);
-    if (me.is_admin) {
-      adminEl.classList.remove("hidden");
-      await loadAdmin("uploads");
-    }
-  } catch (err) {
-    auth.textContent = err.message;
-  }
+    if (me.is_admin) { adminEl.classList.remove("hidden"); await loadAdmin("uploads"); }
+  } catch (err) { auth.textContent = err.message; }
 }
 
-document.querySelectorAll("nav button").forEach((button) => {
-  button.onclick = () => loadAdmin(button.dataset.tab);
-});
-
+document.querySelectorAll("nav button").forEach((button) => { button.onclick = () => loadAdmin(button.dataset.tab); });
 load();

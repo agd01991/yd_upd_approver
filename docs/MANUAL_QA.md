@@ -120,3 +120,25 @@ python -m app.main
 3. В карточке заявки проверьте русские кнопки `Загрузить`, `Загрузить как копию`, `Перезаписать`, `Повторить`, `Отклонить`, а также отдельные кнопки `Изменить имя`, `Изменить расширение` и `Сменить папку`.
 4. Проверьте, что Mini App отправляет `filename_stem` для имени и `filename_extension` для расширения, не отправляя `safe_filename` в новом flow.
 5. Все пользовательские подписи, статусы, кнопки и ошибки должны отображаться на русском языке.
+
+
+## Manual QA: Mini App filters, search, multi-file upload
+
+### User scenario
+
+1. Open the Mini App from Telegram as an approved user.
+2. Verify the auth card, upload card, request cards, file list, badges, and empty states are readable on a narrow mobile viewport.
+3. Select several files and verify the pre-upload list shows number, filename, and size for each file.
+4. Add one shared comment and submit. Verify the progress text shows `Загружается X из N`.
+5. Confirm every successful file creates a separate request and the request list refreshes after completion.
+6. Include one invalid/oversized file if possible and verify the remaining files continue uploading while the failed file is shown as an error.
+7. Switch request status chips and verify empty states say that no requests exist for the selected status when applicable.
+
+### Administrator scenario
+
+1. Open the Mini App as a Telegram ID listed in `TELEGRAM_ADMIN_IDS`.
+2. In `Администратор → Заявки`, verify the redesigned cards show request code, status badge, file name, size, user, short SHA-256, Yandex Disk path, and comment/error/reject reason.
+3. Test status chips: all, pending review, uploaded, failed, rejected, and waiting for action.
+4. Search requests by Telegram ID, username, and full name; verify the clear button resets the list.
+5. Confirm grouped actions still work: open temp file, upload, copy, overwrite, retry, rename stem, change extension, change folder, and reject.
+6. Verify a non-admin Telegram user cannot open admin endpoints or see admin data.

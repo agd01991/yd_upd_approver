@@ -202,3 +202,22 @@ async def test_patch_upload_rejects_invalid_and_conflicting_filename_fields() ->
             FakeSession(upload, user),
         )
     assert exc.value.status_code == 400
+
+
+def test_admin_upload_status_parser_accepts_known_and_all_statuses() -> None:
+    from app.api.routes.admin import _parse_upload_status
+
+    assert _parse_upload_status(None) is None
+    assert _parse_upload_status("all") is None
+    assert _parse_upload_status("pending_approval") == UploadStatus.pending_approval
+    assert _parse_upload_status("uploaded") == UploadStatus.uploaded
+
+
+def test_admin_upload_status_parser_rejects_unknown_status() -> None:
+    from app.api.routes.admin import _parse_upload_status
+
+    with pytest.raises(HTTPException) as exc:
+        _parse_upload_status("unknown")
+
+    assert exc.value.status_code == 400
+    assert "Неизвестный статус" in exc.value.detail

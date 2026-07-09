@@ -221,3 +221,10 @@ For local Telegram Mini App testing, expose the API with `ngrok` or `cloudflared
 - `original_filename`, `local_path` и временный файл не меняются; после изменения безопасно пересобирается только `target_path`.
 
 Mini App и бот показывают основные пользовательские подписи, кнопки, статусы и audit-поля на русском языке. Новый frontend использует поля API `filename_stem`, `filename_extension` и `target_folder`; `safe_filename` сохранён только для обратной совместимости.
+
+
+## Mini App UI: filters, search, and multi-file upload
+
+Telegram Mini App keeps the existing Telegram WebApp initData authentication and the single-file `POST /api/uploads` endpoint, but the UI now supports selecting multiple files at once. The frontend sends selected files sequentially; each file creates a separate upload request, the shared comment is applied to every request, and a failed file does not stop the remaining uploads.
+
+The Mini App has a cleaner mobile-first layout with cards, status badges, compact file rows, grouped admin actions, empty states, and long Yandex Disk paths that wrap on narrow screens. User requests can be filtered by status: all, pending review, uploaded, failed, and rejected. Admin upload requests can be filtered by status and searched by Telegram ID, username, or full name. Admin search is only a display filter; authorization still uses the validated Telegram WebApp user and numeric `TELEGRAM_ADMIN_IDS`.

@@ -3,7 +3,7 @@ from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import FileResponse
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import admin_user_dep, bot_dep, get_db, settings_dep
@@ -125,14 +125,40 @@ async def moderate_user(
     return await _moderate_user(user_id, action, actor.telegram_id, session, settings, bot)
 
 
+def _parse_upload_status(status: str | None) -> UploadStatus | None:
+    if not status or status == "all":
+        return None
+    try:
+        return UploadStatus(status)
+    except ValueError as exc:
+        raise HTTPException(400, "Неизвестный статус заявки") from exc
+
+
+def _user_query_filter(user_query: str | None):
+    if not user_query or not user_query.strip():
+        return None
+    query = user_query.strip()
+    conditions = [User.username.ilike(f"%{query}%"), User.full_name.ilike(f"%{query}%")]
+    if query.isdigit():
+        conditions.append(User.telegram_id == int(query))
+    return or_(*conditions)
+
+
 @router.get("/uploads")
-async def uploads(session: AsyncSession = Depends(get_db)) -> list[dict]:
-    rows = (
-        await session.scalars(
-            select(UploadRequest).order_by(UploadRequest.created_at.desc()).limit(100)
-        )
-    ).all()
-    return [req_json(r, await session.get(User, r.user_id)) for r in rows]
+async def uploads(
+    status: str | None = None,
+    user_query: str | None = None,
+    session: AsyncSession = Depends(get_db),
+) -> list[dict]:
+    upload_status = _parse_upload_status(status)
+    stmt = select(UploadRequest, User).join(User, UploadRequest.user_id == User.id)
+    if upload_status:
+        stmt = stmt.where(UploadRequest.status == upload_status)
+    user_filter = _user_query_filter(user_query)
+    if user_filter is not None:
+        stmt = stmt.where(user_filter)
+    rows = (await session.execute(stmt.order_by(UploadRequest.created_at.desc()).limit(100))).all()
+    return [req_json(upload, user) for upload, user in rows]
 
 
 @router.get("/uploads/{request_id}")
