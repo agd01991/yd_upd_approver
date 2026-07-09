@@ -99,6 +99,14 @@ class YandexDiskClient:
             current = f"{current}/{part}"
             await self.mkdir(current)
 
+    async def move_resource(self, from_path: str, to_path: str, overwrite: bool = False) -> None:
+        response = await self._request(
+            "POST",
+            f"{API}/move",
+            params={"from": from_path, "path": to_path, "overwrite": str(overwrite).lower()},
+        )
+        self._raise_for_status(response, to_path)
+
     async def list_files(self, path: str, limit: int = 50) -> list[dict[str, Any]]:
         response = await self._request("GET", API, params={"path": path, "limit": limit})
         self._raise_for_status(response, path)

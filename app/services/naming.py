@@ -82,3 +82,53 @@ def change_filename_extension(current_filename: str, new_extension: str) -> str:
     if result != f"{stem}.{safe_ext}" or len(result) > 255:
         raise FilenameEditError("Итоговое имя файла слишком длинное или небезопасное")
     return result
+
+
+_FOLDER_CONTROL = re.compile(r"[\x00-\x1f\x7f]")
+_FOLDER_BAD = re.compile(r"[^A-Za-z0-9А-Яа-яЁё№._ ()-]+")
+MAX_FOLDER_SEGMENT_LENGTH = 180
+
+
+class FolderNameValidationError(ValueError):
+    """Ошибка безопасного имени папки пользователя."""
+
+
+def build_recommended_user_folder_name(
+    contract_number: str, contract_date: str, full_name: str
+) -> str:
+    return validate_user_folder_name(
+        f"{contract_number.strip()} от {contract_date.strip()} {full_name.strip()}"
+    )
+
+
+def sanitize_user_folder_name(name: str) -> str:
+    candidate = (name or "").strip()
+    candidate = _FOLDER_CONTROL.sub("", candidate).replace("/", "_").replace("\\", "_")
+    candidate = _FOLDER_BAD.sub("_", candidate)
+    candidate = re.sub(r"\s+", " ", candidate).strip(" .")
+    return candidate
+
+
+def validate_user_folder_name(name: str) -> str:
+    raw = (name or "").strip()
+    if not raw:
+        raise FolderNameValidationError("Имя папки не может быть пустым")
+    lowered = raw.lower()
+    if lowered.startswith("disk:/") or ":/" in raw:
+        raise FolderNameValidationError("Введите только имя папки, не полный путь")
+    if raw in {".", ".."} or ".." in raw:
+        raise FolderNameValidationError("Имя папки не должно содержать переходы по пути")
+    if _FOLDER_CONTROL.search(raw) or "/" in raw or "\\" in raw:
+        raise FolderNameValidationError("Имя папки содержит недопустимые символы")
+    safe = sanitize_user_folder_name(raw)
+    if safe != raw or not safe:
+        raise FolderNameValidationError("Имя папки содержит недопустимые символы")
+    if len(safe) > MAX_FOLDER_SEGMENT_LENGTH:
+        raise FolderNameValidationError("Имя папки слишком длинное")
+    return safe
+
+
+def user_folder_for_user(root: str, user) -> str:
+    if getattr(user, "folder_name", None):
+        return f"{root.rstrip('/')}/{validate_user_folder_name(user.folder_name)}/"
+    return user_folder(root, user.telegram_id, user.full_name, user.username)

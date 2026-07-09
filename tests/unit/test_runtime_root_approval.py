@@ -55,3 +55,37 @@ async def test_api_approve_active_user_returns_400_without_changes(monkeypatch) 
     assert user.root_folder == "disk:/Old/123_user/"
     assert user.allowed_folders == ["disk:/Old/123_user/"]
     assert session.committed is False
+
+
+class FakeScalarResult:
+    def __init__(self, rows):
+        self.rows = rows
+
+    def all(self):
+        return self.rows
+
+
+class ConflictSession(FakeSession):
+    def __init__(self, user, users):
+        super().__init__(user)
+        self.users = users
+
+    async def scalars(self, _stmt):
+        return FakeScalarResult(self.users)
+
+
+async def test_pending_user_approve_rejects_folder_conflict() -> None:
+    user = User(id=1, telegram_id=123, username="user", full_name="User", status=UserStatus.pending)
+    other = User(
+        id=2,
+        telegram_id=456,
+        username="other",
+        full_name="Other",
+        status=UserStatus.active,
+        root_folder="disk:/Runtime Root/123_user/",
+        allowed_folders=["disk:/Runtime Root/123_user/"],
+    )
+    with pytest.raises(ValueError, match="Папка уже назначена другому пользователю"):
+        await approve_user(ConflictSession(user, [user, other]), user, 99, "disk:/Runtime Root")
+    assert user.status == UserStatus.pending
+    assert user.root_folder is None

@@ -162,3 +162,6 @@ pre {
   .actions > div { width: 100%; }
   .file-row { flex-direction: column; gap: 2px; }
 }
+.dropdown { display: grid; gap: 4px; margin-bottom: 8px; }
+.dropdown-item { width: 100%; text-align: left; background: var(--surface); color: var(--text); border: 1px solid var(--border); }
+select { width: 100%; margin: 8px 0; padding: 12px; border-radius: 12px; border: 1px solid var(--border); background: var(--bg); color: var(--text); font: inherit; }

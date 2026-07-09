@@ -13,6 +13,7 @@ let userStatusFilter = "all";
 let adminStatusFilter = "all";
 let adminUserQuery = "";
 let adminSearchTimer;
+let selectedRenameUser = null;
 
 const STATUS_LABELS = {
   pending: "ожидает одобрения",
@@ -183,6 +184,7 @@ async function loadAdmin(tab) {
   adminContent.innerHTML = '<div id="admin-error" class="muted"></div>';
   try {
     if (tab === "users") return await renderAdminUsers();
+    if (tab === "renames") return await renderRenameRequests();
     if (tab === "audit") return await renderAudit();
     if (tab === "disk-root") return await renderDiskRootSettings();
     await renderAdminUploads();
@@ -269,6 +271,45 @@ async function renderDiskRootSettings() {
     } catch (err) { showAdminError(err.message); }
   };
 }
+
+async function renderRenameRequests() {
+  const requests = await api("/api/admin/folder-rename-requests?status=pending");
+  adminContent.innerHTML = `<div id="admin-error" class="muted"></div>
+    <div class="card"><h3>Переименовать папку</h3>
+      <div class="search-box"><input id="rename-user-search" placeholder="Поиск пользователя по Telegram ID, username, ФИО, договору или папке"><div id="rename-user-results" class="dropdown"></div></div>
+      <div id="rename-user-card" class="muted">Выберите пользователя из выпадающего списка.</div>
+      <select id="rename-source"><option value="">Сначала выберите пользователя</option></select>
+      <input id="rename-new-name" placeholder="12345 от 09.07.2026 Иванов Иван Иванович">
+      <button id="rename-user-button">Переименовать папку</button>
+    </div>
+    <div class="card"><h3>Заявки на переименование</h3><div id="rename-requests"></div></div>`;
+  bindRenameUserSearch();
+  document.querySelector("#rename-user-button").onclick = renameSelectedUserFolder;
+  document.querySelector("#rename-requests").innerHTML = (requests.items || []).map((r) => `<div class="request-card"><b>${escapeHtml(r.requested_folder_name)}</b><div class="meta">${escapeHtml(r.user?.telegram_id || "—")} · ${escapeHtml(r.contract_full_name || "—")}</div><button onclick="approveRenameRequest(${r.id}, ${r.user_id})">Одобрить</button><button class="danger" onclick="rejectRenameRequest(${r.id})">Отклонить</button></div>`).join("") || '<div class="empty">Нет pending-заявок.</div>';
+}
+function bindRenameUserSearch() {
+  const input = document.querySelector("#rename-user-search");
+  input.oninput = () => { clearTimeout(adminSearchTimer); adminSearchTimer = setTimeout(async () => {
+    const q = input.value.trim(); const box = document.querySelector("#rename-user-results");
+    if (!q) { box.innerHTML = ""; return; }
+    const data = await api(`/api/admin/users/search?query=${encodeURIComponent(q)}`);
+    box.innerHTML = (data.items || []).map((u) => `<button class="dropdown-item" data-user-id="${u.id}">${escapeHtml(u.telegram_id)} · ${escapeHtml(u.contract_full_name || u.full_name || "—")}<br><span class="muted">${escapeHtml(u.folder_name || "—")}</span></button>`).join("");
+    box.querySelectorAll("[data-user-id]").forEach((b, i) => b.onclick = () => selectRenameUser(data.items[i]));
+  }, 300); };
+}
+async function selectRenameUser(user) {
+  selectedRenameUser = user;
+  document.querySelector("#rename-user-card").innerHTML = `<b>${escapeHtml(user.contract_full_name || user.full_name || "—")}</b><div class="meta">${escapeHtml(user.telegram_id)} · ${escapeHtml(user.folder_name || "—")}</div>`;
+  const candidates = await api(`/api/admin/users/${user.id}/folder-candidates`);
+  document.querySelector("#rename-source").innerHTML = (candidates.items || []).map((c) => `<option value="${escapeHtml(c.path)}">${escapeHtml(c.label)} — ${escapeHtml(c.path)}</option>`).join("");
+}
+async function renameSelectedUserFolder() {
+  if (!selectedRenameUser) return showAdminError("Выберите пользователя");
+  await api(`/api/admin/users/${selectedRenameUser.id}/rename-folder`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ source_folder: document.querySelector("#rename-source").value, new_folder_name: document.querySelector("#rename-new-name").value }) });
+  await renderRenameRequests();
+}
+async function approveRenameRequest(id, userId) { await selectRenameUser({ id: userId }); const source_folder = document.querySelector("#rename-source").value; await api(`/api/admin/folder-rename-requests/${id}/approve`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ source_folder }) }); await renderRenameRequests(); }
+async function rejectRenameRequest(id) { const reason = prompt("Причина", "Отклонено администратором") || "Отклонено администратором"; await api(`/api/admin/folder-rename-requests/${id}/reject`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ reason }) }); await renderRenameRequests(); }
 
 async function renderAudit() {
   const rows = await api("/api/admin/audit");

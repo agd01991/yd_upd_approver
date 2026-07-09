@@ -34,6 +34,13 @@ class UploadStatus(StrEnum):
     deleted_temp = "deleted_temp"
 
 
+class FolderRenameRequestStatus(StrEnum):
+    pending = "pending"
+    approved = "approved"
+    rejected = "rejected"
+    cancelled = "cancelled"
+
+
 class User(Base):
     __tablename__ = "users"
 
@@ -45,6 +52,10 @@ class User(Base):
         Enum(UserStatus), default=UserStatus.pending, index=True
     )
     root_folder: Mapped[str | None] = mapped_column(String(1024))
+    folder_name: Mapped[str | None] = mapped_column(String(512))
+    contract_number: Mapped[str | None] = mapped_column(String(128))
+    contract_date: Mapped[str | None] = mapped_column(String(64))
+    contract_full_name: Mapped[str | None] = mapped_column(String(512))
     allowed_folders: Mapped[list[str]] = mapped_column(JSONB, default=list)
     quota_mb: Mapped[int | None] = mapped_column(Integer)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
@@ -52,6 +63,31 @@ class User(Base):
     approved_by: Mapped[int | None] = mapped_column(BigInteger)
 
     requests: Mapped[list["UploadRequest"]] = relationship(back_populates="user")
+    folder_rename_requests: Mapped[list["FolderRenameRequest"]] = relationship(
+        back_populates="user"
+    )
+
+
+class FolderRenameRequest(Base):
+    __tablename__ = "folder_rename_requests"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    requested_folder_name: Mapped[str] = mapped_column(String(512))
+    contract_number: Mapped[str | None] = mapped_column(String(128))
+    contract_date: Mapped[str | None] = mapped_column(String(64))
+    contract_full_name: Mapped[str | None] = mapped_column(String(512))
+    status: Mapped[FolderRenameRequestStatus] = mapped_column(
+        Enum(FolderRenameRequestStatus), default=FolderRenameRequestStatus.pending, index=True
+    )
+    source_folder: Mapped[str | None] = mapped_column(String(1024))
+    target_folder: Mapped[str | None] = mapped_column(String(1024))
+    reject_reason: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    reviewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    reviewed_by: Mapped[int | None] = mapped_column(BigInteger)
+
+    user: Mapped[User] = relationship(back_populates="folder_rename_requests")
 
 
 class UploadRequest(Base):
