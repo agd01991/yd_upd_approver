@@ -41,3 +41,17 @@ def test_webapp_action_labels_are_context_specific():
     assert "${uploadActionLabel(a)}" in app_js
     assert "${userActionLabel(a)}" in app_js
     assert "${actionLabel(a)}" not in app_js
+
+
+def test_webapp_supports_multiple_uploads_filters_and_escaping():
+    app_js = Path("app/webapp/static/app.js").read_text()
+
+    assert "function escapeHtml(value)" in app_js
+    assert 'type="file" name="file" multiple' in app_js
+    assert "USER_FILTERS = [" in app_js
+    assert "ADMIN_FILTERS = [" in app_js
+    assert "user_query" in app_js
+    assert "Загружается ${index + 1} из ${files.length}" in app_js
+    assert "Ожидают действия" in app_js
+    assert "renderAdminUsers" in app_js and "userActionLabel(a)" in app_js
+    assert "renderAdminUploads" in app_js and "uploadActionLabel(a)" in app_js
