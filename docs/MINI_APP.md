@@ -56,3 +56,13 @@ Security notes for local testing:
 - Protected temp-file downloads are performed by `fetch` with the `X-Telegram-Init-Data` header; no bot token or Yandex token is exposed to the frontend.
 - The regular `/api/uploads` response does not expose the administrator's internal Yandex Disk `target_path`.
 - Admin folder changes are selected from `/api/admin/uploads/{request_id}/allowed-folders` and are still validated server-side against `user.allowed_folders`.
+
+
+## Runtime Yandex Disk root
+
+- `YANDEX_DISK_ROOT` is now a fallback/default. Docker `.env` should point `DATABASE_URL` to `postgres` and `REDIS_URL` to `redis`; use `localhost` only for non-Docker local runs.
+- Admins can run `/diskroot` to see the active root and whether it comes from `.env` or DB.
+- Admins can run `/setdiskroot disk:/New Root` or `/setdiskroot` interactively to change the root for newly approved users.
+- The bot validates the path and creates the Yandex Disk folder before saving; if folder creation fails, the setting is not saved.
+- Changing the root affects only new users approved after the change. Existing active users keep their current folders and are not migrated.
+- Mini App user approval uses the same runtime root with fallback to `YANDEX_DISK_ROOT`. Uploads continue to use each user's assigned `user.root_folder`.
