@@ -9,6 +9,8 @@ from app.db.repositories import create_upload_request, list_user_requests, next_
 from app.services.file_policy import validate_size
 from app.services.naming import join_disk_path, sanitize_filename
 from app.services.storage import TempStorage
+from app.services.user_folders import ensure_user_folder_for_current_root
+from app.services.yandex_disk import YandexDiskClient
 from app.utils.formatting import format_upload_card
 
 router = APIRouter(prefix="/uploads")
@@ -66,7 +68,20 @@ async def create_upload(
                 destination.unlink(missing_ok=True)
                 raise HTTPException(status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, "File is too large")
             out.write(chunk)
-    target_path = join_disk_path(user.root_folder, safe)
+    client = YandexDiskClient(settings.yandex_disk_token)
+    try:
+        target_folder = await ensure_user_folder_for_current_root(session, user, settings, client)
+    except Exception as exc:
+        if hasattr(session, "rollback"):
+            await session.rollback()
+        destination.unlink(missing_ok=True)
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "Не удалось подготовить папку на Яндекс.Диске",
+        ) from exc
+    finally:
+        await client.close()
+    target_path = join_disk_path(target_folder, safe)
     upload = await create_upload_request(
         session,
         request_code=request_code,
@@ -81,7 +96,7 @@ async def create_upload(
         sha256=storage.sha256(destination),
         caption=caption,
         local_path=str(destination),
-        target_folder=user.root_folder,
+        target_folder=target_folder,
         target_path=target_path,
     )
     await session.commit()

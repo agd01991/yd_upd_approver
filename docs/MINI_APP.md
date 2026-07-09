@@ -71,10 +71,10 @@ Security notes for local testing:
 
 - `YANDEX_DISK_ROOT` is now a fallback/default. Docker `.env` should point `DATABASE_URL` to `postgres` and `REDIS_URL` to `redis`; use `localhost` only for non-Docker local runs.
 - Admins can run `/diskroot` to see the active root and whether it comes from `.env` or DB.
-- Admins can run `/setdiskroot disk:/New Root` or `/setdiskroot` interactively to change the root for newly approved users.
+- Admins can run `/setdiskroot disk:/New Root` or `/setdiskroot` interactively to change the active root for new uploads of all active users.
 - The bot validates the path and creates the Yandex Disk folder before saving; if folder creation fails, the setting is not saved.
 - Changing the root affects only new users approved after the change. Existing active users keep their current folders and are not migrated.
-- Mini App user approval uses the same runtime root with fallback to `YANDEX_DISK_ROOT`. Uploads continue to use each user's assigned `user.root_folder`.
+- Mini App user approval uses the same runtime root with fallback to `YANDEX_DISK_ROOT`. Before each new upload and file listing, the backend ensures the user folder exists under the active root.
 
 ## Раздельное изменение имени файла и расширения
 
@@ -84,7 +84,7 @@ Security notes for local testing:
 
 - `Изменить имя` отправляет в API только `filename_stem`. Backend сохраняет текущее расширение: `old.txt` + `тест` превращается в `тест.txt`.
 - `Изменить расширение` отправляет только `filename_extension`. Backend сохраняет имя: `old.txt` + `pdf` превращается в `old.pdf`.
-- `Сменить папку` отправляет только `target_folder`, который повторно проверяется на принадлежность `user.allowed_folders`.
+- `Сменить папку этой заявки` отправляет только `target_folder`, который повторно проверяется на принадлежность `user.allowed_folders`.
 
 `original_filename`, `local_path` и временный файл не изменяются. После каждого допустимого изменения `target_path` безопасно пересобирается из разрешённой папки и безопасного имени файла. Интерфейс Mini App использует русские пользовательские подписи и русские названия статусов; машинные значения API остаются внутренними.
 
@@ -96,3 +96,7 @@ The Mini App uses vanilla HTML/CSS/JS and Telegram theme variables with fallback
 Users can choose multiple files in the upload card. The selected-file list shows the order, file name, and size before sending. Files are uploaded one by one through the existing `POST /api/uploads` endpoint, so every selected file creates its own request. The comment textarea is shared and is attached to every uploaded file. If one file fails validation or upload, the UI records that error and continues with the next file.
 
 The user request list has status chips: all, pending review, uploaded, failed, and rejected. Filtering is performed in the frontend over `/api/uploads`. The admin upload list has chips for all, pending review, uploaded, failed, rejected, and requests waiting for action. Admin status filters use optional query parameters on `GET /api/admin/uploads` where possible. The admin search field calls the same endpoint with `user_query` and matches Telegram ID, username, or full name without changing authorization rules.
+
+## Корневая папка
+
+Во вкладке `Администратор → Корневая папка` администратор видит активную корневую папку и источник (`.env` или database), а также может сохранить новое значение. Это общая папка, внутри которой создаются папки пользователей. После изменения новые загрузки всех пользователей идут в новую root; если папки пользователя там ещё нет, backend создаёт её повторно. Старые файлы не переносятся, старые заявки не мигрируются, старые папки не удаляются. Кнопка `Сменить папку этой заявки` меняет только конкретную заявку.

@@ -7,12 +7,12 @@ from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import admin_user_dep, bot_dep, get_db, settings_dep
-from app.api.schemas import AllowedFoldersResponse, RejectBody, UploadPatch
+from app.api.schemas import AllowedFoldersResponse, DiskRootUpdate, RejectBody, UploadPatch
 from app.api.security import TelegramWebAppUser
 from app.config import Settings
 from app.db.models import AuditLog, UploadRequest, UploadStatus, User, UserStatus
 from app.db.repositories import approve_user
-from app.services.app_settings import get_yandex_disk_root
+from app.services.app_settings import get_yandex_disk_root, get_yandex_disk_root_setting
 from app.services.audit import write_audit
 from app.services.file_policy import folder_allowed
 from app.services.naming import (
@@ -21,7 +21,9 @@ from app.services.naming import (
     change_filename_stem,
     join_disk_path,
     sanitize_filename,
+    user_folder,
 )
+from app.services.user_folders import change_yandex_disk_root_for_active_users
 from app.services.yandex_disk import YandexDiskClient
 from app.workers.upload_worker import upload_approved_request
 
@@ -84,10 +86,15 @@ async def _moderate_user(
         if user.status != UserStatus.pending:
             raise HTTPException(400, "User is already processed")
         disk_root = await get_yandex_disk_root(session, settings)
-        await approve_user(session, user, actor, disk_root)
+        folder = user_folder(disk_root, user.telegram_id, user.full_name, user.username)
         client = YandexDiskClient(settings.yandex_disk_token)
         try:
-            await client.mkdir_recursive(user.root_folder)
+            await client.mkdir_recursive(folder)
+            await approve_user(session, user, actor, disk_root)
+        except Exception as exc:
+            if hasattr(session, "rollback"):
+                await session.rollback()
+            raise HTTPException(503, "Не удалось создать папку Яндекс.Диска") from exc
         finally:
             await client.close()
         msg = "Ваш доступ одобрен. Можете отправлять файлы."
@@ -123,6 +130,41 @@ async def moderate_user(
     if action not in {"approve", "reject", "block"}:
         raise HTTPException(404, "Unknown action")
     return await _moderate_user(user_id, action, actor.telegram_id, session, settings, bot)
+
+
+@router.get("/disk-root")
+async def get_disk_root(
+    session: AsyncSession = Depends(get_db),
+    settings: Settings = Depends(settings_dep),
+) -> dict:
+    current = await get_yandex_disk_root_setting(session, settings)
+    return {
+        "value": current.value,
+        "is_default": current.is_default,
+        "source": "env" if current.is_default else "database",
+    }
+
+
+@router.put("/disk-root")
+async def put_disk_root(
+    body: DiskRootUpdate,
+    actor: TelegramWebAppUser = Depends(admin_user_dep),
+    session: AsyncSession = Depends(get_db),
+    settings: Settings = Depends(settings_dep),
+) -> dict:
+    client = YandexDiskClient(settings.yandex_disk_token)
+    try:
+        root = await change_yandex_disk_root_for_active_users(
+            session, settings, client, body.root, actor.telegram_id
+        )
+        await session.commit()
+    except Exception as exc:
+        if hasattr(session, "rollback"):
+            await session.rollback()
+        raise HTTPException(503, "Не удалось сохранить корневую папку Яндекс.Диска") from exc
+    finally:
+        await client.close()
+    return {"value": root, "is_default": False, "source": "database"}
 
 
 def _parse_upload_status(status: str | None) -> UploadStatus | None:

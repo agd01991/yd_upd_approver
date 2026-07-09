@@ -10,6 +10,8 @@ from app.services.file_policy import validate_size
 from app.services.naming import join_disk_path, sanitize_filename
 from app.services.storage import TempStorage
 from app.services.telegram_files import download_file
+from app.services.user_folders import ensure_user_folder_for_current_root
+from app.services.yandex_disk import YandexDiskClient
 from app.utils.formatting import format_upload_card
 
 router = Router()
@@ -56,7 +58,19 @@ async def document_upload(
             "Не удалось скачать файл из Telegram. Попробуйте отправить файл ещё раз."
         )
         return
-    target_folder = user.root_folder
+    client = YandexDiskClient(settings.yandex_disk_token)
+    try:
+        target_folder = await ensure_user_folder_for_current_root(session, user, settings, client)
+    except Exception:
+        if hasattr(session, "rollback"):
+            await session.rollback()
+        destination.unlink(missing_ok=True)
+        await message.answer(
+            "Не удалось подготовить папку на Яндекс.Диске. Попробуйте позже или обратитесь к администратору."
+        )
+        return
+    finally:
+        await client.close()
     target_path = join_disk_path(target_folder, safe)
 
     upload = await create_upload_request(

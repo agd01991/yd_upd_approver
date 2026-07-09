@@ -19,3 +19,7 @@ class AllowedFolder(BaseModel):
 
 class AllowedFoldersResponse(BaseModel):
     items: list[AllowedFolder]
+
+
+class DiskRootUpdate(BaseModel):
+    root: str

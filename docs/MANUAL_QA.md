@@ -125,10 +125,10 @@ uvicorn app.api.main:app --host 0.0.0.0 --port 8000
 
 - `YANDEX_DISK_ROOT` is now a fallback/default. Docker `.env` should point `DATABASE_URL` to `postgres` and `REDIS_URL` to `redis`; use `localhost` only for non-Docker local runs.
 - Admins can run `/diskroot` to see the active root and whether it comes from `.env` or DB.
-- Admins can run `/setdiskroot disk:/New Root` or `/setdiskroot` interactively to change the root for newly approved users.
+- Admins can run `/setdiskroot disk:/New Root` or `/setdiskroot` interactively to change the active root for new uploads of all active users.
 - The bot validates the path and creates the Yandex Disk folder before saving; if folder creation fails, the setting is not saved.
 - Changing the root affects only new users approved after the change. Existing active users keep their current folders and are not migrated.
-- Mini App user approval uses the same runtime root with fallback to `YANDEX_DISK_ROOT`. Uploads continue to use each user's assigned `user.root_folder`.
+- Mini App user approval uses the same runtime root with fallback to `YANDEX_DISK_ROOT`. Before each new upload and file listing, the backend ensures the user folder exists under the active root.
 
 ## Проверка раздельного изменения имени и расширения
 
@@ -142,7 +142,7 @@ uvicorn app.api.main:app --host 0.0.0.0 --port 8000
 ### Mini App
 1. Откройте Mini App из Telegram и войдите администратором.
 2. Во вкладке пользователей проверьте русские кнопки `Одобрить`, `Отклонить` и `Заблокировать`.
-3. В карточке заявки проверьте русские кнопки `Загрузить`, `Загрузить как копию`, `Перезаписать`, `Повторить`, `Отклонить`, а также отдельные кнопки `Изменить имя`, `Изменить расширение` и `Сменить папку`.
+3. В карточке заявки проверьте русские кнопки `Загрузить`, `Загрузить как копию`, `Перезаписать`, `Повторить`, `Отклонить`, а также отдельные кнопки `Изменить имя`, `Изменить расширение` и `Сменить папку этой заявки`.
 4. Проверьте, что Mini App отправляет `filename_stem` для имени и `filename_extension` для расширения, не отправляя `safe_filename` в новом flow.
 5. Все пользовательские подписи, статусы, кнопки и ошибки должны отображаться на русском языке.
 
@@ -167,3 +167,15 @@ uvicorn app.api.main:app --host 0.0.0.0 --port 8000
 4. Search requests by Telegram ID, username, and full name; verify the clear button resets the list.
 5. Confirm grouped actions still work: open temp file, upload, copy, overwrite, retry, rename stem, change extension, change folder, and reject.
 6. Verify a non-admin Telegram user cannot open admin endpoints or see admin data.
+
+## QA: активная корневая папка Яндекс.Диска
+
+1. Создать или иметь active user с root `disk:/Telegram Uploads/...`.
+2. В Mini App админом открыть `Администратор → Корневая папка`.
+3. Задать `disk:/Test Root`.
+4. Проверить, что root сохранён.
+5. Проверить, что папки active users созданы внутри `disk:/Test Root`.
+6. Отправить новый файл от старого active user.
+7. Проверить, что новая заявка получила `target_folder` внутри `disk:/Test Root`.
+8. Проверить, что старые заявки остались со старым `target_path`.
+9. Проверить, что старые файлы не переносились автоматически.

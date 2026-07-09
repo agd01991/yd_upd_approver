@@ -31,7 +31,7 @@ def upload_keyboard(request_id: int) -> InlineKeyboardMarkup:
         ("Отклонить", "reject"),
         ("Изменить имя", "rename_stem"),
         ("Изменить расширение", "rename_extension"),
-        ("Сменить папку", "folder"),
+        ("Сменить папку этой заявки", "folder"),
         ("Содержимое папки", "list"),
         ("Загрузить как копию", "copy"),
         ("Перезаписать", "overwrite"),
