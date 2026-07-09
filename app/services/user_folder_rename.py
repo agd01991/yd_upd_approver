@@ -5,6 +5,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import Settings
 from app.db.models import UploadRequest, User
+from app.db.repositories import find_user_folder_conflict
 from app.services.audit import write_audit
 from app.services.naming import join_disk_path, validate_user_folder_name
 from app.services.yandex_disk import YandexDiskClient
@@ -70,6 +71,9 @@ async def rename_user_folder(
     target = f"{_parent(source)}/{safe_name}/"
     if target == source:
         raise ValueError("Новое имя совпадает с текущим")
+    conflict = await find_user_folder_conflict(session, target, exclude_user_id=user.id)
+    if conflict:
+        raise ValueError("Папка уже назначена другому пользователю")
     await client.move_resource(source, target, overwrite=False)
     old_allowed = [_norm(p) for p in (user.allowed_folders or [])]
     user.allowed_folders = [target if _norm(p) == source else _norm(p) for p in old_allowed]

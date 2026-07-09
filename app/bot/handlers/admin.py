@@ -30,7 +30,7 @@ from app.services.naming import (
     change_filename_extension,
     change_filename_stem,
     join_disk_path,
-    user_folder,
+    user_folder_for_user,
 )
 from app.services.user_folders import change_yandex_disk_root_for_active_users
 from app.services.yandex_disk import YandexDiskClient, YandexDiskError
@@ -241,11 +241,16 @@ async def user_callback(
             )
             return
         disk_root = await get_yandex_disk_root(session, settings)
-        folder = user_folder(disk_root, user.telegram_id, user.full_name, user.username)
+        folder = user_folder_for_user(disk_root, user)
         client = YandexDiskClient(settings.yandex_disk_token)
         try:
-            await client.mkdir_recursive(folder)
             await approve_user(session, user, callback.from_user.id, disk_root)
+            await client.mkdir_recursive(folder)
+        except ValueError as exc:
+            if hasattr(session, "rollback"):
+                await session.rollback()
+            await callback.answer(str(exc), show_alert=True)
+            return
         except Exception as exc:
             if hasattr(session, "rollback"):
                 await session.rollback()

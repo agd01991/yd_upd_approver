@@ -8,6 +8,26 @@ from app.db.models import UploadRequest, UploadStatus, User, UserStatus
 from app.services.naming import user_folder_for_user
 
 
+def _norm_folder(path: str) -> str:
+    return path.rstrip("/") + "/"
+
+
+async def find_user_folder_conflict(
+    session: AsyncSession, folder: str, *, exclude_user_id: int | None = None
+) -> User | None:
+    normalized = _norm_folder(folder)
+    if not hasattr(session, "scalars"):
+        return None
+    users = (await session.scalars(select(User))).all()
+    for other in users:
+        if exclude_user_id is not None and other.id == exclude_user_id:
+            continue
+        folders = [other.root_folder, *(other.allowed_folders or [])]
+        if any(existing and _norm_folder(existing) == normalized for existing in folders):
+            return other
+    return None
+
+
 async def get_or_create_user(
     session: AsyncSession, telegram_id: int, username: str | None, full_name: str | None
 ) -> tuple[User, bool]:
@@ -42,6 +62,9 @@ async def next_request_code(session: AsyncSession) -> str:
 
 async def approve_user(session: AsyncSession, user: User, admin_id: int, disk_root: str) -> User:
     folder = user_folder_for_user(disk_root, user)
+    conflict = await find_user_folder_conflict(session, folder, exclude_user_id=user.id)
+    if conflict:
+        raise ValueError("Папка уже назначена другому пользователю")
     user.status = UserStatus.active
     user.root_folder = folder
     user.allowed_folders = [folder]
