@@ -31,3 +31,13 @@ def test_webapp_app_js_served():
 
     assert response.status_code == 200
     assert "downloadTemp" in response.text
+
+
+def test_webapp_action_labels_are_context_specific():
+    app_js = Path("app/webapp/static/app.js").read_text()
+
+    assert 'UPLOAD_ACTION_LABELS = { approve: "Загрузить"' in app_js
+    assert 'USER_ACTION_LABELS = { approve: "Одобрить"' in app_js
+    assert "${uploadActionLabel(a)}" in app_js
+    assert "${userActionLabel(a)}" in app_js
+    assert "${actionLabel(a)}" not in app_js

@@ -31,10 +31,12 @@ async function api(path, opts = {}) {
 
 
 const STATUS_LABELS = { pending: "ожидает одобрения", active: "активен", rejected: "отклонён", blocked: "заблокирован", stored: "сохранён временно", new: "новый", pending_approval: "ожидает проверки", approved: "одобрено", uploading: "загружается", uploaded: "загружено", failed: "ошибка загрузки", cancelled: "отменено", deleted_temp: "временный файл удалён" };
-const ACTION_LABELS = { approve: "Загрузить", copy: "Загрузить как копию", overwrite: "Перезаписать", retry: "Повторить", reject: "Отклонить", block: "Заблокировать" };
+const UPLOAD_ACTION_LABELS = { approve: "Загрузить", copy: "Загрузить как копию", overwrite: "Перезаписать", retry: "Повторить", reject: "Отклонить" };
+const USER_ACTION_LABELS = { approve: "Одобрить", reject: "Отклонить", block: "Заблокировать" };
 const AUDIT_LABELS = { upload_filename_stem_change: "изменение имени файла", upload_filename_extension_change: "изменение расширения файла", upload_patch: "изменение заявки", upload_folder_change: "изменение папки" };
 function statusLabel(value) { return STATUS_LABELS[value] || value || "—"; }
-function actionLabel(value) { return ACTION_LABELS[value] || value; }
+function uploadActionLabel(value) { return UPLOAD_ACTION_LABELS[value] || value; }
+function userActionLabel(value) { return USER_ACTION_LABELS[value] || value; }
 function auditLabel(value) { return AUDIT_LABELS[value] || value; }
 
 function fmtSize(n) {
@@ -131,7 +133,7 @@ async function renderAdminUploads() {
       <div class="row">
         <button onclick="downloadTemp(${r.id}, decodeURIComponent('${encodeURIComponent(r.safe_filename)}'))">Открыть файл</button>
         ${["approve", "copy", "overwrite", "retry"].map((a) =>
-          `<button onclick="uploadAction(${r.id}, '${a}')">${actionLabel(a)}</button>`
+          `<button onclick="uploadAction(${r.id}, '${a}')">${uploadActionLabel(a)}</button>`
         ).join("")}
         <button class="danger" onclick="rejectUpload(${r.id})">Отклонить</button>
         <button onclick="changeStem(${r.id})">Изменить имя</button>
@@ -149,7 +151,7 @@ async function renderAdminUsers() {
       ID Telegram: ${u.telegram_id}; ${statusLabel(u.status)}
       <div class="row">
         ${u.status === "pending" ? ["approve", "reject", "block"].map((a) =>
-          `<button onclick="moderateUser(${u.id}, '${a}')">${actionLabel(a)}</button>`
+          `<button onclick="moderateUser(${u.id}, '${a}')">${userActionLabel(a)}</button>`
         ).join("") : ""}
       </div>
     </div>`).join("");
