@@ -54,3 +54,15 @@ async def myfiles(message: Message, session: AsyncSession, settings: Settings) -
     finally:
         await client.close()
     await message.answer(format_folder_items(user.root_folder, files))
+
+
+@router.message(Command("renamefolder"))
+async def renamefolder(message: Message, session: AsyncSession) -> None:
+    user = await get_user_by_tg(session, message.from_user.id)
+    if not user or user.status.value != "active":
+        await message.answer("Заявка на переименование доступна только одобренным пользователям.")
+        return
+    await message.answer(
+        "Создать заявку на переименование можно в Mini App: укажите номер договора, дату, ФИО и новое имя папки. "
+        "Администратор выберет текущую или предыдущую папку и выполнит переименование."
+    )

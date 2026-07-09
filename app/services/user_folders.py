@@ -6,7 +6,7 @@ from app.db.models import User, UserStatus
 from app.services.app_settings import get_yandex_disk_root, set_yandex_disk_root
 from app.services.audit import write_audit
 from app.services.disk_paths import validate_yandex_disk_root
-from app.services.naming import user_folder
+from app.services.naming import user_folder_for_user
 from app.services.yandex_disk import YandexDiskClient
 
 
@@ -37,7 +37,7 @@ def _is_folder_inside_root(folder: str | None, root: str) -> bool:
 def stable_user_folder_for_root(root: str, user: User) -> str:
     basename = _user_folder_basename(user)
     if basename is None:
-        return user_folder(root, user.telegram_id, user.full_name, user.username)
+        return user_folder_for_user(root, user)
     return _folder_with_trailing_slash(root, basename)
 
 

@@ -5,7 +5,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.models import UploadRequest, UploadStatus, User, UserStatus
-from app.services.naming import user_folder
+from app.services.naming import user_folder_for_user
 
 
 async def get_or_create_user(
@@ -41,7 +41,7 @@ async def next_request_code(session: AsyncSession) -> str:
 
 
 async def approve_user(session: AsyncSession, user: User, admin_id: int, disk_root: str) -> User:
-    folder = user_folder(disk_root, user.telegram_id, user.full_name, user.username)
+    folder = user_folder_for_user(disk_root, user)
     user.status = UserStatus.active
     user.root_folder = folder
     user.allowed_folders = [folder]

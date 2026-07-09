@@ -74,7 +74,11 @@ def format_user_card(user: User) -> str:
         f"Имя: {user.full_name or '—'}\n"
         f"Username Telegram: {username}\n"
         f"ID Telegram: {user.telegram_id}\n"
-        f"Статус: {format_user_status(user.status)}"
+        f"Статус: {format_user_status(user.status)}\n"
+        f"Номер договора: {user.contract_number or '—'}\n"
+        f"Дата договора: {user.contract_date or '—'}\n"
+        f"ФИО по договору: {user.contract_full_name or '—'}\n"
+        f"Имя папки: {user.folder_name or '—'}"
     )
 
 
@@ -116,3 +120,29 @@ def format_upload_result(upload: UploadRequest) -> str:
     if upload.status.value == "rejected":
         return f"Файл отклонён: {upload.request_code}. Причина: {upload.reject_reason or '—'}"
     return f"Заявка {upload.request_code}: {format_upload_status(upload.status)}"
+
+
+FOLDER_RENAME_STATUS_LABELS = {
+    "pending": "ожидает рассмотрения",
+    "approved": "одобрена",
+    "rejected": "отклонена",
+    "cancelled": "отменена",
+}
+
+
+def format_folder_rename_status(status: object) -> str:
+    value = _enum_value(status)
+    return FOLDER_RENAME_STATUS_LABELS.get(value, value)
+
+
+def format_folder_rename_request(request, user: User) -> str:
+    username = f"@{user.username}" if user.username else "—"
+    return (
+        "Заявка на переименование папки\n"
+        f"Пользователь: {user.full_name or '—'} / {username} / {user.telegram_id}\n"
+        f"Номер договора: {request.contract_number or '—'}\n"
+        f"Дата договора: {request.contract_date or '—'}\n"
+        f"ФИО по договору: {request.contract_full_name or '—'}\n"
+        f"Новое имя папки: {request.requested_folder_name}\n"
+        f"Статус: {format_folder_rename_status(request.status)}"
+    )

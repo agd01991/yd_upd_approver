@@ -7,10 +7,26 @@ from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import admin_user_dep, bot_dep, get_db, settings_dep
-from app.api.schemas import AllowedFoldersResponse, DiskRootUpdate, RejectBody, UploadPatch
+from app.api.schemas import (
+    AdminRenameFolderBody,
+    AllowedFoldersResponse,
+    DiskRootUpdate,
+    FolderRenameApproveBody,
+    FolderRenameRejectBody,
+    RejectBody,
+    UploadPatch,
+)
 from app.api.security import TelegramWebAppUser
 from app.config import Settings
-from app.db.models import AuditLog, UploadRequest, UploadStatus, User, UserStatus
+from app.db.models import (
+    AuditLog,
+    FolderRenameRequest,
+    FolderRenameRequestStatus,
+    UploadRequest,
+    UploadStatus,
+    User,
+    UserStatus,
+)
 from app.db.repositories import approve_user
 from app.services.app_settings import get_yandex_disk_root, get_yandex_disk_root_setting
 from app.services.audit import write_audit
@@ -21,7 +37,7 @@ from app.services.naming import (
     change_filename_stem,
     join_disk_path,
     sanitize_filename,
-    user_folder,
+    user_folder_for_user,
 )
 from app.services.user_folders import change_yandex_disk_root_for_active_users
 from app.services.yandex_disk import YandexDiskClient
@@ -38,6 +54,28 @@ def user_json(u: User) -> dict:
         "full_name": u.full_name,
         "status": u.status.value,
         "root_folder_assigned": bool(u.root_folder),
+        "folder_name": getattr(u, "folder_name", None),
+        "contract_number": getattr(u, "contract_number", None),
+        "contract_date": getattr(u, "contract_date", None),
+        "contract_full_name": getattr(u, "contract_full_name", None),
+    }
+
+
+def rename_request_json(r: FolderRenameRequest, user: User | None = None) -> dict:
+    return {
+        "id": r.id,
+        "user": user_json(user) if user else None,
+        "user_id": r.user_id,
+        "requested_folder_name": r.requested_folder_name,
+        "contract_number": r.contract_number,
+        "contract_date": r.contract_date,
+        "contract_full_name": r.contract_full_name,
+        "status": r.status.value,
+        "source_folder": r.source_folder,
+        "target_folder": r.target_folder,
+        "reject_reason": r.reject_reason,
+        "created_at": r.created_at,
+        "reviewed_at": r.reviewed_at,
     }
 
 
@@ -86,7 +124,7 @@ async def _moderate_user(
         if user.status != UserStatus.pending:
             raise HTTPException(400, "User is already processed")
         disk_root = await get_yandex_disk_root(session, settings)
-        folder = user_folder(disk_root, user.telegram_id, user.full_name, user.username)
+        folder = user_folder_for_user(disk_root, user)
         client = YandexDiskClient(settings.yandex_disk_token)
         try:
             await client.mkdir_recursive(folder)
@@ -472,3 +510,156 @@ async def audit(session: AsyncSession = Depends(get_db), limit: int = 50) -> lis
         }
         for a in rows
     ]
+
+
+@router.get("/users/search")
+async def search_users(query: str = "", session: AsyncSession = Depends(get_db)) -> dict:
+    q = query.strip()
+    if not q:
+        return {"items": []}
+    like = f"%{q}%"
+    conditions = [
+        User.username.ilike(like),
+        User.full_name.ilike(like),
+        User.contract_full_name.ilike(like),
+        User.contract_number.ilike(like),
+        User.folder_name.ilike(like),
+    ]
+    if q.isdigit():
+        conditions.append(User.telegram_id == int(q))
+    rows = (
+        await session.scalars(
+            select(User).where(or_(*conditions)).order_by(User.created_at.desc()).limit(20)
+        )
+    ).all()
+    return {"items": [user_json(u) for u in rows]}
+
+
+@router.get("/users/{user_id}/folder-candidates")
+async def folder_candidates(
+    user_id: int,
+    session: AsyncSession = Depends(get_db),
+    settings: Settings = Depends(settings_dep),
+) -> dict:
+    from app.services.user_folder_rename import get_user_folder_candidates
+
+    user = await session.get(User, user_id)
+    if not user:
+        raise HTTPException(404, "User not found")
+    items = await get_user_folder_candidates(session, user, settings)
+    return {"items": [c.__dict__ for c in items]}
+
+
+@router.post("/users/{user_id}/rename-folder")
+async def admin_rename_folder(
+    user_id: int,
+    body: AdminRenameFolderBody,
+    actor: TelegramWebAppUser = Depends(admin_user_dep),
+    session: AsyncSession = Depends(get_db),
+    settings: Settings = Depends(settings_dep),
+) -> dict:
+    from app.services.user_folder_rename import rename_user_folder
+
+    user = await session.get(User, user_id)
+    if not user:
+        raise HTTPException(404, "User not found")
+    client = YandexDiskClient(settings.yandex_disk_token)
+    try:
+        target = await rename_user_folder(
+            session, user, body.source_folder, body.new_folder_name, actor.telegram_id, client
+        )
+        await session.commit()
+    except ValueError as exc:
+        await session.rollback()
+        raise HTTPException(400, str(exc)) from exc
+    except Exception as exc:
+        await session.rollback()
+        raise HTTPException(503, "Не удалось переименовать папку Яндекс.Диска") from exc
+    finally:
+        await client.close()
+    return {"user": user_json(user), "target_folder": target}
+
+
+@router.get("/folder-rename-requests")
+async def admin_folder_rename_requests(
+    status: str = "pending", session: AsyncSession = Depends(get_db)
+) -> dict:
+    req_status = FolderRenameRequestStatus(status)
+    rows = (
+        await session.execute(
+            select(FolderRenameRequest, User)
+            .join(User)
+            .where(FolderRenameRequest.status == req_status)
+            .order_by(FolderRenameRequest.created_at)
+        )
+    ).all()
+    return {"items": [rename_request_json(r, u) for r, u in rows]}
+
+
+@router.post("/folder-rename-requests/{request_id}/approve")
+async def approve_folder_rename_request(
+    request_id: int,
+    body: FolderRenameApproveBody,
+    actor: TelegramWebAppUser = Depends(admin_user_dep),
+    session: AsyncSession = Depends(get_db),
+    settings: Settings = Depends(settings_dep),
+    bot=Depends(bot_dep),
+) -> dict:
+    from app.services.user_folder_rename import rename_user_folder
+
+    req = await session.get(FolderRenameRequest, request_id)
+    user = await session.get(User, req.user_id) if req else None
+    if not req or not user:
+        raise HTTPException(404, "Request not found")
+    if req.status != FolderRenameRequestStatus.pending:
+        raise HTTPException(400, "Request is already processed")
+    client = YandexDiskClient(settings.yandex_disk_token)
+    try:
+        target = await rename_user_folder(
+            session, user, body.source_folder, req.requested_folder_name, actor.telegram_id, client
+        )
+        req.status = FolderRenameRequestStatus.approved
+        req.source_folder = body.source_folder
+        req.target_folder = target
+        req.reviewed_at = datetime.now(UTC)
+        req.reviewed_by = actor.telegram_id
+        await session.commit()
+    except ValueError as exc:
+        await session.rollback()
+        raise HTTPException(400, str(exc)) from exc
+    except Exception as exc:
+        await session.rollback()
+        raise HTTPException(503, "Не удалось переименовать папку Яндекс.Диска") from exc
+    finally:
+        await client.close()
+    if bot:
+        await bot.send_message(
+            user.telegram_id, f"Заявка на переименование папки одобрена: {target}"
+        )
+    return rename_request_json(req, user)
+
+
+@router.post("/folder-rename-requests/{request_id}/reject")
+async def reject_folder_rename_request(
+    request_id: int,
+    body: FolderRenameRejectBody,
+    actor: TelegramWebAppUser = Depends(admin_user_dep),
+    session: AsyncSession = Depends(get_db),
+    bot=Depends(bot_dep),
+) -> dict:
+    req = await session.get(FolderRenameRequest, request_id)
+    user = await session.get(User, req.user_id) if req else None
+    if not req or not user:
+        raise HTTPException(404, "Request not found")
+    if req.status != FolderRenameRequestStatus.pending:
+        raise HTTPException(400, "Request is already processed")
+    req.status = FolderRenameRequestStatus.rejected
+    req.reject_reason = body.reason
+    req.reviewed_at = datetime.now(UTC)
+    req.reviewed_by = actor.telegram_id
+    await session.commit()
+    if bot:
+        await bot.send_message(
+            user.telegram_id, f"Заявка на переименование папки отклонена: {body.reason}"
+        )
+    return rename_request_json(req, user)

@@ -7,12 +7,16 @@ from app.db.models import User, UserStatus
 from app.services.file_policy import can_user_upload, folder_allowed
 from app.services.naming import (
     FilenameEditError,
+    FolderNameValidationError,
+    build_recommended_user_folder_name,
     change_filename_extension,
     change_filename_stem,
     copy_filename,
     join_disk_path,
     sanitize_filename,
+    sanitize_user_folder_name,
     user_folder,
+    validate_user_folder_name,
 )
 from app.utils.security import is_admin
 
@@ -89,3 +93,26 @@ def test_change_filename_extension_rejects_invalid(value: str) -> None:
 def test_change_filename_stem_rejects_too_long_result() -> None:
     with pytest.raises(FilenameEditError):
         change_filename_stem("old.txt", "я" * 255)
+
+
+def test_recommended_user_folder_name() -> None:
+    assert (
+        build_recommended_user_folder_name("12345", "09.07.2026", "Иванов Иван Иванович")
+        == "12345 от 09.07.2026 Иванов Иван Иванович"
+    )
+
+
+def test_manual_folder_name_passes() -> None:
+    assert validate_user_folder_name("Договор № 1 (копия)-А_1.2") == "Договор № 1 (копия)-А_1.2"
+
+
+@pytest.mark.parametrize(
+    "value", ["a/b", "a\\b", "bad\x00name", "../x", "..", "disk:/Root/User", "x" * 181, ""]
+)
+def test_folder_name_rejects_unsafe_values(value: str) -> None:
+    with pytest.raises(FolderNameValidationError):
+        validate_user_folder_name(value)
+
+
+def test_sanitize_folder_name_is_explicit() -> None:
+    assert sanitize_user_folder_name("a/b") == "a_b"

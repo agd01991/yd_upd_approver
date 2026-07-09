@@ -23,3 +23,27 @@ class AllowedFoldersResponse(BaseModel):
 
 class DiskRootUpdate(BaseModel):
     root: str
+
+
+class FolderProfileBody(BaseModel):
+    contract_number: str
+    contract_date: str
+    contract_full_name: str
+    requested_folder_name: str | None = None
+
+
+class FolderRenameRequestCreate(FolderProfileBody):
+    requested_folder_name: str
+
+
+class FolderRenameApproveBody(BaseModel):
+    source_folder: str
+
+
+class FolderRenameRejectBody(BaseModel):
+    reason: str = "Отклонено администратором"
+
+
+class AdminRenameFolderBody(BaseModel):
+    source_folder: str
+    new_folder_name: str
