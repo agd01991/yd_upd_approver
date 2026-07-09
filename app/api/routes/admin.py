@@ -46,6 +46,12 @@ from app.workers.upload_worker import upload_approved_request
 router = APIRouter(prefix="/admin", dependencies=[Depends(admin_user_dep)])
 
 
+def _root_folder_label(path: str | None) -> str | None:
+    if not path:
+        return None
+    return path.rstrip("/").rsplit("/", 1)[-1] or None
+
+
 def user_json(u: User) -> dict:
     return {
         "id": u.id,
@@ -54,6 +60,7 @@ def user_json(u: User) -> dict:
         "full_name": u.full_name,
         "status": u.status.value,
         "root_folder_assigned": bool(u.root_folder),
+        "root_folder_label": _root_folder_label(u.root_folder),
         "folder_name": getattr(u, "folder_name", None),
         "contract_number": getattr(u, "contract_number", None),
         "contract_date": getattr(u, "contract_date", None),
