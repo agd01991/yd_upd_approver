@@ -4,7 +4,7 @@
 
 1. Скопируйте `.env.example` в `.env`.
 2. Заполните `TELEGRAM_BOT_TOKEN`, `TELEGRAM_ADMIN_IDS`, `YANDEX_DISK_TOKEN`.
-3. Проверьте `YANDEX_DISK_ROOT`, `DATABASE_URL`, `TEMP_STORAGE_DIR`, `MAX_FILE_SIZE_MB`.
+3. Проверьте `YANDEX_DISK_ROOT`, `DATABASE_URL`, `TEMP_STORAGE_DIR`, `MAX_FILE_SIZE_MB`; затем `/diskroot` должен показать runtime root или fallback `.env`.
 
 ## 2. Запуск БД
 
@@ -34,7 +34,7 @@ python -m app.main
 
 1. Нажмите `Одобрить` в карточке пользователя.
 2. Проверьте уведомление пользователя.
-3. Проверьте, что папка пользователя создана в `YANDEX_DISK_ROOT`.
+3. Проверьте, что папка пользователя создана в runtime root из `/diskroot`; если runtime setting не задан, используется fallback `YANDEX_DISK_ROOT`.
 
 ## 7. Отправка файла
 

@@ -2,7 +2,7 @@
 
 ## Architecture
 
-The Mini App adds a FastAPI backend in `app/api` and a vanilla HTML/CSS/JS frontend in `app/webapp`. The bot process remains separate. Both bot and API use the same PostgreSQL database, SQLAlchemy models, temporary storage, audit log, and administrator-owned Yandex Disk OAuth token.
+The Mini App adds a FastAPI backend in `app/api` and a vanilla HTML/CSS/JS frontend in `app/webapp`. The bot process remains separate. Both bot and API use the same PostgreSQL database, SQLAlchemy models, temporary storage, audit log, runtime `app_settings`, and administrator-owned Yandex Disk OAuth token.
 
 ## Authentication
 
