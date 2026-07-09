@@ -29,10 +29,11 @@ def upload_keyboard(request_id: int) -> InlineKeyboardMarkup:
         ("Открыть файл", "open"),
         ("Загрузить", "approve"),
         ("Отклонить", "reject"),
-        ("Переименовать", "rename"),
+        ("Изменить имя", "rename_stem"),
+        ("Изменить расширение", "rename_extension"),
         ("Сменить папку", "folder"),
         ("Содержимое папки", "list"),
-        ("Как копию", "copy"),
+        ("Загрузить как копию", "copy"),
         ("Перезаписать", "overwrite"),
         ("Повторить", "retry"),
     ]

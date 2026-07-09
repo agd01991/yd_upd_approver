@@ -154,3 +154,51 @@ async def test_non_admin_cannot_pass_admin_dependency() -> None:
         )
 
     assert exc.value.status_code == 403
+
+
+@pytest.mark.anyio
+async def test_patch_upload_filename_stem_preserves_extension() -> None:
+    upload = make_upload()
+    upload.safe_filename = "old.txt"
+    upload.target_path = "disk:/Telegram Uploads/123_user/old.txt"
+    result = await patch_upload(
+        upload.id,
+        UploadPatch(filename_stem="тест"),
+        TelegramWebAppUser(telegram_id=100),
+        FakeSession(upload, make_user()),
+    )
+    assert result["safe_filename"] == "тест.txt"
+    assert result["target_path"].endswith("/тест.txt")
+
+
+@pytest.mark.anyio
+async def test_patch_upload_filename_extension_changes_extension_only() -> None:
+    upload = make_upload()
+    upload.safe_filename = "old.txt"
+    result = await patch_upload(
+        upload.id,
+        UploadPatch(filename_extension="pdf"),
+        TelegramWebAppUser(telegram_id=100),
+        FakeSession(upload, make_user()),
+    )
+    assert result["safe_filename"] == "old.pdf"
+
+
+@pytest.mark.anyio
+async def test_patch_upload_rejects_invalid_and_conflicting_filename_fields() -> None:
+    upload = make_upload()
+    user = make_user()
+    actor = TelegramWebAppUser(telegram_id=100)
+    with pytest.raises(HTTPException) as exc:
+        await patch_upload(
+            upload.id, UploadPatch(filename_stem="bad.txt"), actor, FakeSession(upload, user)
+        )
+    assert exc.value.status_code == 400
+    with pytest.raises(HTTPException) as exc:
+        await patch_upload(
+            upload.id,
+            UploadPatch(filename_stem="x", filename_extension="pdf"),
+            actor,
+            FakeSession(upload, user),
+        )
+    assert exc.value.status_code == 400

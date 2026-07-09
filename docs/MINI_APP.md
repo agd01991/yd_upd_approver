@@ -66,3 +66,15 @@ Security notes for local testing:
 - The bot validates the path and creates the Yandex Disk folder before saving; if folder creation fails, the setting is not saved.
 - Changing the root affects only new users approved after the change. Existing active users keep their current folders and are not migrated.
 - Mini App user approval uses the same runtime root with fallback to `YANDEX_DISK_ROOT`. Uploads continue to use each user's assigned `user.root_folder`.
+
+## Раздельное изменение имени файла и расширения
+
+Администратор в Mini App модерирует пользователей русскими кнопками `Одобрить`, `Отклонить` и `Заблокировать`. Для заявок на файлы используются отдельные русские подписи действий: `Загрузить`, `Загрузить как копию`, `Перезаписать`, `Повторить` и `Отклонить`, поэтому одинаковое API-действие `approve` отображается по контексту.
+
+Администратор в Mini App меняет параметры заявки отдельными действиями:
+
+- `Изменить имя` отправляет в API только `filename_stem`. Backend сохраняет текущее расширение: `old.txt` + `тест` превращается в `тест.txt`.
+- `Изменить расширение` отправляет только `filename_extension`. Backend сохраняет имя: `old.txt` + `pdf` превращается в `old.pdf`.
+- `Сменить папку` отправляет только `target_folder`, который повторно проверяется на принадлежность `user.allowed_folders`.
+
+`original_filename`, `local_path` и временный файл не изменяются. После каждого допустимого изменения `target_path` безопасно пересобирается из разрешённой папки и безопасного имени файла. Интерфейс Mini App использует русские пользовательские подписи и русские названия статусов; машинные значения API остаются внутренними.

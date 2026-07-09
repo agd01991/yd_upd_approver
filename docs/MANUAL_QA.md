@@ -104,3 +104,19 @@ python -m app.main
 - The bot validates the path and creates the Yandex Disk folder before saving; if folder creation fails, the setting is not saved.
 - Changing the root affects only new users approved after the change. Existing active users keep their current folders and are not migrated.
 - Mini App user approval uses the same runtime root with fallback to `YANDEX_DISK_ROOT`. Uploads continue to use each user's assigned `user.root_folder`.
+
+## Проверка раздельного изменения имени и расширения
+
+### Telegram-бот
+1. Отправьте активным пользователем файл `old.txt` и откройте заявку администратором.
+2. Нажмите `Изменить имя`, введите `тест` и проверьте, что имя в карточке стало `тест.txt`: расширение сохранено, `original_filename` и локальный временный файл не меняются, а путь на Яндекс.Диске пересобран с новым безопасным именем.
+3. Нажмите `Изменить расширение`, введите `pdf` или `.pdf` и проверьте, что имя стало `тест.pdf`: имя файла сохранено, меняется только расширение.
+4. Попробуйте в поле имени ввести `тест.pdf` для файла с расширением `.txt` — бот должен показать русское сообщение об ошибке и не менять заявку.
+5. Для заявок в статусах `uploaded` и `rejected` кнопки изменения должны быть запрещены.
+
+### Mini App
+1. Откройте Mini App из Telegram и войдите администратором.
+2. Во вкладке пользователей проверьте русские кнопки `Одобрить`, `Отклонить` и `Заблокировать`.
+3. В карточке заявки проверьте русские кнопки `Загрузить`, `Загрузить как копию`, `Перезаписать`, `Повторить`, `Отклонить`, а также отдельные кнопки `Изменить имя`, `Изменить расширение` и `Сменить папку`.
+4. Проверьте, что Mini App отправляет `filename_stem` для имени и `filename_extension` для расширения, не отправляя `safe_filename` в новом flow.
+5. Все пользовательские подписи, статусы, кнопки и ошибки должны отображаться на русском языке.

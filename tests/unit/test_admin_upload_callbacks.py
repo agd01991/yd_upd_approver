@@ -151,7 +151,7 @@ class FakeTextMessage(FakeMessage):
 
 
 @pytest.mark.anyio
-async def test_rename_fsm_sanitizes_and_updates_target_path() -> None:
+async def test_rename_fsm_preserves_extension_and_updates_target_path() -> None:
     request = SimpleNamespace(
         id=1,
         user_id=2,
@@ -168,15 +168,15 @@ async def test_rename_fsm_sanitizes_and_updates_target_path() -> None:
     user = SimpleNamespace(id=2, telegram_id=10, username="ivan", full_name="Ivan")
     state = FakeState()
     await state.update_data(request_id=1)
-    message = FakeTextMessage("../new/name.pdf")
+    message = FakeTextMessage("тест")
     await admin.rename_upload(
         message,
         state,
         FakeSession(request, user),
         Settings(telegram_admin_ids=[1]),
     )
-    assert request.safe_filename == "name.pdf"
-    assert request.target_path == "disk:/root/u/name.pdf"
+    assert request.safe_filename == "тест.txt"
+    assert request.target_path == "disk:/root/u/тест.txt"
     assert message.answers[0][1] is not None
 
 
@@ -214,3 +214,28 @@ async def test_folder_selection_only_uses_allowed_folders() -> None:
     assert request.target_folder == "disk:/root/u/docs/"
     assert request.target_path == "disk:/root/u/docs/file.txt"
     assert callback.message.answers[0][1] is not None
+
+
+@pytest.mark.anyio
+async def test_extension_fsm_changes_only_extension() -> None:
+    request = SimpleNamespace(
+        id=1,
+        user_id=2,
+        status=UploadStatus.pending_approval,
+        request_code="REQ-20260707-ABCDEF12",
+        safe_filename="old.txt",
+        target_folder="disk:/root/u/",
+        target_path="disk:/root/u/old.txt",
+        size_bytes=1,
+        mime_type="text/plain",
+        sha256="a" * 64,
+        caption=None,
+    )
+    user = SimpleNamespace(id=2, telegram_id=10, username="ivan", full_name="Ivan")
+    state = FakeState()
+    await state.update_data(request_id=1)
+    await admin.rename_extension_upload(
+        FakeTextMessage("pdf"), state, FakeSession(request, user), Settings(telegram_admin_ids=[1])
+    )
+    assert request.safe_filename == "old.pdf"
+    assert request.target_path == "disk:/root/u/old.pdf"
