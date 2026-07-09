@@ -1,4 +1,9 @@
-"""Add runtime application settings."""
+"""add app settings
+
+Revision ID: 0003_app_settings
+Revises: 0002_mini_app_upload_source
+Create Date: 2026-07-08 00:00:00.000000
+"""
 
 from collections.abc import Sequence
 
