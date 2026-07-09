@@ -127,8 +127,12 @@ async def _moderate_user(
         folder = user_folder_for_user(disk_root, user)
         client = YandexDiskClient(settings.yandex_disk_token)
         try:
-            await client.mkdir_recursive(folder)
             await approve_user(session, user, actor, disk_root)
+            await client.mkdir_recursive(folder)
+        except ValueError as exc:
+            if hasattr(session, "rollback"):
+                await session.rollback()
+            raise HTTPException(400, str(exc)) from exc
         except Exception as exc:
             if hasattr(session, "rollback"):
                 await session.rollback()
@@ -584,15 +588,14 @@ async def admin_rename_folder(
 async def admin_folder_rename_requests(
     status: str = "pending", session: AsyncSession = Depends(get_db)
 ) -> dict:
-    req_status = FolderRenameRequestStatus(status)
-    rows = (
-        await session.execute(
-            select(FolderRenameRequest, User)
-            .join(User)
-            .where(FolderRenameRequest.status == req_status)
-            .order_by(FolderRenameRequest.created_at)
-        )
-    ).all()
+    query = select(FolderRenameRequest, User).join(User).order_by(FolderRenameRequest.created_at)
+    if status and status != "all":
+        try:
+            req_status = FolderRenameRequestStatus(status)
+        except ValueError as exc:
+            raise HTTPException(400, "Неизвестный статус заявки") from exc
+        query = query.where(FolderRenameRequest.status == req_status)
+    rows = (await session.execute(query)).all()
     return {"items": [rename_request_json(r, u) for r, u in rows]}
 
 

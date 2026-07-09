@@ -1,5 +1,7 @@
-from aiogram import Bot, Router
-from aiogram.filters import Command
+from aiogram import Bot, F, Router
+from aiogram.filters import Command, StateFilter
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
@@ -23,7 +25,19 @@ from app.services.naming import (
 from app.utils.formatting import format_user_card
 
 router = Router()
-_ONBOARDING: dict[int, dict[str, str]] = {}
+
+
+class FolderProfileStates(StatesGroup):
+    waiting_for_contract_number = State()
+    waiting_for_contract_date = State()
+    waiting_for_contract_full_name = State()
+    waiting_for_folder_confirm = State()
+    waiting_for_manual_folder_name = State()
+
+
+def _text_value(message: Message) -> str | None:
+    text = (message.text or "").strip()
+    return text or None
 
 
 def webapp_keyboard(settings: Settings) -> InlineKeyboardMarkup | None:
@@ -41,7 +55,9 @@ def webapp_keyboard(settings: Settings) -> InlineKeyboardMarkup | None:
 
 
 @router.message(Command("start"))
-async def start(message: Message, bot: Bot, session: AsyncSession, settings: Settings) -> None:
+async def start(
+    message: Message, bot: Bot, session: AsyncSession, settings: Settings, state: FSMContext
+) -> None:
     user, created = await get_or_create_user(
         session,
         message.from_user.id,
@@ -63,7 +79,8 @@ async def start(message: Message, bot: Bot, session: AsyncSession, settings: Set
         return
 
     if user.status == UserStatus.pending and not user.folder_name:
-        _ONBOARDING[user.telegram_id] = {"step": "contract_number"}
+        await state.clear()
+        await state.set_state(FolderProfileStates.waiting_for_contract_number)
         await message.answer("Введите номер договора:")
         return
     await message.answer(
@@ -85,93 +102,132 @@ async def help_cmd(message: Message) -> None:
     await message.answer("Команды: /profile, /status, /myfiles. Отправьте файл после одобрения.")
 
 
-@router.message()
-async def onboarding_answers(
-    message: Message, bot: Bot, session: AsyncSession, settings: Settings
+@router.message(
+    StateFilter(FolderProfileStates.waiting_for_contract_number), F.text, ~F.text.startswith("/")
+)
+async def onboarding_contract_number(message: Message, state: FSMContext) -> None:
+    text = _text_value(message)
+    if not text:
+        await message.answer("Введите номер договора текстом:")
+        return
+    await state.update_data(contract_number=text)
+    await state.set_state(FolderProfileStates.waiting_for_contract_date)
+    await message.answer("Введите дату договора (например, 09.07.2026):")
+
+
+@router.message(
+    StateFilter(FolderProfileStates.waiting_for_contract_date), F.text, ~F.text.startswith("/")
+)
+async def onboarding_contract_date(message: Message, state: FSMContext) -> None:
+    text = _text_value(message)
+    if not text:
+        await message.answer("Введите дату договора текстом:")
+        return
+    await state.update_data(contract_date=text)
+    await state.set_state(FolderProfileStates.waiting_for_contract_full_name)
+    await message.answer("Введите ФИО по договору:")
+
+
+@router.message(
+    StateFilter(FolderProfileStates.waiting_for_contract_full_name), F.text, ~F.text.startswith("/")
+)
+async def onboarding_contract_full_name(message: Message, state: FSMContext) -> None:
+    text = _text_value(message)
+    if not text:
+        await message.answer("Введите ФИО по договору текстом:")
+        return
+    data = await state.get_data()
+    try:
+        folder_name = build_recommended_user_folder_name(
+            data["contract_number"], data["contract_date"], text
+        )
+    except FolderNameValidationError as exc:
+        await state.clear()
+        await state.set_state(FolderProfileStates.waiting_for_contract_number)
+        await message.answer(
+            f"Данные дают небезопасное имя папки: {exc}. Введите номер договора заново:"
+        )
+        return
+    await state.update_data(contract_full_name=text, folder_name=folder_name)
+    await state.set_state(FolderProfileStates.waiting_for_folder_confirm)
+    await message.answer(
+        f"Предлагаемое имя папки:\n{folder_name}\n\nПодтвердить или изменить?",
+        reply_markup=ReplyKeyboardMarkup(
+            keyboard=[
+                [KeyboardButton(text="Подтвердить")],
+                [KeyboardButton(text="Изменить имя папки")],
+                [KeyboardButton(text="Изменить данные")],
+            ],
+            resize_keyboard=True,
+        ),
+    )
+
+
+@router.message(
+    StateFilter(FolderProfileStates.waiting_for_folder_confirm), F.text, ~F.text.startswith("/")
+)
+async def onboarding_confirm(
+    message: Message, bot: Bot, session: AsyncSession, settings: Settings, state: FSMContext
 ) -> None:
-    state = _ONBOARDING.get(message.from_user.id)
-    if not state:
+    text = _text_value(message)
+    if not text:
+        await message.answer("Выберите действие кнопкой или отправьте текст команды.")
         return
     user, _ = await get_or_create_user(
         session, message.from_user.id, message.from_user.username, message.from_user.full_name
     )
-    text = (message.text or "").strip()
-    step = state.get("step")
-    if step == "contract_number":
-        state["contract_number"] = text
-        state["step"] = "contract_date"
-        await message.answer("Введите дату договора (например, 09.07.2026):")
-        return
-    if step == "contract_date":
-        state["contract_date"] = text
-        state["step"] = "contract_full_name"
-        await message.answer("Введите ФИО по договору:")
-        return
-    if step == "contract_full_name":
-        state["contract_full_name"] = text
-        try:
-            state["folder_name"] = build_recommended_user_folder_name(
-                state["contract_number"], state["contract_date"], state["contract_full_name"]
-            )
-        except FolderNameValidationError as exc:
-            state.clear()
-            state["step"] = "contract_number"
-            await message.answer(
-                f"Данные дают небезопасное имя папки: {exc}. Введите номер договора заново:"
-            )
-            return
-        state["step"] = "confirm"
-        await message.answer(
-            f"Предлагаемое имя папки:\n{state['folder_name']}\n\nПодтвердить или изменить?",
-            reply_markup=ReplyKeyboardMarkup(
-                keyboard=[
-                    [KeyboardButton(text="Подтвердить")],
-                    [KeyboardButton(text="Изменить имя папки")],
-                    [KeyboardButton(text="Изменить данные")],
-                ],
-                resize_keyboard=True,
-            ),
-        )
-        return
-    if step == "confirm" and text == "Изменить данные":
-        _ONBOARDING[user.telegram_id] = {"step": "contract_number"}
+    if text == "Изменить данные":
+        await state.clear()
+        await state.set_state(FolderProfileStates.waiting_for_contract_number)
         await message.answer("Введите номер договора:", reply_markup=ReplyKeyboardRemove())
         return
-    if step == "confirm" and text == "Изменить имя папки":
-        state["step"] = "manual_name"
+    if text == "Изменить имя папки":
+        await state.set_state(FolderProfileStates.waiting_for_manual_folder_name)
         await message.answer("Введите итоговое имя папки:", reply_markup=ReplyKeyboardRemove())
         return
-    if step == "manual_name":
-        try:
-            state["folder_name"] = validate_user_folder_name(text)
-        except FolderNameValidationError as exc:
-            await message.answer(f"Имя папки небезопасно: {exc}. Введите другое имя:")
-            return
-        state["step"] = "confirm"
-        await message.answer(
-            f"Итоговое имя папки:\n{state['folder_name']}\n\nПодтвердить?",
-            reply_markup=ReplyKeyboardMarkup(
-                keyboard=[
-                    [KeyboardButton(text="Подтвердить")],
-                    [KeyboardButton(text="Изменить имя папки")],
-                    [KeyboardButton(text="Изменить данные")],
-                ],
-                resize_keyboard=True,
-            ),
-        )
+    if text != "Подтвердить":
+        await message.answer("Подтвердите имя папки или выберите изменение данных.")
         return
-    if step == "confirm" and text == "Подтвердить":
-        user.contract_number = state["contract_number"]
-        user.contract_date = state["contract_date"]
-        user.contract_full_name = state["contract_full_name"]
-        user.folder_name = state["folder_name"]
-        await session.commit()
-        _ONBOARDING.pop(user.telegram_id, None)
-        for admin_id in settings.telegram_admin_ids:
-            await bot.send_message(
-                admin_id, format_user_card(user), reply_markup=user_moderation_keyboard(user.id)
-            )
-        await message.answer(
-            "Заявка отправлена администратору. Дождитесь одобрения.",
-            reply_markup=ReplyKeyboardRemove(),
+    data = await state.get_data()
+    user.contract_number = data["contract_number"]
+    user.contract_date = data["contract_date"]
+    user.contract_full_name = data["contract_full_name"]
+    user.folder_name = data["folder_name"]
+    await session.commit()
+    await state.clear()
+    for admin_id in settings.telegram_admin_ids:
+        await bot.send_message(
+            admin_id, format_user_card(user), reply_markup=user_moderation_keyboard(user.id)
         )
+    await message.answer(
+        "Заявка отправлена администратору. Дождитесь одобрения.",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+
+
+@router.message(
+    StateFilter(FolderProfileStates.waiting_for_manual_folder_name), F.text, ~F.text.startswith("/")
+)
+async def onboarding_manual_name(message: Message, state: FSMContext) -> None:
+    text = _text_value(message)
+    if not text:
+        await message.answer("Введите непустое имя папки:")
+        return
+    try:
+        folder_name = validate_user_folder_name(text)
+    except FolderNameValidationError as exc:
+        await message.answer(f"Имя папки небезопасно: {exc}. Введите другое имя:")
+        return
+    await state.update_data(folder_name=folder_name)
+    await state.set_state(FolderProfileStates.waiting_for_folder_confirm)
+    await message.answer(
+        f"Итоговое имя папки:\n{folder_name}\n\nПодтвердить?",
+        reply_markup=ReplyKeyboardMarkup(
+            keyboard=[
+                [KeyboardButton(text="Подтвердить")],
+                [KeyboardButton(text="Изменить имя папки")],
+                [KeyboardButton(text="Изменить данные")],
+            ],
+            resize_keyboard=True,
+        ),
+    )
