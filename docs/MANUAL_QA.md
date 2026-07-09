@@ -141,7 +141,7 @@ uvicorn app.api.main:app --host 0.0.0.0 --port 8000
 
 ### Mini App
 1. Откройте Mini App из Telegram и войдите администратором.
-2. Во вкладке пользователей проверьте русские кнопки `Одобрить`, `Отклонить` и `Заблокировать`.
+2. Во вкладке пользователей проверьте русские кнопки `Одобрить`, `Отклонить` и `Заблокировать`, а также строку с папкой пользователя на Яндекс.Диске (`folder_name`/`root_folder_label` или `не назначена`).
 3. В карточке заявки проверьте русские кнопки `Загрузить`, `Загрузить как копию`, `Перезаписать`, `Повторить`, `Отклонить`, а также отдельные кнопки `Изменить имя`, `Изменить расширение` и `Сменить папку этой заявки`.
 4. Проверьте, что Mini App отправляет `filename_stem` для имени и `filename_extension` для расширения, не отправляя `safe_filename` в новом flow.
 5. Все пользовательские подписи, статусы, кнопки и ошибки должны отображаться на русском языке.
@@ -152,7 +152,7 @@ uvicorn app.api.main:app --host 0.0.0.0 --port 8000
 ### User scenario
 
 1. Open the Mini App from Telegram as an approved user.
-2. Verify the auth card, upload card, request cards, file list, badges, and empty states are readable on a narrow mobile viewport.
+2. Verify the auth card, upload card, request cards, file list, badges, and empty states are readable on a narrow mobile viewport. The auth card must show the user folder name; if no folder is assigned yet, it must show `не назначена`.
 3. Select several files and verify the pre-upload list shows number, filename, and size for each file.
 4. Add one shared comment and submit. Verify the progress text shows `Загружается X из N`.
 5. Confirm every successful file creates a separate request and the request list refreshes after completion.

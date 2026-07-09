@@ -66,6 +66,7 @@ function userActionLabel(value) { return USER_ACTION_LABELS[value] || value; }
 function auditLabel(value) { return AUDIT_LABELS[value] || value; }
 function fmtSize(n) { return n ? `${(n / 1048576).toFixed(2)} MB` : "—"; }
 function shortSha(value) { return value ? value.slice(0, 12) : "—"; }
+function userFolderLabel(user) { return user?.folder_name || user?.root_folder_label || (user?.root_folder_assigned ? "назначена" : "не назначена"); }
 
 async function readError(response) {
   try {
@@ -239,6 +240,7 @@ async function renderAdminUsers() {
   adminContent.innerHTML = '<div id="admin-error" class="muted"></div>' + rows.map((u) => `
     <div class="card user-card"><div class="card-head"><b>${escapeHtml(u.full_name || "—")}</b><span class="badge">${escapeHtml(statusLabel(u.status))}</span></div>
       <div class="meta">@${escapeHtml(u.username || "—")} · ID Telegram: ${escapeHtml(u.telegram_id)}</div>
+      <div class="meta">Папка на Яндекс.Диске: ${escapeHtml(userFolderLabel(u))}</div>
       <div class="row">${u.status === "pending" ? ["approve", "reject", "block"].map((a) => `<button onclick="moderateUser(${u.id}, '${a}')">${userActionLabel(a)}</button>`).join("") : ""}</div>
     </div>`).join("") || '<div class="card empty">Пользователей пока нет.</div>';
 }
@@ -342,7 +344,7 @@ async function load() {
   try {
     const me = await api("/api/me");
     const title = escapeHtml(me.full_name || me.username || me.telegram_id);
-    auth.innerHTML = `<div class="card-head"><b>${title}</b><span class="badge">${escapeHtml(statusLabel(me.status))}</span></div><div class="muted">Папка на Яндекс.Диске: ${me.root_folder_assigned ? "назначена" : "не назначена"}</div>`;
+    auth.innerHTML = `<div class="card-head"><b>${title}</b><span class="badge">${escapeHtml(statusLabel(me.status))}</span></div><div class="muted">Папка на Яндекс.Диске: ${escapeHtml(userFolderLabel(me))}</div>`;
     await renderUser(me);
     if (me.is_admin) { adminEl.classList.remove("hidden"); await loadAdmin("uploads"); }
   } catch (err) { auth.textContent = err.message; }

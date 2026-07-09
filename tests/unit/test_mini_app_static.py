@@ -55,3 +55,17 @@ def test_webapp_supports_multiple_uploads_filters_and_escaping():
     assert "Ожидают действия" in app_js
     assert "renderAdminUsers" in app_js and "userActionLabel(a)" in app_js
     assert "renderAdminUploads" in app_js and "uploadActionLabel(a)" in app_js
+
+
+def test_webapp_displays_user_folder_name_safely():
+    app_js = Path("app/webapp/static/app.js").read_text()
+
+    assert "function userFolderLabel" in app_js
+    assert "user?.folder_name || user?.root_folder_label" in app_js
+    assert 'user?.root_folder_assigned ? "назначена" : "не назначена"' in app_js
+    assert (
+        'Папка на Яндекс.Диске: ${me.root_folder_assigned ? "назначена" : "не назначена"}'
+        not in app_js
+    )
+    assert "Папка на Яндекс.Диске: ${escapeHtml(userFolderLabel(me))}" in app_js
+    assert "Папка на Яндекс.Диске: ${escapeHtml(userFolderLabel(u))}" in app_js
