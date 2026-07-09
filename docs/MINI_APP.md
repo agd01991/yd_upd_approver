@@ -30,11 +30,20 @@ The frontend never receives Telegram bot tokens, Yandex OAuth tokens, Authorizat
 
 ## Local run
 
-Run `uvicorn app.api.main:app --host 0.0.0.0 --port 8000` or `docker compose up --build`, then open `http://localhost:8000/` for a smoke test. Real Telegram Mini Apps require a public HTTPS URL, so expose port 8000 via ngrok, cloudflared, or another HTTPS tunnel and set `WEBAPP_URL=https://...`.
+For Docker Compose, run `docker compose up --build`, then open `http://localhost:8000/` for a smoke test. Compose runs Alembic through the one-shot `migrate` service after PostgreSQL becomes healthy; `api` and `bot` start only after `migrate` completes successfully and do not run migrations in parallel.
+
+For non-Docker local runs, execute migrations manually and then start the API:
+
+```bash
+alembic upgrade head
+uvicorn app.api.main:app --host 0.0.0.0 --port 8000
+```
+
+Real Telegram Mini Apps require a public HTTPS URL, so expose port 8000 via ngrok, cloudflared, or another HTTPS tunnel and set `WEBAPP_URL=https://...`.
 
 ## Production
 
-Deploy the API behind HTTPS, set `WEBAPP_URL`, keep `CORS_ORIGINS` restricted to trusted origins, run Alembic migrations, and configure the bot menu/button in BotFather or use the `/app` command.
+Deploy the API behind HTTPS, set `WEBAPP_URL`, keep `CORS_ORIGINS` restricted to trusted origins, run Alembic migrations once before starting API and bot processes, and configure the bot menu/button in BotFather or use the `/app` command.
 
 ## Limitations
 

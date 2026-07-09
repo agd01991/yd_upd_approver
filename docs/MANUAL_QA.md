@@ -6,22 +6,47 @@
 2. Заполните `TELEGRAM_BOT_TOKEN`, `TELEGRAM_ADMIN_IDS`, `YANDEX_DISK_TOKEN`.
 3. Проверьте `YANDEX_DISK_ROOT`, `DATABASE_URL`, `TEMP_STORAGE_DIR`, `MAX_FILE_SIZE_MB`.
 
-## 2. Запуск БД
+## 2. Docker Compose запуск
+
+Для обычного Docker-запуска достаточно одной команды:
 
 ```bash
-docker compose up -d postgres redis
+docker compose up --build
 ```
 
-## 3. Миграции
+Compose запускает PostgreSQL с healthcheck, затем one-shot сервис `migrate` выполняет `alembic upgrade head`, и только после успешного завершения миграций стартуют `api` и `bot`. `api` и `bot` не запускают Alembic самостоятельно.
+
+Если локальная БД уже была частично обновлена старой версией Compose после race condition, обычно достаточно повторить запуск без удаления PostgreSQL volume:
+
+```bash
+docker compose up --build
+```
+
+Либо выполнить шаги отдельно:
+
+```bash
+docker compose up -d migrate
+docker compose up -d api bot
+```
+
+Не используйте `docker compose down -v` как основной способ восстановления, потому что он удаляет локальные данные PostgreSQL.
+
+## 3. Non-Docker local: миграции
 
 ```bash
 alembic upgrade head
 ```
 
-## 4. Запуск бота
+## 4. Non-Docker local: запуск бота или API
 
 ```bash
 python -m app.main
+```
+
+или API:
+
+```bash
+uvicorn app.api.main:app --host 0.0.0.0 --port 8000
 ```
 
 ## 5. Новый пользователь

@@ -32,11 +32,36 @@ Docker:
 docker compose up --build
 ```
 
-Контейнер bot при старте выполняет миграции и затем запускает приложение:
+В Docker Compose миграции выполняет отдельный one-shot сервис `migrate`. Он ждёт healthy-состояния PostgreSQL, один раз запускает `alembic upgrade head`, а сервисы `api` и `bot` стартуют только после успешного завершения миграций. `api` и `bot` больше не запускают Alembic параллельно, поэтому при `docker compose up --build` не возникает race condition на создании таблиц.
+
+Для non-Docker local запуска миграции по-прежнему выполняются вручную перед стартом нужного процесса:
 
 ```bash
-alembic upgrade head && python -m app.main
+alembic upgrade head
+python -m app.main
 ```
+
+или отдельно API:
+
+```bash
+alembic upgrade head
+uvicorn app.api.main:app --host 0.0.0.0 --port 8000
+```
+
+Если локальная БД уже попала в состояние после старой гонки миграций, обычно достаточно повторно запустить Compose без удаления volume:
+
+```bash
+docker compose up --build
+```
+
+При необходимости можно явно выполнить миграционный сервис, а затем поднять приложения:
+
+```bash
+docker compose up -d migrate
+docker compose up -d api bot
+```
+
+Не используйте `docker compose down -v` как основной способ восстановления: эта команда удаляет PostgreSQL volume и локальные данные.
 
 ## Переменные окружения
 
@@ -108,6 +133,8 @@ pytest
 alembic upgrade head
 python -m app.main
 ```
+
+Для Docker-проверки достаточно `docker compose up --build`: Compose сначала запускает `migrate`, затем `api` и `bot`. После старта API healthcheck можно проверить командой `curl http://localhost:8000/health`.
 
 ## Runtime root Яндекс.Диска
 
