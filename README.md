@@ -43,7 +43,7 @@ alembic upgrade head && python -m app.main
 - `TELEGRAM_BOT_TOKEN` — токен Telegram Bot API.
 - `TELEGRAM_ADMIN_IDS` — числовые Telegram ID администраторов через запятую.
 - `YANDEX_DISK_TOKEN` — OAuth-токен Яндекс.Диска администратора. Именно этим токеном выполняются загрузки.
-- `YANDEX_DISK_ROOT` — корневая папка для пользовательских папок, например `disk:/Telegram Uploads`.
+- `YANDEX_DISK_ROOT` — fallback-корневая папка для пользовательских папок, например `disk:/Telegram Uploads`. Администратор может изменить runtime-значение для новых пользователей командами `/diskroot` и `/setdiskroot disk:/New Root`; оно хранится в таблице `app_settings`.
 - `DATABASE_URL` — async SQLAlchemy URL PostgreSQL.
 - `REDIS_URL` — зарезервировано для будущей очереди.
 - `TEMP_STORAGE_DIR` — локальная папка временных файлов до одобрения.
@@ -51,6 +51,11 @@ alembic upgrade head && python -m app.main
 - `ALLOW_USER_DOWNLOADS`, `ALLOW_USER_FOLDER_SELECTION` — будущие политики доступа.
 
 ## Сценарий работы
+
+### Admin disk root
+
+- `/diskroot` показывает текущую корневую папку Яндекс.Диска и источник: runtime setting из БД или fallback `.env`.
+- `/setdiskroot disk:/Telegram Uploads` валидирует путь, создаёт папку на Яндекс.Диске и сохраняет новое runtime-значение только для новых пользователей.
 
 ### `/start`
 
