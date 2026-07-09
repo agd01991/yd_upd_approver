@@ -113,6 +113,74 @@ async def users(session: AsyncSession = Depends(get_db)) -> list[dict]:
     ]
 
 
+@router.get("/users/search")
+async def search_users(query: str = "", session: AsyncSession = Depends(get_db)) -> dict:
+    q = query.strip()
+    if not q:
+        return {"items": []}
+    like = f"%{q}%"
+    conditions = [
+        User.username.ilike(like),
+        User.full_name.ilike(like),
+        User.contract_full_name.ilike(like),
+        User.contract_number.ilike(like),
+        User.folder_name.ilike(like),
+    ]
+    if q.isdigit():
+        conditions.append(User.telegram_id == int(q))
+    rows = (
+        await session.scalars(
+            select(User).where(or_(*conditions)).order_by(User.created_at.desc()).limit(20)
+        )
+    ).all()
+    return {"items": [user_json(u) for u in rows]}
+
+
+@router.get("/users/{user_id}/folder-candidates")
+async def folder_candidates(
+    user_id: int,
+    session: AsyncSession = Depends(get_db),
+    settings: Settings = Depends(settings_dep),
+) -> dict:
+    from app.services.user_folder_rename import get_user_folder_candidates
+
+    user = await session.get(User, user_id)
+    if not user:
+        raise HTTPException(404, "User not found")
+    items = await get_user_folder_candidates(session, user, settings)
+    return {"items": [c.__dict__ for c in items]}
+
+
+@router.post("/users/{user_id}/rename-folder")
+async def admin_rename_folder(
+    user_id: int,
+    body: AdminRenameFolderBody,
+    actor: TelegramWebAppUser = Depends(admin_user_dep),
+    session: AsyncSession = Depends(get_db),
+    settings: Settings = Depends(settings_dep),
+) -> dict:
+    from app.services.user_folder_rename import rename_user_folder
+
+    user = await session.get(User, user_id)
+    if not user:
+        raise HTTPException(404, "User not found")
+    client = YandexDiskClient(settings.yandex_disk_token)
+    try:
+        target = await rename_user_folder(
+            session, user, body.source_folder, body.new_folder_name, actor.telegram_id, client
+        )
+        await session.commit()
+    except ValueError as exc:
+        await session.rollback()
+        raise HTTPException(400, str(exc)) from exc
+    except Exception as exc:
+        await session.rollback()
+        raise HTTPException(503, "Не удалось переименовать папку Яндекс.Диска") from exc
+    finally:
+        await client.close()
+    return {"user": user_json(user), "target_folder": target}
+
+
 async def _moderate_user(
     user_id: int, action: str, actor: int, session: AsyncSession, settings: Settings, bot
 ) -> dict:
@@ -514,74 +582,6 @@ async def audit(session: AsyncSession = Depends(get_db), limit: int = 50) -> lis
         }
         for a in rows
     ]
-
-
-@router.get("/users/search")
-async def search_users(query: str = "", session: AsyncSession = Depends(get_db)) -> dict:
-    q = query.strip()
-    if not q:
-        return {"items": []}
-    like = f"%{q}%"
-    conditions = [
-        User.username.ilike(like),
-        User.full_name.ilike(like),
-        User.contract_full_name.ilike(like),
-        User.contract_number.ilike(like),
-        User.folder_name.ilike(like),
-    ]
-    if q.isdigit():
-        conditions.append(User.telegram_id == int(q))
-    rows = (
-        await session.scalars(
-            select(User).where(or_(*conditions)).order_by(User.created_at.desc()).limit(20)
-        )
-    ).all()
-    return {"items": [user_json(u) for u in rows]}
-
-
-@router.get("/users/{user_id}/folder-candidates")
-async def folder_candidates(
-    user_id: int,
-    session: AsyncSession = Depends(get_db),
-    settings: Settings = Depends(settings_dep),
-) -> dict:
-    from app.services.user_folder_rename import get_user_folder_candidates
-
-    user = await session.get(User, user_id)
-    if not user:
-        raise HTTPException(404, "User not found")
-    items = await get_user_folder_candidates(session, user, settings)
-    return {"items": [c.__dict__ for c in items]}
-
-
-@router.post("/users/{user_id}/rename-folder")
-async def admin_rename_folder(
-    user_id: int,
-    body: AdminRenameFolderBody,
-    actor: TelegramWebAppUser = Depends(admin_user_dep),
-    session: AsyncSession = Depends(get_db),
-    settings: Settings = Depends(settings_dep),
-) -> dict:
-    from app.services.user_folder_rename import rename_user_folder
-
-    user = await session.get(User, user_id)
-    if not user:
-        raise HTTPException(404, "User not found")
-    client = YandexDiskClient(settings.yandex_disk_token)
-    try:
-        target = await rename_user_folder(
-            session, user, body.source_folder, body.new_folder_name, actor.telegram_id, client
-        )
-        await session.commit()
-    except ValueError as exc:
-        await session.rollback()
-        raise HTTPException(400, str(exc)) from exc
-    except Exception as exc:
-        await session.rollback()
-        raise HTTPException(503, "Не удалось переименовать папку Яндекс.Диска") from exc
-    finally:
-        await client.close()
-    return {"user": user_json(user), "target_folder": target}
 
 
 @router.get("/folder-rename-requests")
