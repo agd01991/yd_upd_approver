@@ -10,6 +10,37 @@ from app.services.naming import user_folder
 from app.services.yandex_disk import YandexDiskClient
 
 
+def _folder_with_trailing_slash(root: str, basename: str) -> str:
+    return f"{root.rstrip('/')}/{basename}/"
+
+
+def _user_folder_basename(user: User) -> str | None:
+    folder = (user.root_folder or "").strip().rstrip("/")
+    if not folder:
+        return None
+    basename = folder.rsplit("/", 1)[-1]
+    if not basename or basename in {".", ".."}:
+        return None
+    if any(ord(ch) < 32 or ord(ch) == 127 for ch in basename):
+        return None
+    return basename
+
+
+def _is_folder_inside_root(folder: str | None, root: str) -> bool:
+    if not folder:
+        return False
+    normalized_folder = folder.rstrip("/")
+    normalized_root = root.rstrip("/")
+    return normalized_folder.startswith(f"{normalized_root}/")
+
+
+def stable_user_folder_for_root(root: str, user: User) -> str:
+    basename = _user_folder_basename(user)
+    if basename is None:
+        return user_folder(root, user.telegram_id, user.full_name, user.username)
+    return _folder_with_trailing_slash(root, basename)
+
+
 async def ensure_user_folder_for_current_root(
     session: AsyncSession,
     user: User,
@@ -21,7 +52,11 @@ async def ensure_user_folder_for_current_root(
         if hasattr(session, "scalar")
         else validate_yandex_disk_root(settings.yandex_disk_root)
     )
-    expected = user_folder(root, user.telegram_id, user.full_name, user.username)
+    expected = (
+        user.root_folder
+        if _is_folder_inside_root(user.root_folder, root)
+        else stable_user_folder_for_root(root, user)
+    )
     await client.mkdir_recursive(expected)
     if user.root_folder != expected:
         user.root_folder = expected
@@ -40,6 +75,8 @@ async def change_yandex_disk_root_for_active_users(
     old_root = await get_yandex_disk_root(session, settings)
     normalized = validate_yandex_disk_root(root)
     await client.mkdir_recursive(normalized)
+    if normalized == old_root:
+        return old_root
     if hasattr(session, "scalars"):
         users = list(
             (await session.scalars(select(User).where(User.status == UserStatus.active))).all()
@@ -48,7 +85,7 @@ async def change_yandex_disk_root_for_active_users(
         users = []
     updates: list[tuple[User, str]] = []
     for user in users:
-        folder = user_folder(normalized, user.telegram_id, user.full_name, user.username)
+        folder = stable_user_folder_for_root(normalized, user)
         await client.mkdir_recursive(folder)
         updates.append((user, folder))
     for user, folder in updates:
