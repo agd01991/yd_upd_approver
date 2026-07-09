@@ -29,6 +29,14 @@ async function api(path, opts = {}) {
   return response.json();
 }
 
+
+const STATUS_LABELS = { pending: "ожидает одобрения", active: "активен", rejected: "отклонён", blocked: "заблокирован", stored: "сохранён временно", new: "новый", pending_approval: "ожидает проверки", approved: "одобрено", uploading: "загружается", uploaded: "загружено", failed: "ошибка загрузки", cancelled: "отменено", deleted_temp: "временный файл удалён" };
+const ACTION_LABELS = { approve: "Загрузить", copy: "Загрузить как копию", overwrite: "Перезаписать", retry: "Повторить", reject: "Отклонить", block: "Заблокировать" };
+const AUDIT_LABELS = { upload_filename_stem_change: "изменение имени файла", upload_filename_extension_change: "изменение расширения файла", upload_patch: "изменение заявки", upload_folder_change: "изменение папки" };
+function statusLabel(value) { return STATUS_LABELS[value] || value || "—"; }
+function actionLabel(value) { return ACTION_LABELS[value] || value; }
+function auditLabel(value) { return AUDIT_LABELS[value] || value; }
+
 function fmtSize(n) {
   return n ? `${(n / 1048576).toFixed(2)} MB` : "—";
 }
@@ -66,7 +74,7 @@ async function renderUser(me) {
   document.querySelector("#up").onsubmit = async (event) => {
     event.preventDefault();
     const fd = new FormData(event.target);
-    document.querySelector("#upmsg").textContent = "Загрузка...";
+    document.querySelector("#upmsg").textContent = "Файл загружается...";
     try {
       const result = await api("/api/uploads", { method: "POST", body: fd });
       document.querySelector("#upmsg").textContent = `Создана заявка ${result.request_code}`;
@@ -82,7 +90,7 @@ async function loadUserLists() {
   const reqs = await api("/api/uploads");
   document.querySelector("#reqs").innerHTML = reqs.map((r) => `
     <div class="card">
-      <b>${r.request_code}</b> ${r.status}<br>
+      <b>${r.request_code}</b> ${statusLabel(r.status)}<br>
       ${r.safe_filename}<br>
       <span class="muted">${r.reject_reason || r.error_message || ""}</span>
     </div>`).join("") || "Нет заявок";
@@ -114,19 +122,21 @@ async function renderAdminUploads() {
   const rows = await api("/api/admin/uploads");
   adminContent.innerHTML = '<div id="admin-error" class="muted"></div>' + rows.map((r) => `
     <div class="card" id="upload-${r.id}">
-      <b>${r.request_code}</b> ${r.status}<br>
+      <b>${r.request_code}</b> ${statusLabel(r.status)}<br>
       ${r.safe_filename} (${fmtSize(r.size_bytes)})<br>
-      user: ${r.user?.telegram_id || "—"}<br>
-      sha: ${(r.sha256 || "").slice(0, 12)}<br>
+      Пользователь: ${r.user?.telegram_id || "—"}<br>
+      SHA-256: ${(r.sha256 || "").slice(0, 12)}<br>
       <span class="small">${r.target_path}</span><br>
       <span class="muted">${r.caption || r.error_message || r.reject_reason || ""}</span>
       <div class="row">
-        <button onclick="downloadTemp(${r.id}, decodeURIComponent('${encodeURIComponent(r.safe_filename)}'))">temp</button>
+        <button onclick="downloadTemp(${r.id}, decodeURIComponent('${encodeURIComponent(r.safe_filename)}'))">Открыть файл</button>
         ${["approve", "copy", "overwrite", "retry"].map((a) =>
-          `<button onclick="uploadAction(${r.id}, '${a}')">${a}</button>`
+          `<button onclick="uploadAction(${r.id}, '${a}')">${actionLabel(a)}</button>`
         ).join("")}
-        <button class="danger" onclick="rejectUpload(${r.id})">reject</button>
-        <button onclick="patchUpload(${r.id})">edit</button>
+        <button class="danger" onclick="rejectUpload(${r.id})">Отклонить</button>
+        <button onclick="changeStem(${r.id})">Изменить имя</button>
+        <button onclick="changeExtension(${r.id})">Изменить расширение</button>
+        <button onclick="changeFolder(${r.id})">Сменить папку</button>
       </div>
     </div>`).join("");
 }
@@ -136,10 +146,10 @@ async function renderAdminUsers() {
   adminContent.innerHTML = '<div id="admin-error" class="muted"></div>' + rows.map((u) => `
     <div class="card">
       <b>${u.full_name || "—"}</b> @${u.username || "—"}<br>
-      ID ${u.telegram_id}; ${u.status}
+      ID Telegram: ${u.telegram_id}; ${statusLabel(u.status)}
       <div class="row">
         ${u.status === "pending" ? ["approve", "reject", "block"].map((a) =>
-          `<button onclick="moderateUser(${u.id}, '${a}')">${a}</button>`
+          `<button onclick="moderateUser(${u.id}, '${a}')">${actionLabel(a)}</button>`
         ).join("") : ""}
       </div>
     </div>`).join("");
@@ -149,8 +159,8 @@ async function renderAudit() {
   const rows = await api("/api/admin/audit");
   adminContent.innerHTML = '<div id="admin-error" class="muted"></div>' + rows.map((a) => `
     <div class="card">
-      <b>${a.action}</b><br>
-      actor=${a.actor_telegram_id}; request=${a.request_id || "—"}<br>
+      <b>${auditLabel(a.action)}</b><br>
+      Администратор: ${a.actor_telegram_id}; заявка: ${a.request_id || "—"}<br>
       <span class="small">${JSON.stringify(a.new_value)}</span>
     </div>`).join("");
 }
@@ -199,26 +209,48 @@ async function rejectUpload(id) {
   await loadAdmin("uploads");
 }
 
-async function patchUpload(id) {
+async function changeStem(id) {
   try {
-    const safeFilename = prompt("Новое имя файла (пусто — не менять)");
-    const folders = await api(`/api/admin/uploads/${id}/allowed-folders`);
-    let targetFolder = null;
-    if (folders.items.length) {
-      const choices = folders.items.map((f, index) => `${index + 1}. ${f.label}`).join("\n");
-      const selected = prompt(`Новая папка (пусто — не менять):\n${choices}`);
-      if (selected) {
-        const index = Number.parseInt(selected, 10) - 1;
-        if (!folders.items[index]) {
-          throw new Error("Выберите номер папки из списка");
-        }
-        targetFolder = folders.items[index].path;
-      }
-    }
+    const filenameStem = prompt("Введите новое имя файла без расширения. Текущее расширение будет сохранено.");
+    if (!filenameStem) return;
     await api(`/api/admin/uploads/${id}`, {
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ safe_filename: safeFilename || null, target_folder: targetFolder }),
+      body: JSON.stringify({ filename_stem: filenameStem }),
+    });
+    await loadAdmin("uploads");
+  } catch (err) {
+    showAdminError(err.message);
+  }
+}
+
+async function changeExtension(id) {
+  try {
+    const filenameExtension = prompt("Введите новое расширение файла, например: pdf или .pdf");
+    if (!filenameExtension) return;
+    await api(`/api/admin/uploads/${id}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ filename_extension: filenameExtension }),
+    });
+    await loadAdmin("uploads");
+  } catch (err) {
+    showAdminError(err.message);
+  }
+}
+
+async function changeFolder(id) {
+  try {
+    const folders = await api(`/api/admin/uploads/${id}/allowed-folders`);
+    const choices = folders.items.map((f, index) => `${index + 1}. ${f.label}`).join("\n");
+    const selected = prompt(`Выберите новую папку по номеру:\n${choices}`);
+    if (!selected) return;
+    const index = Number.parseInt(selected, 10) - 1;
+    if (!folders.items[index]) throw new Error("Выберите номер папки из списка");
+    await api(`/api/admin/uploads/${id}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ target_folder: folders.items[index].path }),
     });
     await loadAdmin("uploads");
   } catch (err) {
@@ -229,7 +261,7 @@ async function patchUpload(id) {
 async function load() {
   try {
     const me = await api("/api/me");
-    auth.innerHTML = `<b>${me.full_name || me.username || me.telegram_id}</b><br>Статус: ${me.status}<br>Папка: ${me.root_folder_assigned ? "назначена" : "не назначена"}`;
+    auth.innerHTML = `<b>${me.full_name || me.username || me.telegram_id}</b><br>Статус: ${statusLabel(me.status)}<br>Папка на Яндекс.Диске: ${me.root_folder_assigned ? "назначена" : "не назначена"}`;
     await renderUser(me);
     if (me.is_admin) {
       adminEl.classList.remove("hidden");

@@ -26,9 +26,20 @@ from app.services.app_settings import (
 )
 from app.services.audit import write_audit
 from app.services.disk_paths import DiskPathValidationError, validate_yandex_disk_root
-from app.services.naming import join_disk_path, sanitize_filename
+from app.services.naming import (
+    FilenameEditError,
+    change_filename_extension,
+    change_filename_stem,
+    join_disk_path,
+)
 from app.services.yandex_disk import YandexDiskClient, YandexDiskError
-from app.utils.formatting import format_folder_items, format_upload_card, format_upload_result
+from app.utils.formatting import (
+    format_audit_action,
+    format_folder_items,
+    format_upload_card,
+    format_upload_result,
+    format_user_status,
+)
 from app.utils.security import ensure_admin_callback, is_admin
 from app.workers.upload_worker import upload_approved_request
 
@@ -44,7 +55,8 @@ REJECT_REASONS = {
 
 
 class UploadEditStates(StatesGroup):
-    waiting_for_rename = State()
+    waiting_for_filename_stem = State()
+    waiting_for_filename_extension = State()
     waiting_for_custom_reject_reason = State()
     waiting_for_yandex_disk_root = State()
 
@@ -178,10 +190,10 @@ async def users(message: Message, session: AsyncSession, settings: Settings) -> 
         username = f"@{user.username}" if user.username else "—"
         text = (
             f"Имя: {user.full_name or '—'}\n"
-            f"Username: {username}\n"
-            f"Telegram ID: {user.telegram_id}\n"
-            f"Статус: {user.status.value}\n"
-            f"Root folder: {user.root_folder or '—'}"
+            f"Username Telegram: {username}\n"
+            f"ID Telegram: {user.telegram_id}\n"
+            f"Статус: {format_user_status(user.status)}\n"
+            f"Папка на Яндекс.Диске: {user.root_folder or '—'}"
         )
         markup = user_moderation_keyboard(user.id) if user.status == UserStatus.pending else None
         await message.answer(text, reply_markup=markup)
@@ -200,9 +212,9 @@ async def audit(message: Message, session: AsyncSession, settings: Settings) -> 
     lines = []
     for row in rows:
         lines.append(
-            f"{row.created_at}: actor={row.actor_telegram_id}; action={row.action}; "
-            f"request_id={row.request_id or '—'}; user_id={row.user_id or '—'}; "
-            f"old={row.old_value or '—'}; new={row.new_value or '—'}"
+            f"{row.created_at}: администратор={row.actor_telegram_id}; действие={format_audit_action(row.action)}; "
+            f"заявка={row.request_id or '—'}; пользователь={row.user_id or '—'}; "
+            f"было={row.old_value or '—'}; стало={row.new_value or '—'}"
         )
     await message.answer("\n\n".join(lines))
 
@@ -454,15 +466,25 @@ async def upload_callback(
         await callback.answer("Заявка отклонена")
         return
 
-    if action == "rename":
+    if action in {"rename", "rename_stem"}:
         if request.status in {UploadStatus.uploaded, UploadStatus.rejected}:
             await callback.answer("Эту заявку уже нельзя переименовать", show_alert=True)
             return
-        await state.set_state(UploadEditStates.waiting_for_rename)
+        await state.set_state(UploadEditStates.waiting_for_filename_stem)
         await state.update_data(request_id=request.id)
         await callback.message.answer(
-            f"Отправьте новое имя файла для заявки {request.request_code}"
+            "Введите новое имя файла без расширения. Текущее расширение будет сохранено."
         )
+        await callback.answer()
+        return
+
+    if action == "rename_extension":
+        if request.status in {UploadStatus.uploaded, UploadStatus.rejected}:
+            await callback.answer("Эту заявку уже нельзя переименовать", show_alert=True)
+            return
+        await state.set_state(UploadEditStates.waiting_for_filename_extension)
+        await state.update_data(request_id=request.id)
+        await callback.message.answer("Введите новое расширение файла, например: pdf или .pdf")
         await callback.answer()
         return
 
@@ -507,7 +529,7 @@ async def upload_callback(
         await callback.answer("Папка изменена")
 
 
-@router.message(UploadEditStates.waiting_for_rename)
+@router.message(UploadEditStates.waiting_for_filename_stem)
 async def rename_upload(
     message: Message, state: FSMContext, session: AsyncSession, settings: Settings
 ) -> None:
@@ -529,14 +551,18 @@ async def rename_upload(
         await message.answer("Пользователь заявки не найден")
         await state.clear()
         return
-    safe = sanitize_filename(message.text or "file")
     old = {"safe_filename": request.safe_filename, "target_path": request.target_path}
+    try:
+        safe = change_filename_stem(request.safe_filename, message.text or "")
+    except FilenameEditError as exc:
+        await message.answer(f"Не удалось изменить имя файла: {exc}")
+        return
     request.safe_filename = safe
     request.target_path = join_disk_path(request.target_folder, safe)
     await write_audit(
         session,
         actor_telegram_id=message.from_user.id,
-        action="upload_rename",
+        action="upload_filename_stem_change",
         request_id=request.id,
         user_id=request.user_id,
         old_value=old,
@@ -571,3 +597,49 @@ async def custom_reject_reason(
     await _reject_request(bot, session, message.from_user.id, request, user, reason)
     await state.clear()
     await message.answer("Заявка отклонена")
+
+
+@router.message(UploadEditStates.waiting_for_filename_extension)
+async def rename_extension_upload(
+    message: Message, state: FSMContext, session: AsyncSession, settings: Settings
+) -> None:
+    if not is_admin(message.from_user.id, settings):
+        await state.clear()
+        return
+    data = await state.get_data()
+    request = await session.get(UploadRequest, data.get("request_id"))
+    if not request:
+        await message.answer("Заявка не найдена")
+        await state.clear()
+        return
+    if request.status in {UploadStatus.uploaded, UploadStatus.rejected}:
+        await message.answer("Эту заявку уже нельзя переименовать")
+        await state.clear()
+        return
+    user = await session.get(User, request.user_id)
+    if not user:
+        await message.answer("Пользователь заявки не найден")
+        await state.clear()
+        return
+    old = {"safe_filename": request.safe_filename, "target_path": request.target_path}
+    try:
+        safe = change_filename_extension(request.safe_filename, message.text or "")
+    except FilenameEditError as exc:
+        await message.answer(f"Не удалось изменить расширение файла: {exc}")
+        return
+    request.safe_filename = safe
+    request.target_path = join_disk_path(request.target_folder, safe)
+    await write_audit(
+        session,
+        actor_telegram_id=message.from_user.id,
+        action="upload_filename_extension_change",
+        request_id=request.id,
+        user_id=request.user_id,
+        old_value=old,
+        new_value={"safe_filename": request.safe_filename, "target_path": request.target_path},
+    )
+    await session.commit()
+    await state.clear()
+    await message.answer(
+        format_upload_card(request, user), reply_markup=upload_keyboard(request.id)
+    )

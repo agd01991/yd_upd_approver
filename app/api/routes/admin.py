@@ -15,7 +15,13 @@ from app.db.repositories import approve_user
 from app.services.app_settings import get_yandex_disk_root
 from app.services.audit import write_audit
 from app.services.file_policy import folder_allowed
-from app.services.naming import join_disk_path, sanitize_filename
+from app.services.naming import (
+    FilenameEditError,
+    change_filename_extension,
+    change_filename_stem,
+    join_disk_path,
+    sanitize_filename,
+)
 from app.services.yandex_disk import YandexDiskClient
 from app.workers.upload_worker import upload_approved_request
 
@@ -336,12 +342,30 @@ async def patch_upload(
         "target_folder": r.target_folder,
         "target_path": r.target_path,
     }
+    filename_fields = [
+        name
+        for name, value in {
+            "safe_filename": body.safe_filename,
+            "filename_stem": body.filename_stem,
+            "filename_extension": body.filename_extension,
+        }.items()
+        if value is not None
+    ]
+    if len(filename_fields) > 1:
+        raise HTTPException(400, "Передайте только одно поле изменения имени или расширения")
     if body.target_folder:
         if not folder_allowed(user, body.target_folder):
-            raise HTTPException(400, "Folder is not allowed")
+            raise HTTPException(400, "Папка недоступна пользователю")
         r.target_folder = body.target_folder
-    if body.safe_filename:
-        r.safe_filename = sanitize_filename(body.safe_filename)
+    try:
+        if body.filename_stem is not None:
+            r.safe_filename = change_filename_stem(r.safe_filename, body.filename_stem)
+        elif body.filename_extension is not None:
+            r.safe_filename = change_filename_extension(r.safe_filename, body.filename_extension)
+        elif body.safe_filename is not None:
+            r.safe_filename = sanitize_filename(body.safe_filename)
+    except FilenameEditError as exc:
+        raise HTTPException(400, str(exc)) from exc
     r.target_path = join_disk_path(r.target_folder, r.safe_filename)
     await write_audit(
         session,

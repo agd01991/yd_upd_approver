@@ -210,3 +210,14 @@ curl http://localhost:8000/health
 ```
 
 For local Telegram Mini App testing, expose the API with `ngrok` or `cloudflared`, set `WEBAPP_URL` to the public `/app` URL used by Telegram, and open the app from Telegram so WebApp `initData` is available. Protected temp-file downloads in the Mini App use `fetch` with the `X-Telegram-Init-Data` header instead of query tokens or unauthenticated links. The user uploads API intentionally does not return internal Yandex Disk `target_path`; admins still see moderation paths in the admin API. Admin folder edits must choose one of the user's allowed folders and the backend validates the folder again before saving.
+
+### Раздельное изменение имени и расширения
+
+Администратор может отдельно менять имя файла и расширение в Telegram-боте и Mini App:
+
+- `Изменить имя` меняет только часть имени без расширения. Например, для `old.txt` ввод `тест` даст `тест.txt`; ввод текущего полного имени `тест.txt` не создаёт двойное расширение.
+- `Изменить расширение` меняет только расширение и принимает значения вида `pdf` или `.pdf`. Например, `old.txt` + `pdf` даст `old.pdf`.
+- Попытка сменить расширение через поле имени, path traversal, `/`, `\\`, control characters и `..` отклоняются русским сообщением об ошибке.
+- `original_filename`, `local_path` и временный файл не меняются; после изменения безопасно пересобирается только `target_path`.
+
+Mini App и бот показывают основные пользовательские подписи, кнопки, статусы и audit-поля на русском языке. Новый frontend использует поля API `filename_stem`, `filename_extension` и `target_folder`; `safe_filename` сохранён только для обратной совместимости.
