@@ -1,4 +1,5 @@
 import logging
+import traceback
 import uuid
 from typing import Any
 
@@ -103,19 +104,23 @@ def error_response(
     )
 
 
-def sanitized_exc_info(exc: Exception) -> tuple[type[BaseException], BaseException, Any]:
-    safe_exc = RuntimeError(redact_text(exc)).with_traceback(exc.__traceback__)
-    return (RuntimeError, safe_exc, exc.__traceback__)
+def sanitized_traceback(exc: Exception) -> str:
+    traceback_exception = traceback.TracebackException.from_exception(
+        exc,
+        capture_locals=False,
+    )
+    rendered = "".join(traceback_exception.format(chain=True))
+    return redact_text(rendered)
 
 
 def log_5xx(request: Request, exc: Exception) -> None:
     logger.error(
-        "API request failed request_id=%s method=%s path=%s exc_type=%s",
+        "API request failed request_id=%s method=%s path=%s exc_type=%s\n%s",
         request_id(request),
         request.method,
         request.url.path,
         type(exc).__name__,
-        exc_info=sanitized_exc_info(exc),
+        sanitized_traceback(exc),
     )
 
 

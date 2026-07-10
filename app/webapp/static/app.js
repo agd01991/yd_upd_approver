@@ -15,6 +15,7 @@ let adminUserQuery = "";
 let adminSearchTimer;
 let selectedRenameUser = null;
 let renameFolderCandidates = [];
+let renameSelectionVersion = 0;
 
 const STATUS_LABELS = {
   pending: "ожидает одобрения",
@@ -322,6 +323,7 @@ async function renderRenameRequests() {
       <button id="rename-user-button">Переименовать папку</button>
     </div>
     <div class="card"><h3>Заявки на переименование</h3><div id="rename-requests"></div></div>`;
+  renameSelectionVersion += 1;
   bindRenameUserSearch();
   document.querySelector("#rename-user-button").onclick = renameSelectedUserFolder;
   document.querySelector("#rename-requests").innerHTML = (requests.items || []).map((r) => `<div class="request-card"><b>${escapeHtml(r.requested_folder_name)}</b><div class="meta">${escapeHtml(r.user?.telegram_id || "—")} · ${escapeHtml(r.contract_full_name || "—")}</div><button onclick="approveRenameRequest(${r.id}, ${r.user_id})">Одобрить</button><button class="danger" onclick="rejectRenameRequest(${r.id})">Отклонить</button></div>`).join("") || '<div class="empty">Нет pending-заявок.</div>';
@@ -355,13 +357,18 @@ function selectedRenameSourceFolder() {
   if (!selectedRenameUser || !value || !renameFolderCandidates.some((c) => c.path === value)) return null;
   return value;
 }
+function isCurrentRenameSelection(selectionVersion) {
+  return selectionVersion === renameSelectionVersion;
+}
 async function selectRenameUser(user, { showErrors = true } = {}) {
+  const selectionVersion = ++renameSelectionVersion;
   resetRenameSelection("Загрузка папок пользователя…");
   setRenameControlsEnabled(false);
   const card = document.querySelector("#rename-user-card");
   if (card) card.textContent = "Загрузка папок пользователя…";
   try {
     const candidates = await api(`/api/admin/users/${user.id}/folder-candidates`);
+    if (!isCurrentRenameSelection(selectionVersion)) return false;
     const items = candidates.items || [];
     if (items.length === 0) {
       resetRenameSelection("Нет доступных папок для переименования");
@@ -375,6 +382,7 @@ async function selectRenameUser(user, { showErrors = true } = {}) {
     setRenameControlsEnabled(true);
     return true;
   } catch (err) {
+    if (!isCurrentRenameSelection(selectionVersion)) return false;
     resetRenameSelection("Не удалось загрузить папки пользователя");
     if (card) card.textContent = "Выберите пользователя из выпадающего списка.";
     setRenameControlsEnabled(false);
@@ -391,7 +399,7 @@ async function renameSelectedUserFolder() {
     await renderRenameRequests();
   } catch (err) { showAdminError(safeErrorMessage(err)); }
 }
-async function approveRenameRequest(id, userId) { try { await selectRenameUser({ id: userId }, { showErrors: false }); const source_folder = selectedRenameSourceFolder(); if (!source_folder) return showAdminError("Выберите актуальную папку пользователя из списка."); await api(`/api/admin/folder-rename-requests/${id}/approve`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ source_folder }) }); await renderRenameRequests(); } catch (err) { showAdminError(safeErrorMessage(err)); } }
+async function approveRenameRequest(id, userId) { try { const selected = await selectRenameUser({ id: userId }, { showErrors: false }); if (!selected) return; const source_folder = selectedRenameSourceFolder(); if (!source_folder) return showAdminError("Выберите актуальную папку пользователя из списка."); await api(`/api/admin/folder-rename-requests/${id}/approve`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ source_folder }) }); await renderRenameRequests(); } catch (err) { showAdminError(safeErrorMessage(err)); } }
 async function rejectRenameRequest(id) { try { const reason = prompt("Причина", "Отклонено администратором") || "Отклонено администратором"; await api(`/api/admin/folder-rename-requests/${id}/reject`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ reason }) }); await renderRenameRequests(); } catch (err) { showAdminError(safeErrorMessage(err)); } }
 
 async function renderAudit() {
