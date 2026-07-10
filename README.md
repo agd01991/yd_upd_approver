@@ -273,3 +273,81 @@ The Mini App has a cleaner mobile-first layout with cards, status badges, compac
 Администратор также может переименовать папку без заявки: во вкладке «Заявки на переименование» есть поиск пользователей с выпадающим списком и карточка «Переименовать папку». Source folder выбирается только из backend candidates: текущая папка, разрешённые папки и папки из истории upload requests. Переименование выполняется backend-side через Yandex Disk move/rename с `overwrite=false`; токены не передаются во frontend.
 
 Переименование меняет именно папку пользователя, а не общую root folder. Старые файлы физически остаются в переименованной папке на Яндекс.Диске. Если переименована текущая папка пользователя, обновляется `user.root_folder` и `user.folder_name`; совпадающие записи в `allowed_folders` заменяются на новый путь; старые `upload_requests` с этим `target_folder` получают новый `target_folder` и пересчитанный `target_path`.
+
+## Безопасный Docker-запуск
+
+Основная `docker-compose.yml` безопасна по умолчанию: PostgreSQL и Redis доступны только внутри Compose-сети и не публикуют порты на host. API в основной конфигурации только `expose`-ит порт `8000` для внутренних сервисов. Миграции выполняет единственный one-shot сервис `migrate`; API и bot ждут его успешного завершения и сами Alembic не запускают.
+
+### Локальный запуск для разработки
+
+1. Создайте локальный `.env` на основе `.env.example` и задайте реальные секреты только в локальном файле. Не коммитьте `.env`.
+2. Запустите основную конфигурацию вместе с dev override:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.dev.yml up --build
+```
+
+Dev override публикует только loopback-порты:
+
+- API: `127.0.0.1:8000:8000`;
+- PostgreSQL: `127.0.0.1:55432:5432`;
+- Redis наружу не публикуется.
+
+`docker compose up --build` собирает image локально и не публикует его ни в Docker Hub, ни в GHCR. В конфигурации нет `docker push`, registry login или публикации images.
+
+### Подключение DBeaver к PostgreSQL
+
+Используйте dev-конфигурацию и подключайтесь к PostgreSQL так:
+
+- host: `127.0.0.1`;
+- port: `55432`;
+- database: значение `POSTGRES_DB` из `.env` (по умолчанию в примере `bot`);
+- user: значение `POSTGRES_USER` из `.env`;
+- password: значение `POSTGRES_PASSWORD` из `.env`.
+
+Проверить подключение без публикации стандартного порта PostgreSQL можно командой:
+
+```bash
+psql "postgresql://$POSTGRES_USER:$POSTGRES_PASSWORD@127.0.0.1:55432/$POSTGRES_DB"
+```
+
+### Проверка состояния, healthcheck и логов
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.dev.yml ps
+docker compose -f docker-compose.yml -f docker-compose.dev.yml logs api bot migrate
+docker inspect --format '{{json .State.Health}}' yd_upd_approver-postgres-1
+docker inspect --format '{{json .State.Health}}' yd_upd_approver-redis-1
+curl http://127.0.0.1:8000/health
+```
+
+Логи Docker ограничены через json-file rotation (`max-size` и `max-file`), чтобы долгий локальный запуск не раздувал файлы логов бесконтрольно.
+
+### Пароль PostgreSQL и существующие volumes
+
+`POSTGRES_PASSWORD` применяется официальным образом PostgreSQL image только при первичной инициализации нового data volume. Если volume уже существует, изменение `.env` не меняет пароль роли внутри базы. Удалять volume для смены пароля не нужно.
+
+Безопасные варианты смены пароля существующей роли:
+
+```sql
+ALTER ROLE bot WITH PASSWORD 'new-strong-password';
+```
+
+или интерактивно в `psql`:
+
+```sql
+\password bot
+```
+
+После изменения пароля роли обновите `.env` так, чтобы `POSTGRES_PASSWORD` и `DATABASE_URL` совпадали с новым значением.
+
+> Внимание: не выполняйте `docker compose down -v` без актуальной резервной копии. Эта команда удаляет volumes, включая данные PostgreSQL.
+
+### Просмотр локальных images
+
+Безопасные команды просмотра локально собранных images:
+
+```bash
+docker image ls yd-upd-approver
+docker image inspect yd-upd-approver:security-test --format '{{.Id}} {{.Config.User}}'
+```
