@@ -1,7 +1,8 @@
-from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
+from fastapi import APIRouter, Depends, File, Form, UploadFile, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import bot_dep, current_user_dep, get_db, settings_dep
+from app.api.errors import ApiError
 from app.bot.keyboards import upload_keyboard
 from app.config import Settings
 from app.db.models import User, UserStatus
@@ -55,7 +56,11 @@ async def create_upload(
 ) -> dict:
     user, _ = current
     if user.status != UserStatus.active or not user.root_folder:
-        raise HTTPException(status.HTTP_403_FORBIDDEN, "Only active users can upload files")
+        raise ApiError(
+            status.HTTP_403_FORBIDDEN,
+            "user_not_active",
+            "Загрузка доступна только активным пользователям.",
+        )
     safe = sanitize_filename(file.filename or "file")
     request_code = await next_request_code(session)
     storage = TempStorage(settings.temp_storage_dir)
@@ -66,7 +71,11 @@ async def create_upload(
             size += len(chunk)
             if not validate_size(size, settings):
                 destination.unlink(missing_ok=True)
-                raise HTTPException(status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, "File is too large")
+                raise ApiError(
+                    status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                    "file_too_large",
+                    "Файл превышает допустимый размер.",
+                )
             out.write(chunk)
     client = YandexDiskClient(settings.yandex_disk_token)
     try:
@@ -75,9 +84,8 @@ async def create_upload(
         if hasattr(session, "rollback"):
             await session.rollback()
         destination.unlink(missing_ok=True)
-        raise HTTPException(
-            status.HTTP_503_SERVICE_UNAVAILABLE,
-            "Не удалось подготовить папку на Яндекс.Диске",
+        raise ApiError(
+            503, "yandex_disk_unavailable", "Не удалось подготовить папку на Яндекс.Диске"
         ) from exc
     finally:
         await client.close()

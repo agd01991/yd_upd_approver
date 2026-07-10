@@ -1,9 +1,10 @@
 from collections.abc import AsyncIterator
 
 from aiogram import Bot
-from fastapi import Depends, Header, HTTPException, status
+from fastapi import Depends, Header, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.api.errors import ApiError
 from app.api.security import TelegramWebAppUser, validate_init_data
 from app.config import Settings, get_settings
 from app.db.models import User
@@ -41,7 +42,9 @@ async def admin_user_dep(
     settings: Settings = Depends(settings_dep),
 ) -> TelegramWebAppUser:
     if tg_user.telegram_id not in settings.telegram_admin_ids:
-        raise HTTPException(status.HTTP_403_FORBIDDEN, "Admin access required")
+        raise ApiError(
+            status.HTTP_403_FORBIDDEN, "admin_access_required", "Недостаточно прав администратора."
+        )
     return tg_user
 
 

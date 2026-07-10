@@ -1,8 +1,9 @@
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import bot_dep, current_user_dep, get_db, settings_dep
+from app.api.errors import ApiError
 from app.api.schemas import FolderProfileBody, FolderRenameRequestCreate
 from app.bot.keyboards import user_moderation_keyboard
 from app.config import Settings
@@ -78,7 +79,7 @@ async def save_folder_profile(
             )
         )
     except FolderNameValidationError as exc:
-        raise HTTPException(400, str(exc)) from exc
+        raise ApiError(400, "invalid_request", "Проверьте корректность введённых данных.") from exc
     was_missing = not user.folder_name
     user.contract_number = body.contract_number.strip()
     user.contract_date = body.contract_date.strip()
@@ -100,7 +101,11 @@ async def create_my_folder_rename_request(
 ) -> dict:
     user, _ = current
     if user.status != UserStatus.active:
-        raise HTTPException(400, "Заявка на переименование доступна только активному пользователю")
+        raise ApiError(
+            400,
+            "invalid_request_state",
+            "Заявка на переименование доступна только активному пользователю.",
+        )
     existing = await session.scalar(
         select(FolderRenameRequest).where(
             FolderRenameRequest.user_id == user.id,
@@ -112,7 +117,7 @@ async def create_my_folder_rename_request(
     try:
         folder_name = validate_user_folder_name(body.requested_folder_name)
     except FolderNameValidationError as exc:
-        raise HTTPException(400, str(exc)) from exc
+        raise ApiError(400, "invalid_request", "Проверьте корректность введённых данных.") from exc
     req = FolderRenameRequest(
         user_id=user.id,
         requested_folder_name=folder_name,

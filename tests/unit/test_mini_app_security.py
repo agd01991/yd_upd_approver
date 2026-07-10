@@ -7,8 +7,7 @@ from urllib.parse import urlencode
 import pytest
 
 fastapi = pytest.importorskip("fastapi")
-from fastapi import HTTPException
-
+from app.api.errors import ApiError
 from app.api.security import validate_init_data
 from app.config import Settings
 
@@ -38,12 +37,12 @@ def test_valid_init_data_passes():
 def test_invalid_hash_fails():
     settings = Settings(telegram_bot_token="123:ABC")
     init = signed({"auth_date": int(time.time()), "user": {"id": 42}}, "123:ABC") + "x"
-    with pytest.raises(HTTPException):
+    with pytest.raises(ApiError):
         validate_init_data(init, settings)
 
 
 def test_expired_auth_date_fails():
     settings = Settings(telegram_bot_token="123:ABC", webapp_auth_max_age_seconds=1)
     init = signed({"auth_date": int(time.time()) - 100, "user": {"id": 42}}, "123:ABC")
-    with pytest.raises(HTTPException):
+    with pytest.raises(ApiError):
         validate_init_data(init, settings)
