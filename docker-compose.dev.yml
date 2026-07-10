@@ -1,0 +1,18 @@
+services:
+  api:
+    ports:
+      - "127.0.0.1:8000:8000"
+    volumes:
+      - ./var:/app/var
+
+  bot:
+    volumes:
+      - ./var:/app/var
+
+  migrate:
+    volumes:
+      - ./var:/app/var
+
+  postgres:
+    ports:
+      - "127.0.0.1:55432:5432"

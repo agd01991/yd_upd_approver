@@ -70,3 +70,32 @@ jobs:
 
       - name: Tests
         run: pytest
+
+      - name: Prepare Docker Compose environment
+        run: |
+          cp .env.example .env
+          {
+            echo "TELEGRAM_BOT_TOKEN="
+            echo "YANDEX_DISK_TOKEN="
+            echo "POSTGRES_DB=bot"
+            echo "POSTGRES_USER=bot"
+            echo "POSTGRES_PASSWORD=change-me-before-production"
+            echo "DATABASE_URL=postgresql+asyncpg://bot:change-me-before-production@postgres:5432/bot"
+            echo "REDIS_URL=redis://redis:6379/0"
+          } >> "$GITHUB_ENV"
+
+      - name: Validate production Compose config
+        run: docker compose -f docker-compose.yml config --quiet
+
+      - name: Validate development Compose config
+        run: docker compose -f docker-compose.yml -f docker-compose.dev.yml config --quiet
+
+      - name: Build Docker image
+        run: docker build --no-cache -t yd-upd-approver:ci .
+
+      - name: Verify Docker image hardening
+        run: |
+          test "$(docker image inspect yd-upd-approver:ci --format '{{.Config.User}}')" != ""
+          test "$(docker image inspect yd-upd-approver:ci --format '{{.Config.User}}')" != "0"
+          test "$(docker image inspect yd-upd-approver:ci --format '{{.Config.User}}')" != "root"
+          docker run --rm --entrypoint python yd-upd-approver:ci -c "import os, pathlib; assert os.geteuid() != 0; assert not pathlib.Path('/app/.env').exists(); assert not any(pathlib.Path('/app/var/tmp_uploads').iterdir())"
