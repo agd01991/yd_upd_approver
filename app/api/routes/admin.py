@@ -40,7 +40,11 @@ from app.services.naming import (
     sanitize_filename,
     user_folder_for_user,
 )
-from app.services.upload_queue import UploadQueueError, enqueue_upload_request
+from app.services.upload_queue import (
+    UploadQueueError,
+    enqueue_upload_request,
+    reject_upload_request,
+)
 from app.services.user_folders import change_yandex_disk_root_for_active_users
 from app.services.yandex_disk import YandexDiskClient
 
@@ -442,26 +446,13 @@ async def reject_upload(
     session: AsyncSession = Depends(get_db),
     bot=Depends(bot_dep),
 ) -> dict:
-    r = await session.get(UploadRequest, request_id)
-    user = await session.get(User, r.user_id) if r else None
-    if not r or not user:
-        raise ApiError(404, "request_not_found", "Заявка не найдена.")
-    if r.status in {UploadStatus.uploaded, UploadStatus.rejected}:
-        raise ApiError(400, "invalid_request_state", "Заявку нельзя отклонить в текущем состоянии.")
-    old = r.status.value
-    r.status = UploadStatus.rejected
-    r.rejected_at = datetime.now(UTC)
-    r.reject_reason = body.reason[:1000]
-    await write_audit(
-        session,
-        actor.telegram_id,
-        "upload_reject",
-        request_id=r.id,
-        user_id=user.id,
-        old_value={"status": old},
-        new_value={"status": r.status.value, "reason": r.reject_reason},
-    )
-    await session.commit()
+    try:
+        r = await reject_upload_request(session, request_id, actor.telegram_id, body.reason)
+    except UploadQueueError as exc:
+        if exc.code == "request_not_found":
+            raise ApiError(404, exc.code, str(exc)) from exc
+        raise ApiError(409, exc.code, str(exc)) from exc
+    user = await session.get(User, r.user_id)
     if bot:
         await bot.send_message(
             user.telegram_id, f"Заявка {r.request_code} отклонена: {r.reject_reason}"

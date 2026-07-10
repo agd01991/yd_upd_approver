@@ -15,7 +15,6 @@ from app.config import Settings, get_settings
 from app.db.models import UploadMode, UploadRequest, UploadStatus, User
 from app.db.session import SessionLocal
 from app.services.audit import write_audit
-from app.services.naming import copy_filename, join_disk_path
 from app.services.storage import TempStorage
 from app.services.yandex_disk import (
     ConflictError,
@@ -67,12 +66,6 @@ def _is_under_temp(path: str, settings: Settings) -> bool:
     except ValueError:
         return False
     return True
-
-
-def _target_for(job: UploadJob) -> str:
-    if job.upload_mode == UploadMode.copy:
-        return join_disk_path(job.target_folder, copy_filename(job.safe_filename, job.request_code))
-    return job.target_path
 
 
 def _remote_sha256(info: dict) -> str | None:
@@ -285,7 +278,7 @@ async def notify_result(
 async def process_job(job: UploadJob, settings: Settings, bot: Bot | None = None) -> None:
     stop = asyncio.Event()
     hb = asyncio.create_task(heartbeat(job, settings, stop))
-    target = _target_for(job)
+    target = job.target_path
     try:
         path = Path(job.local_path)
         if not path.is_file() or not _is_under_temp(job.local_path, settings):

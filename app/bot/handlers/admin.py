@@ -1,4 +1,3 @@
-from datetime import UTC, datetime
 from pathlib import Path
 
 from aiogram import Bot, Router
@@ -32,7 +31,12 @@ from app.services.naming import (
     join_disk_path,
     user_folder_for_user,
 )
-from app.services.upload_queue import UploadQueueError, enqueue_upload_request
+from app.services.upload_queue import (
+    REJECTABLE_UPLOAD_STATUSES,
+    UploadQueueError,
+    enqueue_upload_request,
+    reject_upload_request,
+)
 from app.services.user_folders import change_yandex_disk_root_for_active_users
 from app.services.yandex_disk import YandexDiskClient, YandexDiskError
 from app.utils.formatting import (
@@ -318,21 +322,8 @@ async def _reject_request(
     user: User,
     reason: str,
 ) -> None:
-    old_status = request.status.value
-    request.status = UploadStatus.rejected
-    request.rejected_at = datetime.now(UTC)
-    request.reject_reason = reason
-    await write_audit(
-        session,
-        actor_telegram_id=admin_id,
-        action="upload_reject",
-        request_id=request.id,
-        user_id=user.id,
-        old_value={"status": old_status},
-        new_value={"status": request.status.value, "reason": reason},
-    )
-    await session.commit()
-    await _notify_upload_result(bot, admin_id, request, user)
+    rejected = await reject_upload_request(session, request.id, admin_id, reason)
+    await _notify_upload_result(bot, admin_id, rejected, user)
 
 
 @router.callback_query(UploadModerationCallback.filter())
@@ -394,7 +385,7 @@ async def upload_callback(
         return
 
     if action == "reject":
-        if request.status in {UploadStatus.uploaded, UploadStatus.rejected}:
+        if request.status not in REJECTABLE_UPLOAD_STATUSES:
             await callback.answer("Эту заявку уже нельзя отклонить", show_alert=True)
             return
         await callback.message.answer(
@@ -405,6 +396,10 @@ async def upload_callback(
         return
 
     if action in REJECT_REASONS:
+        if request.status not in REJECTABLE_UPLOAD_STATUSES:
+            await callback.answer("Эту заявку уже нельзя отклонить", show_alert=True)
+            await state.clear()
+            return
         if action == "reject_other":
             await state.set_state(UploadEditStates.waiting_for_custom_reject_reason)
             await state.update_data(request_id=request.id)
@@ -413,9 +408,13 @@ async def upload_callback(
             )
             await callback.answer()
             return
-        await _reject_request(
-            bot, session, callback.from_user.id, request, user, REJECT_REASONS[action]
-        )
+        try:
+            await _reject_request(
+                bot, session, callback.from_user.id, request, user, REJECT_REASONS[action]
+            )
+        except UploadQueueError as exc:
+            await callback.answer(str(exc), show_alert=True)
+            return
         await callback.answer("Заявка отклонена")
         return
 
@@ -560,7 +559,12 @@ async def custom_reject_reason(
         await state.clear()
         return
     reason = (message.text or "Отклонено администратором").strip()[:1000]
-    await _reject_request(bot, session, message.from_user.id, request, user, reason)
+    try:
+        await _reject_request(bot, session, message.from_user.id, request, user, reason)
+    except UploadQueueError as exc:
+        await state.clear()
+        await message.answer(str(exc))
+        return
     await state.clear()
     await message.answer("Заявка отклонена")
 

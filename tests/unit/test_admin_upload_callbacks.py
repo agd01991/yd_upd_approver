@@ -80,7 +80,7 @@ async def test_upload_callback_non_admin_denied() -> None:
 
 
 @pytest.mark.anyio
-async def test_upload_callback_reject_notifies_user() -> None:
+async def test_upload_callback_reject_notifies_user(monkeypatch) -> None:  # noqa: ANN001
     request = SimpleNamespace(
         id=1,
         user_id=2,
@@ -91,6 +91,16 @@ async def test_upload_callback_reject_notifies_user() -> None:
     )
     user = SimpleNamespace(id=2, telegram_id=10, username=None, full_name="User")
     bot = FakeBot()
+
+    async def fake_reject(session, request_id, actor, reason):  # noqa: ANN001
+        assert request_id == request.id
+        assert actor == 1
+        request.status = UploadStatus.rejected
+        request.reject_reason = reason
+        await session.commit()
+        return request
+
+    monkeypatch.setattr(admin, "reject_upload_request", fake_reject)
     await admin.upload_callback(
         FakeCallback(from_id=1),
         SimpleNamespace(action="reject_duplicate", request_id=1),
@@ -102,6 +112,40 @@ async def test_upload_callback_reject_notifies_user() -> None:
     assert request.status == UploadStatus.rejected
     assert request.reject_reason == "Дубликат"
     assert any(chat_id == 10 for chat_id, _, _ in bot.messages)
+
+
+@pytest.mark.anyio
+async def test_upload_callback_reject_reason_after_enqueue_is_blocked(monkeypatch) -> None:  # noqa: ANN001
+    request = SimpleNamespace(
+        id=1,
+        user_id=2,
+        status=UploadStatus.approved,
+        request_code="REQ-000001",
+        reject_reason=None,
+        rejected_at=None,
+        worker_token="worker-token",
+        lease_expires_at="lease",
+    )
+    user = SimpleNamespace(id=2, telegram_id=10, username=None, full_name="User")
+    bot = FakeBot()
+
+    async def fail_reject(*args, **kwargs):  # noqa: ANN002, ANN003
+        raise AssertionError("locked reject service must not be called after UX guard")
+
+    monkeypatch.setattr(admin, "reject_upload_request", fail_reject)
+    callback = FakeCallback(from_id=1)
+    await admin.upload_callback(
+        callback,
+        SimpleNamespace(action="reject_duplicate", request_id=1),
+        bot,
+        FakeSession(request, user),
+        Settings(telegram_admin_ids=[1]),
+        FakeState(),
+    )
+    assert request.status == UploadStatus.approved
+    assert request.worker_token == "worker-token"
+    assert not bot.messages
+    assert callback.answers == [("Эту заявку уже нельзя отклонить", True)]
 
 
 @pytest.mark.anyio

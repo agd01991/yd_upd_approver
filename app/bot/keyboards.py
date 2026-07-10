@@ -39,7 +39,7 @@ def upload_keyboard(request_id: int | object) -> InlineKeyboardMarkup:
         ("Перезаписать", "overwrite"),
         ("Повторить", "retry"),
     ]
-    if getattr(status, "value", status) in {"approved", "uploading"}:
+    if getattr(status, "value", status) in {"approved", "uploading", "uploaded", "rejected"}:
         actions = [("Открыть файл", "open"), ("Содержимое папки", "list")]
     elif getattr(status, "value", status) == "failed":
         actions = [

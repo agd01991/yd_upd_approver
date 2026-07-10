@@ -21,6 +21,11 @@ ACTION_TO_MODE = {
     "overwrite": UploadMode.overwrite,
 }
 
+REJECTABLE_UPLOAD_STATUSES = {UploadStatus.pending_approval, UploadStatus.failed}
+REJECT_INVALID_STATE_MESSAGE = (
+    "Заявка уже поставлена в очередь или загружается и не может быть отклонена."
+)
+
 
 def _same_mode(action: str, request: UploadRequest) -> UploadMode:
     if action == "retry":
@@ -75,7 +80,7 @@ async def enqueue_upload_request(
     _ensure_temp_file(request)
     now = datetime.now(UTC)
     old_status = request.status.value
-    if mode == UploadMode.copy:
+    if mode == UploadMode.copy and action == "copy":
         request.target_path = join_disk_path(
             request.target_folder, copy_filename(request.safe_filename, request.request_code)
         )
@@ -99,6 +104,44 @@ async def enqueue_upload_request(
             "upload_mode": mode.value,
             "queued_at": now.isoformat(),
         },
+    )
+    await session.commit()
+    return request
+
+
+async def reject_upload_request(
+    session: AsyncSession,
+    request_id: int,
+    actor_telegram_id: int,
+    reason: str,
+) -> UploadRequest:
+    result = await session.execute(
+        select(UploadRequest).where(UploadRequest.id == request_id).with_for_update()
+    )
+    request = result.scalar_one_or_none()
+    if request is None:
+        raise UploadQueueError("Заявка не найдена.", "request_not_found")
+
+    user = await session.get(User, request.user_id)
+    if user is None:
+        raise UploadQueueError("Пользователь заявки не найден.", "request_not_found")
+
+    if request.status not in REJECTABLE_UPLOAD_STATUSES:
+        raise UploadQueueError(REJECT_INVALID_STATE_MESSAGE)
+
+    old_status = request.status.value
+    safe_reason = reason[:1000]
+    request.status = UploadStatus.rejected
+    request.rejected_at = datetime.now(UTC)
+    request.reject_reason = safe_reason
+    await write_audit(
+        session,
+        actor_telegram_id=actor_telegram_id,
+        action="upload_reject",
+        request_id=request.id,
+        user_id=request.user_id,
+        old_value={"status": old_status},
+        new_value={"status": request.status.value, "reason": safe_reason},
     )
     await session.commit()
     return request
