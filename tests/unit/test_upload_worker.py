@@ -58,7 +58,7 @@ async def test_upload_worker_failed_keeps_temp(tmp_path) -> None:
     await upload_approved_request(FakeSession(), request, FakeClient(fail=True))
     assert request.status == UploadStatus.failed
     assert file_path.exists()
-    assert request.error_message == "boom"
+    assert request.error_message == "Не удалось загрузить файл. Повторите попытку позже."
 
 
 @pytest.mark.anyio

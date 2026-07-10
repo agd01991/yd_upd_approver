@@ -68,21 +68,57 @@ function fmtSize(n) { return n ? `${(n / 1048576).toFixed(2)} MB` : "—"; }
 function shortSha(value) { return value ? value.slice(0, 12) : "—"; }
 function userFolderLabel(user) { return user?.folder_name || user?.root_folder_label || (user?.root_folder_assigned ? "назначена" : "не назначена"); }
 
-async function readError(response) {
-  try {
-    const data = await response.json();
-    return data.detail || JSON.stringify(data);
-  } catch {
-    return await response.text();
+class ApiClientError extends Error {
+  constructor({ status = 0, code = "network_error", message, details = null, requestId = null, network = false }) {
+    super(message || "Ошибка запроса.");
+    this.name = "ApiClientError";
+    this.status = status;
+    this.code = code;
+    this.details = details;
+    this.requestId = requestId;
+    this.network = network;
   }
+}
+
+function safeErrorMessage(error) {
+  if (error?.network) return "Нет соединения с сервером. Проверьте интернет и повторите попытку.";
+  if (error?.status === 401) return "Откройте Mini App через Telegram заново.";
+  if (error?.status === 403) return "Недостаточно прав для выполнения операции.";
+  if (error?.status === 413) return "Файл превышает допустимый размер.";
+  if (error?.status === 422) return "Проверьте корректность заполненных полей.";
+  if (error?.status >= 500) return `${error.message || "Сервис временно недоступен. Повторите попытку позже."}${error.requestId ? ` Код обращения: ${error.requestId}` : ""}`;
+  return String(error?.message || "Ошибка запроса.");
+}
+
+async function readError(response) {
+  const requestId = response.headers.get("X-Request-ID");
+  const text = await response.text();
+  if (!text) return new ApiClientError({ status: response.status, message: "Ошибка запроса.", requestId });
+  try {
+    const data = JSON.parse(text);
+    if (data?.error && typeof data.error === "object") {
+      return new ApiClientError({ status: response.status, code: data.error.code, message: data.error.message, details: data.error.details, requestId: data.request_id || requestId });
+    }
+    if (typeof data.detail === "string") return new ApiClientError({ status: response.status, message: data.detail, requestId });
+    if (typeof data.message === "string") return new ApiClientError({ status: response.status, message: data.message, requestId });
+  } catch {
+    return new ApiClientError({ status: response.status, message: text, requestId });
+  }
+  return new ApiClientError({ status: response.status, message: "Ошибка запроса.", requestId });
 }
 
 async function api(path, opts = {}) {
   opts.headers = { ...(opts.headers || {}), "X-Telegram-Init-Data": initData };
-  const response = await fetch(path, opts);
-  if (response.status === 401) throw new Error("Откройте приложение через Telegram");
-  if (!response.ok) throw new Error(await readError(response));
-  return response.json();
+  let response;
+  try {
+    response = await fetch(path, opts);
+  } catch {
+    throw new ApiClientError({ network: true, message: "Нет соединения с сервером. Проверьте интернет и повторите попытку." });
+  }
+  if (!response.ok) throw await readError(response);
+  if (response.status === 204) return null;
+  const text = await response.text();
+  return text ? JSON.parse(text) : null;
 }
 
 function chipHtml(filters, current, prefix) {
@@ -152,7 +188,7 @@ async function uploadSelectedFiles(event, form, input) {
       const result = await api("/api/uploads", { method: "POST", body: fd });
       results.push(`✅ ${file.name}: создана заявка ${result.request_code}`);
     } catch (err) {
-      results.push(`❌ ${file.name}: ${err.message}`);
+      results.push(`❌ ${file.name}: ${safeErrorMessage(err)}`);
     }
   }
   msg.innerHTML = `<b>Готово</b>${results.map((item) => `<div>${escapeHtml(item)}</div>`).join("")}`;
@@ -189,7 +225,7 @@ async function loadAdmin(tab) {
     if (tab === "audit") return await renderAudit();
     if (tab === "disk-root") return await renderDiskRootSettings();
     await renderAdminUploads();
-  } catch (err) { showAdminError(err.message); }
+  } catch (err) { showAdminError(safeErrorMessage(err)); }
 }
 
 async function renderAdminUploads() {
@@ -270,7 +306,7 @@ async function renderDiskRootSettings() {
       await api("/api/admin/disk-root", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ root }) });
       msg.textContent = "Корневая папка сохранена.";
       await renderDiskRootSettings();
-    } catch (err) { showAdminError(err.message); }
+    } catch (err) { showAdminError(safeErrorMessage(err)); }
   };
 }
 
@@ -294,24 +330,29 @@ function bindRenameUserSearch() {
   input.oninput = () => { clearTimeout(adminSearchTimer); adminSearchTimer = setTimeout(async () => {
     const q = input.value.trim(); const box = document.querySelector("#rename-user-results");
     if (!q) { box.innerHTML = ""; return; }
-    const data = await api(`/api/admin/users/search?query=${encodeURIComponent(q)}`);
+    let data;
+    try { data = await api(`/api/admin/users/search?query=${encodeURIComponent(q)}`); } catch (err) { showAdminError(safeErrorMessage(err)); return; }
     box.innerHTML = (data.items || []).map((u) => `<button class="dropdown-item" data-user-id="${u.id}">${escapeHtml(u.telegram_id)} · ${escapeHtml(u.contract_full_name || u.full_name || "—")}<br><span class="muted">${escapeHtml(u.folder_name || "—")}</span></button>`).join("");
     box.querySelectorAll("[data-user-id]").forEach((b, i) => b.onclick = () => selectRenameUser(data.items[i]));
   }, 300); };
 }
 async function selectRenameUser(user) {
-  selectedRenameUser = user;
-  document.querySelector("#rename-user-card").innerHTML = `<b>${escapeHtml(user.contract_full_name || user.full_name || "—")}</b><div class="meta">${escapeHtml(user.telegram_id)} · ${escapeHtml(user.folder_name || "—")}</div>`;
-  const candidates = await api(`/api/admin/users/${user.id}/folder-candidates`);
-  document.querySelector("#rename-source").innerHTML = (candidates.items || []).map((c) => `<option value="${escapeHtml(c.path)}">${escapeHtml(c.label)} — ${escapeHtml(c.path)}</option>`).join("");
+  try {
+    selectedRenameUser = user;
+    document.querySelector("#rename-user-card").innerHTML = `<b>${escapeHtml(user.contract_full_name || user.full_name || "—")}</b><div class="meta">${escapeHtml(user.telegram_id)} · ${escapeHtml(user.folder_name || "—")}</div>`;
+    const candidates = await api(`/api/admin/users/${user.id}/folder-candidates`);
+    document.querySelector("#rename-source").innerHTML = (candidates.items || []).map((c) => `<option value="${escapeHtml(c.path)}">${escapeHtml(c.label)} — ${escapeHtml(c.path)}</option>`).join("");
+  } catch (err) { showAdminError(safeErrorMessage(err)); }
 }
 async function renameSelectedUserFolder() {
-  if (!selectedRenameUser) return showAdminError("Выберите пользователя");
-  await api(`/api/admin/users/${selectedRenameUser.id}/rename-folder`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ source_folder: document.querySelector("#rename-source").value, new_folder_name: document.querySelector("#rename-new-name").value }) });
-  await renderRenameRequests();
+  try {
+    if (!selectedRenameUser) return showAdminError("Выберите пользователя");
+    await api(`/api/admin/users/${selectedRenameUser.id}/rename-folder`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ source_folder: document.querySelector("#rename-source").value, new_folder_name: document.querySelector("#rename-new-name").value }) });
+    await renderRenameRequests();
+  } catch (err) { showAdminError(safeErrorMessage(err)); }
 }
-async function approveRenameRequest(id, userId) { await selectRenameUser({ id: userId }); const source_folder = document.querySelector("#rename-source").value; await api(`/api/admin/folder-rename-requests/${id}/approve`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ source_folder }) }); await renderRenameRequests(); }
-async function rejectRenameRequest(id) { const reason = prompt("Причина", "Отклонено администратором") || "Отклонено администратором"; await api(`/api/admin/folder-rename-requests/${id}/reject`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ reason }) }); await renderRenameRequests(); }
+async function approveRenameRequest(id, userId) { try { await selectRenameUser({ id: userId }); const source_folder = document.querySelector("#rename-source").value; await api(`/api/admin/folder-rename-requests/${id}/approve`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ source_folder }) }); await renderRenameRequests(); } catch (err) { showAdminError(safeErrorMessage(err)); } }
+async function rejectRenameRequest(id) { try { const reason = prompt("Причина", "Отклонено администратором") || "Отклонено администратором"; await api(`/api/admin/folder-rename-requests/${id}/reject`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ reason }) }); await renderRenameRequests(); } catch (err) { showAdminError(safeErrorMessage(err)); } }
 
 async function renderAudit() {
   const rows = await api("/api/admin/audit");
@@ -330,15 +371,15 @@ async function downloadTemp(id, filename) {
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url; a.download = filename || "file"; document.body.appendChild(a); a.click(); a.remove(); URL.revokeObjectURL(url);
-  } catch (err) { showAdminError(err.message); }
+  } catch (err) { showAdminError(safeErrorMessage(err)); }
 }
 
-async function moderateUser(id, action) { await api(`/api/admin/users/${id}/${action}`, { method: "POST" }); await loadAdmin("users"); }
-async function uploadAction(id, action) { await api(`/api/admin/uploads/${id}/${action}`, { method: "POST" }); await loadAdmin("uploads"); }
-async function rejectUpload(id) { const reason = prompt("Причина", "Отклонено администратором"); if (reason) await api(`/api/admin/uploads/${id}/reject`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ reason }) }); await loadAdmin("uploads"); }
-async function changeStem(id) { try { const filenameStem = prompt("Введите новое имя файла без расширения. Текущее расширение будет сохранено."); if (!filenameStem) return; await api(`/api/admin/uploads/${id}`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ filename_stem: filenameStem }) }); await loadAdmin("uploads"); } catch (err) { showAdminError(err.message); } }
-async function changeExtension(id) { try { const filenameExtension = prompt("Введите новое расширение файла, например: pdf или .pdf"); if (!filenameExtension) return; await api(`/api/admin/uploads/${id}`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ filename_extension: filenameExtension }) }); await loadAdmin("uploads"); } catch (err) { showAdminError(err.message); } }
-async function changeFolder(id) { try { const folders = await api(`/api/admin/uploads/${id}/allowed-folders`); const choices = folders.items.map((f, index) => `${index + 1}. ${f.label}`).join("\n"); const selected = prompt(`Выберите новую папку только для этой заявки:\n${choices}\n\nОбщая корневая папка меняется во вкладке «Корневая папка».`); if (!selected) return; const index = Number.parseInt(selected, 10) - 1; if (!folders.items[index]) throw new Error("Выберите номер папки из списка"); await api(`/api/admin/uploads/${id}`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ target_folder: folders.items[index].path }) }); await loadAdmin("uploads"); } catch (err) { showAdminError(err.message); } }
+async function moderateUser(id, action) { try { await api(`/api/admin/users/${id}/${action}`, { method: "POST" }); await loadAdmin("users"); } catch (err) { showAdminError(safeErrorMessage(err)); } }
+async function uploadAction(id, action) { try { await api(`/api/admin/uploads/${id}/${action}`, { method: "POST" }); await loadAdmin("uploads"); } catch (err) { showAdminError(safeErrorMessage(err)); } }
+async function rejectUpload(id) { try { const reason = prompt("Причина", "Отклонено администратором"); if (reason) await api(`/api/admin/uploads/${id}/reject`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ reason }) }); await loadAdmin("uploads"); } catch (err) { showAdminError(safeErrorMessage(err)); } }
+async function changeStem(id) { try { const filenameStem = prompt("Введите новое имя файла без расширения. Текущее расширение будет сохранено."); if (!filenameStem) return; await api(`/api/admin/uploads/${id}`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ filename_stem: filenameStem }) }); await loadAdmin("uploads"); } catch (err) { showAdminError(safeErrorMessage(err)); } }
+async function changeExtension(id) { try { const filenameExtension = prompt("Введите новое расширение файла, например: pdf или .pdf"); if (!filenameExtension) return; await api(`/api/admin/uploads/${id}`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ filename_extension: filenameExtension }) }); await loadAdmin("uploads"); } catch (err) { showAdminError(safeErrorMessage(err)); } }
+async function changeFolder(id) { try { const folders = await api(`/api/admin/uploads/${id}/allowed-folders`); const choices = folders.items.map((f, index) => `${index + 1}. ${f.label}`).join("\n"); const selected = prompt(`Выберите новую папку только для этой заявки:\n${choices}\n\nОбщая корневая папка меняется во вкладке «Корневая папка».`); if (!selected) return; const index = Number.parseInt(selected, 10) - 1; if (!folders.items[index]) throw new Error("Выберите номер папки из списка"); await api(`/api/admin/uploads/${id}`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ target_folder: folders.items[index].path }) }); await loadAdmin("uploads"); } catch (err) { showAdminError(safeErrorMessage(err)); } }
 
 async function load() {
   try {
@@ -347,7 +388,7 @@ async function load() {
     auth.innerHTML = `<div class="card-head"><b>${title}</b><span class="badge">${escapeHtml(statusLabel(me.status))}</span></div><div class="muted">Папка на Яндекс.Диске: ${escapeHtml(userFolderLabel(me))}</div>`;
     await renderUser(me);
     if (me.is_admin) { adminEl.classList.remove("hidden"); await loadAdmin("uploads"); }
-  } catch (err) { auth.textContent = err.message; }
+  } catch (err) { auth.textContent = safeErrorMessage(err); }
 }
 
 document.querySelectorAll("nav button").forEach((button) => { button.onclick = () => loadAdmin(button.dataset.tab); });

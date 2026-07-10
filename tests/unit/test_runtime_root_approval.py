@@ -51,7 +51,7 @@ async def test_api_approve_active_user_returns_400_without_changes(monkeypatch) 
     with pytest.raises(HTTPException) as exc:
         await _moderate_user(1, "approve", 99, session, Settings(), bot=None)
     assert exc.value.status_code == 400
-    assert exc.value.detail == "User is already processed"
+    assert exc.value.detail == "Пользователь уже обработан."
     assert user.root_folder == "disk:/Old/123_user/"
     assert user.allowed_folders == ["disk:/Old/123_user/"]
     assert session.committed is False

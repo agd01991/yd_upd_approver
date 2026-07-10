@@ -1,12 +1,13 @@
 from datetime import UTC, datetime
 from pathlib import Path
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends
 from fastapi.responses import FileResponse
 from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import admin_user_dep, bot_dep, get_db, settings_dep
+from app.api.errors import ApiError
 from app.api.schemas import (
     AdminRenameFolderBody,
     AllowedFoldersResponse,
@@ -153,7 +154,7 @@ async def folder_candidates(
 
     user = await session.get(User, user_id)
     if not user:
-        raise HTTPException(404, "User not found")
+        raise ApiError(404, "user_not_found", "Пользователь не найден.")
     items = await get_user_folder_candidates(session, user, settings)
     return {"items": [c.__dict__ for c in items]}
 
@@ -170,7 +171,7 @@ async def admin_rename_folder(
 
     user = await session.get(User, user_id)
     if not user:
-        raise HTTPException(404, "User not found")
+        raise ApiError(404, "user_not_found", "Пользователь не найден.")
     client = YandexDiskClient(settings.yandex_disk_token)
     try:
         target = await rename_user_folder(
@@ -179,10 +180,12 @@ async def admin_rename_folder(
         await session.commit()
     except ValueError as exc:
         await session.rollback()
-        raise HTTPException(400, str(exc)) from exc
+        raise ApiError(400, "invalid_request", "Проверьте корректность введённых данных.") from exc
     except Exception as exc:
         await session.rollback()
-        raise HTTPException(503, "Не удалось переименовать папку Яндекс.Диска") from exc
+        raise ApiError(
+            503, "yandex_disk_unavailable", "Не удалось переименовать папку Яндекс.Диска"
+        ) from exc
     finally:
         await client.close()
     return {"user": user_json(user), "target_folder": target}
@@ -193,11 +196,11 @@ async def _moderate_user(
 ) -> dict:
     user = await session.get(User, user_id)
     if not user:
-        raise HTTPException(404, "User not found")
+        raise ApiError(404, "user_not_found", "Пользователь не найден.")
     old = user.status.value
     if action == "approve":
         if user.status != UserStatus.pending:
-            raise HTTPException(400, "User is already processed")
+            raise ApiError(400, "invalid_request_state", "Пользователь уже обработан.")
         disk_root = await get_yandex_disk_root(session, settings)
         folder = user_folder_for_user(disk_root, user)
         client = YandexDiskClient(settings.yandex_disk_token)
@@ -207,11 +210,15 @@ async def _moderate_user(
         except ValueError as exc:
             if hasattr(session, "rollback"):
                 await session.rollback()
-            raise HTTPException(400, str(exc)) from exc
+            raise ApiError(
+                400, "invalid_request", "Проверьте корректность введённых данных."
+            ) from exc
         except Exception as exc:
             if hasattr(session, "rollback"):
                 await session.rollback()
-            raise HTTPException(503, "Не удалось создать папку Яндекс.Диска") from exc
+            raise ApiError(
+                503, "yandex_disk_unavailable", "Не удалось создать папку Яндекс.Диска"
+            ) from exc
         finally:
             await client.close()
         msg = "Ваш доступ одобрен. Можете отправлять файлы."
@@ -245,7 +252,7 @@ async def moderate_user(
     bot=Depends(bot_dep),
 ) -> dict:
     if action not in {"approve", "reject", "block"}:
-        raise HTTPException(404, "Unknown action")
+        raise ApiError(404, "not_found", "Unknown action")
     return await _moderate_user(user_id, action, actor.telegram_id, session, settings, bot)
 
 
@@ -278,7 +285,9 @@ async def put_disk_root(
     except Exception as exc:
         if hasattr(session, "rollback"):
             await session.rollback()
-        raise HTTPException(503, "Не удалось сохранить корневую папку Яндекс.Диска") from exc
+        raise ApiError(
+            503, "yandex_disk_unavailable", "Не удалось сохранить корневую папку Яндекс.Диска"
+        ) from exc
     finally:
         await client.close()
     return {"value": root, "is_default": False, "source": "database"}
@@ -290,7 +299,7 @@ def _parse_upload_status(status: str | None) -> UploadStatus | None:
     try:
         return UploadStatus(status)
     except ValueError as exc:
-        raise HTTPException(400, "Неизвестный статус заявки") from exc
+        raise ApiError(400, "invalid_request", "Неизвестный статус заявки") from exc
 
 
 def _user_query_filter(user_query: str | None):
@@ -324,7 +333,7 @@ async def uploads(
 async def upload_detail(request_id: int, session: AsyncSession = Depends(get_db)) -> dict:
     r = await session.get(UploadRequest, request_id)
     if not r:
-        raise HTTPException(404, "Request not found")
+        raise ApiError(404, "request_not_found", "Заявка не найдена.")
     return req_json(r, await session.get(User, r.user_id))
 
 
@@ -332,7 +341,7 @@ async def upload_detail(request_id: int, session: AsyncSession = Depends(get_db)
 async def download_temp(request_id: int, session: AsyncSession = Depends(get_db)):
     r = await session.get(UploadRequest, request_id)
     if not r or not r.local_path or not Path(r.local_path).exists():
-        raise HTTPException(404, "Temp file not found")
+        raise ApiError(404, "request_not_found", "Временный файл не найден.")
     return FileResponse(r.local_path, filename=r.safe_filename)
 
 
@@ -341,7 +350,7 @@ async def allowed_folders(request_id: int, session: AsyncSession = Depends(get_d
     r = await session.get(UploadRequest, request_id)
     user = await session.get(User, r.user_id) if r else None
     if not r or not user:
-        raise HTTPException(404, "Request not found")
+        raise ApiError(404, "request_not_found", "Заявка не найдена.")
     return {
         "items": [{"path": path, "label": _folder_label(path)} for path in user.allowed_folders]
     }
@@ -355,7 +364,7 @@ async def folder_items(
 ) -> dict:
     r = await session.get(UploadRequest, request_id)
     if not r:
-        raise HTTPException(404, "Request not found")
+        raise ApiError(404, "request_not_found", "Заявка не найдена.")
     client = YandexDiskClient(settings.yandex_disk_token)
     try:
         items = await client.list_files(r.target_folder)
@@ -376,16 +385,16 @@ async def _run_action(
     r = await session.get(UploadRequest, request_id)
     user = await session.get(User, r.user_id) if r else None
     if not r or not user:
-        raise HTTPException(404, "Request not found")
+        raise ApiError(404, "request_not_found", "Заявка не найдена.")
     if action == "retry" and r.status != UploadStatus.failed:
-        raise HTTPException(400, "Retry only failed requests")
+        raise ApiError(400, "invalid_request_state", "Повтор доступен только для заявок с ошибкой.")
     if action in {"approve", "overwrite", "retry", "copy"}:
         if r.status not in {
             UploadStatus.pending_approval,
             UploadStatus.failed,
             UploadStatus.approved,
         }:
-            raise HTTPException(400, "Invalid status")
+            raise ApiError(400, "invalid_request_state", "Недопустимое состояние заявки.")
         if action == "copy":
             client = YandexDiskClient(settings.yandex_disk_token)
             try:
@@ -416,7 +425,7 @@ async def _run_action(
                 user.telegram_id, f"Статус заявки {r.request_code}: {r.status.value}"
             )
         return req_json(r, user)
-    raise HTTPException(404, "Unknown action")
+    raise ApiError(404, "not_found", "Unknown action")
 
 
 async def upload_action(
@@ -485,9 +494,9 @@ async def reject_upload(
     r = await session.get(UploadRequest, request_id)
     user = await session.get(User, r.user_id) if r else None
     if not r or not user:
-        raise HTTPException(404, "Request not found")
+        raise ApiError(404, "request_not_found", "Заявка не найдена.")
     if r.status in {UploadStatus.uploaded, UploadStatus.rejected}:
-        raise HTTPException(400, "Cannot reject")
+        raise ApiError(400, "invalid_request_state", "Заявку нельзя отклонить в текущем состоянии.")
     old = r.status.value
     r.status = UploadStatus.rejected
     r.rejected_at = datetime.now(UTC)
@@ -519,9 +528,9 @@ async def patch_upload(
     r = await session.get(UploadRequest, request_id)
     user = await session.get(User, r.user_id) if r else None
     if not r or not user:
-        raise HTTPException(404, "Request not found")
+        raise ApiError(404, "request_not_found", "Заявка не найдена.")
     if r.status in {UploadStatus.uploaded, UploadStatus.rejected}:
-        raise HTTPException(400, "Cannot edit")
+        raise ApiError(400, "invalid_request_state", "Заявку нельзя изменить в текущем состоянии.")
     old = {
         "safe_filename": r.safe_filename,
         "target_folder": r.target_folder,
@@ -537,10 +546,12 @@ async def patch_upload(
         if value is not None
     ]
     if len(filename_fields) > 1:
-        raise HTTPException(400, "Передайте только одно поле изменения имени или расширения")
+        raise ApiError(
+            400, "invalid_request", "Передайте только одно поле изменения имени или расширения."
+        )
     if body.target_folder:
         if not folder_allowed(user, body.target_folder):
-            raise HTTPException(400, "Папка недоступна пользователю")
+            raise ApiError(400, "folder_not_allowed", "Папка недоступна пользователю.")
         r.target_folder = body.target_folder
     try:
         if body.filename_stem is not None:
@@ -550,7 +561,7 @@ async def patch_upload(
         elif body.safe_filename is not None:
             r.safe_filename = sanitize_filename(body.safe_filename)
     except FilenameEditError as exc:
-        raise HTTPException(400, str(exc)) from exc
+        raise ApiError(400, "invalid_request", "Проверьте корректность введённых данных.") from exc
     r.target_path = join_disk_path(r.target_folder, r.safe_filename)
     await write_audit(
         session,
@@ -600,7 +611,7 @@ async def admin_folder_rename_requests(
         try:
             req_status = FolderRenameRequestStatus(status)
         except ValueError as exc:
-            raise HTTPException(400, "Неизвестный статус заявки") from exc
+            raise ApiError(400, "invalid_request", "Неизвестный статус заявки") from exc
         query = query.where(FolderRenameRequest.status == req_status)
     rows = (await session.execute(query)).all()
     return {"items": [rename_request_json(r, u) for r, u in rows]}
@@ -620,9 +631,9 @@ async def approve_folder_rename_request(
     req = await session.get(FolderRenameRequest, request_id)
     user = await session.get(User, req.user_id) if req else None
     if not req or not user:
-        raise HTTPException(404, "Request not found")
+        raise ApiError(404, "request_not_found", "Заявка не найдена.")
     if req.status != FolderRenameRequestStatus.pending:
-        raise HTTPException(400, "Request is already processed")
+        raise ApiError(409, "invalid_request_state", "Заявка уже обработана.")
     client = YandexDiskClient(settings.yandex_disk_token)
     try:
         target = await rename_user_folder(
@@ -636,10 +647,12 @@ async def approve_folder_rename_request(
         await session.commit()
     except ValueError as exc:
         await session.rollback()
-        raise HTTPException(400, str(exc)) from exc
+        raise ApiError(400, "invalid_request", "Проверьте корректность введённых данных.") from exc
     except Exception as exc:
         await session.rollback()
-        raise HTTPException(503, "Не удалось переименовать папку Яндекс.Диска") from exc
+        raise ApiError(
+            503, "yandex_disk_unavailable", "Не удалось переименовать папку Яндекс.Диска"
+        ) from exc
     finally:
         await client.close()
     if bot:
@@ -660,9 +673,9 @@ async def reject_folder_rename_request(
     req = await session.get(FolderRenameRequest, request_id)
     user = await session.get(User, req.user_id) if req else None
     if not req or not user:
-        raise HTTPException(404, "Request not found")
+        raise ApiError(404, "request_not_found", "Заявка не найдена.")
     if req.status != FolderRenameRequestStatus.pending:
-        raise HTTPException(400, "Request is already processed")
+        raise ApiError(409, "invalid_request_state", "Заявка уже обработана.")
     req.status = FolderRenameRequestStatus.rejected
     req.reject_reason = body.reason
     req.reviewed_at = datetime.now(UTC)

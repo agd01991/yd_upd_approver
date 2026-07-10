@@ -1,3 +1,5 @@
+from typing import Any
+
 from pydantic import BaseModel
 
 
@@ -47,3 +49,14 @@ class FolderRenameRejectBody(BaseModel):
 class AdminRenameFolderBody(BaseModel):
     source_folder: str
     new_folder_name: str
+
+
+class ErrorBody(BaseModel):
+    code: str
+    message: str
+    details: Any = None
+
+
+class ErrorResponse(BaseModel):
+    error: ErrorBody
+    request_id: str

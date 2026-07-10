@@ -6,7 +6,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.db.models import UploadRequest, UploadStatus
 from app.services.approval import require_transition
 from app.services.storage import TempStorage
-from app.services.yandex_disk import ConflictError, YandexDiskClient
+from app.services.yandex_disk import (
+    ConflictError,
+    InsufficientStorageError,
+    YandexAuthError,
+    YandexDiskClient,
+    YandexNetworkError,
+)
 
 
 async def upload_approved_request(
@@ -31,9 +37,19 @@ async def upload_approved_request(
         request.error_message = "Name conflict on Yandex Disk"
         await session.flush()
         return
-    except Exception as exc:
+    except (YandexAuthError, YandexNetworkError):
         request.status = UploadStatus.failed
-        request.error_message = str(exc)
+        request.error_message = "Яндекс.Диск временно недоступен. Повторите попытку позже."
+        await session.flush()
+        return
+    except InsufficientStorageError:
+        request.status = UploadStatus.failed
+        request.error_message = "На Яндекс.Диске недостаточно свободного места."
+        await session.flush()
+        return
+    except Exception:
+        request.status = UploadStatus.failed
+        request.error_message = "Не удалось загрузить файл. Повторите попытку позже."
         await session.flush()
         return
     request.status = UploadStatus.uploaded
