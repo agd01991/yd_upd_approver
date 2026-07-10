@@ -32,6 +32,7 @@ from app.services.naming import (
     join_disk_path,
     user_folder_for_user,
 )
+from app.services.upload_queue import UploadQueueError, enqueue_upload_request
 from app.services.user_folders import change_yandex_disk_root_for_active_users
 from app.services.yandex_disk import YandexDiskClient, YandexDiskError
 from app.utils.formatting import (
@@ -42,7 +43,6 @@ from app.utils.formatting import (
     format_user_status,
 )
 from app.utils.security import ensure_admin_callback, is_admin
-from app.workers.upload_worker import upload_approved_request
 
 router = Router()
 
@@ -170,7 +170,7 @@ async def queue(message: Message, session: AsyncSession, settings: Settings) -> 
         user = await session.get(User, request.user_id)
         if user:
             await message.answer(
-                format_upload_card(request, user), reply_markup=upload_keyboard(request.id)
+                format_upload_card(request, user), reply_markup=upload_keyboard(request)
             )
     if len(requests) == 10:
         await message.answer("Показаны первые 10 заявок.")
@@ -295,45 +295,19 @@ async def _run_upload(
     bot: Bot,
     callback: CallbackQuery,
     session: AsyncSession,
-    settings: Settings,
     request: UploadRequest,
     user: User,
-    overwrite: bool = False,
+    action: str = "approve",
 ) -> None:
-    if request.status not in {
-        UploadStatus.pending_approval,
-        UploadStatus.failed,
-        UploadStatus.approved,
-    }:
-        await callback.answer(
-            f"Нельзя загрузить заявку в статусе {request.status.value}", show_alert=True
-        )
-        return
-    request.status = UploadStatus.approved
-    request.approved_at = datetime.now(UTC)
-    request.approved_by = callback.from_user.id
-    client = YandexDiskClient(settings.yandex_disk_token)
     try:
-        await upload_approved_request(session, request, client, overwrite=overwrite)
-        await write_audit(
-            session,
-            actor_telegram_id=callback.from_user.id,
-            action="upload_overwrite" if overwrite else "upload_approve",
-            request_id=request.id,
-            user_id=user.id,
-            new_value={"status": request.status.value, "target_path": request.target_path},
-        )
-        await session.commit()
-    finally:
-        await client.close()
-    await _notify_upload_result(bot, callback.from_user.id, request, user)
-    if request.status == UploadStatus.failed:
-        await bot.send_message(
-            callback.from_user.id,
-            "Если это конфликт имени, выберите: загрузить как копию, перезаписать или повторить.",
-            reply_markup=upload_keyboard(request.id),
-        )
-    await callback.answer("Готово")
+        queued = await enqueue_upload_request(session, request.id, action, callback.from_user.id)
+    except UploadQueueError as exc:
+        await callback.answer(str(exc), show_alert=True)
+        return
+    await callback.message.answer(
+        format_upload_card(queued, user), reply_markup=upload_keyboard(queued)
+    )
+    await callback.answer("Заявка поставлена в очередь")
 
 
 async def _reject_request(
@@ -415,34 +389,8 @@ async def upload_callback(
         await callback.answer()
         return
 
-    if action in {"approve", "overwrite", "retry"}:
-        if action == "retry" and request.status != UploadStatus.failed:
-            await callback.answer("Повторить можно только заявку в статусе failed", show_alert=True)
-            return
-        await _run_upload(
-            bot, callback, session, settings, request, user, overwrite=action == "overwrite"
-        )
-        return
-
-    if action == "copy":
-        client = YandexDiskClient(settings.yandex_disk_token)
-        try:
-            old_target_path = request.target_path
-            request.target_path = await client.resolve_conflict_copy(
-                request.target_folder, request.safe_filename, request.request_code
-            )
-            await write_audit(
-                session,
-                actor_telegram_id=callback.from_user.id,
-                action="upload_copy_path",
-                request_id=request.id,
-                user_id=user.id,
-                old_value={"target_path": old_target_path},
-                new_value={"target_path": request.target_path},
-            )
-        finally:
-            await client.close()
-        await _run_upload(bot, callback, session, settings, request, user, overwrite=False)
+    if action in {"approve", "overwrite", "retry", "copy"}:
+        await _run_upload(bot, callback, session, request, user, action=action)
         return
 
     if action == "reject":
@@ -472,7 +420,12 @@ async def upload_callback(
         return
 
     if action in {"rename", "rename_stem"}:
-        if request.status in {UploadStatus.uploaded, UploadStatus.rejected}:
+        if request.status in {
+            UploadStatus.approved,
+            UploadStatus.uploading,
+            UploadStatus.uploaded,
+            UploadStatus.rejected,
+        }:
             await callback.answer("Эту заявку уже нельзя переименовать", show_alert=True)
             return
         await state.set_state(UploadEditStates.waiting_for_filename_stem)
@@ -484,7 +437,12 @@ async def upload_callback(
         return
 
     if action == "rename_extension":
-        if request.status in {UploadStatus.uploaded, UploadStatus.rejected}:
+        if request.status in {
+            UploadStatus.approved,
+            UploadStatus.uploading,
+            UploadStatus.uploaded,
+            UploadStatus.rejected,
+        }:
             await callback.answer("Эту заявку уже нельзя переименовать", show_alert=True)
             return
         await state.set_state(UploadEditStates.waiting_for_filename_extension)
@@ -529,7 +487,7 @@ async def upload_callback(
         )
         await session.commit()
         await callback.message.answer(
-            format_upload_card(request, user), reply_markup=upload_keyboard(request.id)
+            format_upload_card(request, user), reply_markup=upload_keyboard(request)
         )
         await callback.answer("Папка изменена")
 
@@ -547,7 +505,12 @@ async def rename_upload(
         await message.answer("Заявка не найдена")
         await state.clear()
         return
-    if request.status in {UploadStatus.uploaded, UploadStatus.rejected}:
+    if request.status in {
+        UploadStatus.approved,
+        UploadStatus.uploading,
+        UploadStatus.uploaded,
+        UploadStatus.rejected,
+    }:
         await message.answer("Эту заявку уже нельзя переименовать")
         await state.clear()
         return
@@ -575,9 +538,7 @@ async def rename_upload(
     )
     await session.commit()
     await state.clear()
-    await message.answer(
-        format_upload_card(request, user), reply_markup=upload_keyboard(request.id)
-    )
+    await message.answer(format_upload_card(request, user), reply_markup=upload_keyboard(request))
 
 
 @router.message(UploadEditStates.waiting_for_custom_reject_reason)
@@ -617,7 +578,12 @@ async def rename_extension_upload(
         await message.answer("Заявка не найдена")
         await state.clear()
         return
-    if request.status in {UploadStatus.uploaded, UploadStatus.rejected}:
+    if request.status in {
+        UploadStatus.approved,
+        UploadStatus.uploading,
+        UploadStatus.uploaded,
+        UploadStatus.rejected,
+    }:
         await message.answer("Эту заявку уже нельзя переименовать")
         await state.clear()
         return
@@ -645,6 +611,4 @@ async def rename_extension_upload(
     )
     await session.commit()
     await state.clear()
-    await message.answer(
-        format_upload_card(request, user), reply_markup=upload_keyboard(request.id)
-    )
+    await message.answer(format_upload_card(request, user), reply_markup=upload_keyboard(request))

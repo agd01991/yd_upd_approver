@@ -24,7 +24,9 @@ def user_moderation_keyboard(user_id: int) -> InlineKeyboardMarkup:
     )
 
 
-def upload_keyboard(request_id: int) -> InlineKeyboardMarkup:
+def upload_keyboard(request_id: int | object) -> InlineKeyboardMarkup:
+    status = getattr(request_id, "status", None)
+    real_id = getattr(request_id, "id", request_id)
     actions = [
         ("Открыть файл", "open"),
         ("Загрузить", "approve"),
@@ -37,11 +39,22 @@ def upload_keyboard(request_id: int) -> InlineKeyboardMarkup:
         ("Перезаписать", "overwrite"),
         ("Повторить", "retry"),
     ]
+    if getattr(status, "value", status) in {"approved", "uploading"}:
+        actions = [("Открыть файл", "open"), ("Содержимое папки", "list")]
+    elif getattr(status, "value", status) == "failed":
+        actions = [
+            ("Открыть файл", "open"),
+            ("Отклонить", "reject"),
+            ("Содержимое папки", "list"),
+            ("Загрузить как копию", "copy"),
+            ("Перезаписать", "overwrite"),
+            ("Повторить", "retry"),
+        ]
     rows = [
         [
             InlineKeyboardButton(
                 text=t,
-                callback_data=UploadModerationCallback(action=a, request_id=request_id).pack(),
+                callback_data=UploadModerationCallback(action=a, request_id=real_id).pack(),
             )
         ]
         for t, a in actions

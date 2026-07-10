@@ -395,3 +395,36 @@ docker image inspect yd-upd-approver:security-test --format '{{.Id}} {{.Config.U
 | `internal_error` | Неожиданная внутренняя ошибка сервера |
 
 Если пользователь сообщает об ошибке, администратору достаточно передать `request_id` / `X-Request-ID`, время операции и краткое описание действия. Traceback, SQL, токены, Telegram initData, credentials, тела запросов и внутренние пути клиенту не возвращаются; подробности неожиданных ошибок остаются только в серверном логе с тем же `request_id`.
+
+## Фоновый worker загрузок
+
+Жизненный цикл upload request теперь отделяет модерацию от передачи файла на Яндекс.Диск:
+
+1. `pending_approval` — файл сохранён локально и ждёт решения администратора.
+2. `approved` — заявка поставлена в durable queue PostgreSQL и ожидает worker (`approved` в API означает «в очереди на загрузку»).
+3. `uploading` — отдельный worker забрал job через `SELECT ... FOR UPDATE SKIP LOCKED`, выставил lease и выполняет потоковую загрузку.
+4. `uploaded` — worker подтвердил загрузку, закоммитил итоговый статус и только после этого удалил временный файл.
+5. `failed` — подтверждённая ошибка загрузки; временный файл сохраняется для ручного retry/copy/overwrite.
+
+API и Telegram callback больше не ждут Яндекс.Диск: действия `approve`, `copy`, `overwrite` и `retry` только записывают режим (`normal`, `copy`, `overwrite`), `queued_at`, счётчик попыток и lease-поля в PostgreSQL одной транзакцией. Redis остаётся в compose для будущих задач, но не является источником истины очереди: после рестарта API, bot, Redis или worker job остаётся в таблице `upload_requests`.
+
+Запуск worker:
+
+```bash
+python -m app.workers.upload_worker
+```
+
+В Docker Compose worker — отдельный сервис без опубликованных портов:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.dev.yml logs -f worker
+docker compose ps worker
+```
+
+Если worker остановлен, enqueue продолжает работать: заявки остаются в PostgreSQL со статусом `approved`. После запуска worker продолжит обработку. Два worker можно запустить для проверки конкурентной обработки, например масштабированием сервиса, если это поддерживается вашей compose-версией; `SKIP LOCKED` не позволит двум процессам забрать одну строку одновременно.
+
+Worker использует lease/heartbeat. Claim выставляет `worker_token` и `lease_expires_at`, а heartbeat продлевает lease только для строки с тем же token. Если процесс упал или legacy-строка осталась в `uploading` без lease, следующий цикл recovery вернёт job в `approved` без удаления временного файла и без раскрытия секретов в audit/log.
+
+При падении после принятия файла Яндекс.Диском, но до commit `uploaded`, повторный worker перед загрузкой пытается сверить существующий remote resource через `get_info()`: безопасное завершение возможно только при совпадении размера и SHA-256. Совпадения имени или размера недостаточно; при конфликте `normal`/`copy` job становится `failed`, а `overwrite` может повторить загрузку.
+
+Ручной retry разрешён только из `failed` и сохраняет предыдущий `upload_mode` (или использует `normal`, если режима ещё нет). Диагностировать failed job следует по безопасному `error_message`, audit events `upload_failed`, `upload_recovered`, `upload_started`, `upload_uploaded` и server logs без токенов, upload URL, DSN или содержимого файла.

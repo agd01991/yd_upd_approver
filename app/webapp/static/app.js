@@ -25,7 +25,7 @@ const STATUS_LABELS = {
   stored: "сохранён временно",
   new: "новый",
   pending_approval: "на проверке",
-  approved: "одобрено",
+  approved: "в очереди на загрузку",
   uploading: "загружается",
   uploaded: "загружено",
   failed: "ошибка",
@@ -51,6 +51,7 @@ const ADMIN_FILTERS = [
   ["needs_action", "Ожидают действия"],
 ];
 const NEEDS_ACTION_STATUSES = new Set(["pending_approval", "failed"]);
+const QUEUED_STATUSES = new Set(["approved", "uploading"]);
 
 function escapeHtml(value) {
   return String(value ?? "").replace(/[&<>'"]/g, (char) => ({
@@ -254,11 +255,19 @@ function adminUploadCard(r) {
     <div class="meta">SHA-256: ${escapeHtml(shortSha(r.sha256))}</div>
     <div class="path">${escapeHtml(r.target_path || "—")}</div>
     <div class="muted">${escapeHtml(r.caption || r.error_message || r.reject_reason || "")}</div>
-    <div class="actions"><div><b>Основные</b><button data-download-id="${r.id}" data-download-name="${escapeHtml(r.safe_filename || "file")}">Открыть файл</button><button onclick="uploadAction(${r.id}, 'approve')">${uploadActionLabel("approve")}</button></div>
-    <div><b>Конфликт/повтор</b>${["copy", "overwrite", "retry"].map((a) => `<button onclick="uploadAction(${r.id}, '${a}')">${uploadActionLabel(a)}</button>`).join("")}</div>
-    <div><b>Редактирование</b><button onclick="changeStem(${r.id})">Изменить имя</button><button onclick="changeExtension(${r.id})">Изменить расширение</button><button onclick="changeFolder(${r.id})">Сменить папку этой заявки</button></div>
-    <div><b>Опасное</b><button class="danger" onclick="rejectUpload(${r.id})">Отклонить</button></div></div>
+    <div class="actions">${adminUploadActions(r)}</div>
   </div>`;
+}
+
+function adminUploadActions(r) {
+  const open = `<div><b>Основные</b><button data-download-id="${r.id}" data-download-name="${escapeHtml(r.safe_filename || "file")}">Открыть файл</button></div>`;
+  if (QUEUED_STATUSES.has(r.status)) return `${open}<div class="muted">Заявка поставлена в очередь и будет обработана worker.</div>`;
+  const canSubmit = r.status === "pending_approval" || r.status === "failed";
+  const approve = canSubmit && r.status === "pending_approval" ? `<button onclick="uploadAction(${r.id}, 'approve')">${uploadActionLabel("approve")}</button>` : "";
+  const conflict = canSubmit ? ["copy", "overwrite"].concat(r.status === "failed" ? ["retry"] : []).map((a) => `<button onclick="uploadAction(${r.id}, '${a}')">${uploadActionLabel(a)}</button>`).join("") : "";
+  const edit = r.status === "pending_approval" || r.status === "failed" ? `<div><b>Редактирование</b><button onclick="changeStem(${r.id})">Изменить имя</button><button onclick="changeExtension(${r.id})">Изменить расширение</button><button onclick="changeFolder(${r.id})">Сменить папку этой заявки</button></div>` : "";
+  const reject = r.status !== "uploaded" && r.status !== "rejected" ? `<div><b>Опасное</b><button class="danger" onclick="rejectUpload(${r.id})">Отклонить</button></div>` : "";
+  return `${open}<div><b>Загрузка</b>${approve}${conflict}</div>${edit}${reject}`;
 }
 
 function bindAdminUploadControls() {
@@ -423,7 +432,7 @@ async function downloadTemp(id, filename) {
 }
 
 async function moderateUser(id, action) { try { await api(`/api/admin/users/${id}/${action}`, { method: "POST" }); await loadAdmin("users"); } catch (err) { showAdminError(safeErrorMessage(err)); } }
-async function uploadAction(id, action) { try { await api(`/api/admin/uploads/${id}/${action}`, { method: "POST" }); await loadAdmin("uploads"); } catch (err) { showAdminError(safeErrorMessage(err)); } }
+async function uploadAction(id, action) { try { await api(`/api/admin/uploads/${id}/${action}`, { method: "POST" }); showAdminError("Заявка поставлена в очередь"); await loadAdmin("uploads"); } catch (err) { showAdminError(safeErrorMessage(err)); } }
 async function rejectUpload(id) { try { const reason = prompt("Причина", "Отклонено администратором"); if (reason) await api(`/api/admin/uploads/${id}/reject`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ reason }) }); await loadAdmin("uploads"); } catch (err) { showAdminError(safeErrorMessage(err)); } }
 async function changeStem(id) { try { const filenameStem = prompt("Введите новое имя файла без расширения. Текущее расширение будет сохранено."); if (!filenameStem) return; await api(`/api/admin/uploads/${id}`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ filename_stem: filenameStem }) }); await loadAdmin("uploads"); } catch (err) { showAdminError(safeErrorMessage(err)); } }
 async function changeExtension(id) { try { const filenameExtension = prompt("Введите новое расширение файла, например: pdf или .pdf"); if (!filenameExtension) return; await api(`/api/admin/uploads/${id}`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ filename_extension: filenameExtension }) }); await loadAdmin("uploads"); } catch (err) { showAdminError(safeErrorMessage(err)); } }

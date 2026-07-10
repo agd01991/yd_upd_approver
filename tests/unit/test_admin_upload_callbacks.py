@@ -89,7 +89,7 @@ async def test_upload_callback_reject_notifies_user() -> None:
         reject_reason=None,
         rejected_at=None,
     )
-    user = SimpleNamespace(id=2, telegram_id=10)
+    user = SimpleNamespace(id=2, telegram_id=10, username=None, full_name="User")
     bot = FakeBot()
     await admin.upload_callback(
         FakeCallback(from_id=1),
@@ -105,7 +105,7 @@ async def test_upload_callback_reject_notifies_user() -> None:
 
 
 @pytest.mark.anyio
-async def test_upload_callback_approve_uploads_and_notifies(monkeypatch) -> None:  # noqa: ANN001
+async def test_upload_callback_approve_enqueues_without_upload(monkeypatch) -> None:  # noqa: ANN001
     request = SimpleNamespace(
         id=1,
         user_id=2,
@@ -114,22 +114,28 @@ async def test_upload_callback_approve_uploads_and_notifies(monkeypatch) -> None
         approved_at=None,
         approved_by=None,
         target_path="disk:/root/file.txt",
+        target_folder="disk:/root",
+        mime_type=None,
+        safe_filename="file.txt",
+        size_bytes=5,
+        sha256="a" * 64,
+        caption=None,
+        error_message=None,
+        reject_reason=None,
     )
-    user = SimpleNamespace(id=2, telegram_id=10)
+    user = SimpleNamespace(id=2, telegram_id=10, username=None, full_name="User")
     bot = FakeBot()
 
-    class FakeClient:
-        def __init__(self, token: str) -> None:
-            self.token = token
+    async def fake_enqueue(session, request_id, action, actor):  # noqa: ANN001
+        assert action == "approve"
+        request.status = UploadStatus.approved
+        request.approved_by = actor
+        return request
 
-        async def close(self) -> None:
-            pass
+    async def fail_worker(*args, **kwargs):  # noqa: ANN002, ANN003
+        raise AssertionError("upload must not run in callback")
 
-    async def fake_worker(session, upload, client, overwrite=False):  # noqa: ANN001
-        upload.status = UploadStatus.uploaded
-
-    monkeypatch.setattr(admin, "YandexDiskClient", FakeClient)
-    monkeypatch.setattr(admin, "upload_approved_request", fake_worker)
+    monkeypatch.setattr(admin, "enqueue_upload_request", fake_enqueue)
     await admin.upload_callback(
         FakeCallback(from_id=1),
         SimpleNamespace(action="approve", request_id=1),
@@ -138,9 +144,9 @@ async def test_upload_callback_approve_uploads_and_notifies(monkeypatch) -> None
         Settings(telegram_admin_ids=[1], yandex_disk_token="token"),
         FakeState(),
     )
-    assert request.status == UploadStatus.uploaded
+    assert request.status == UploadStatus.approved
     assert request.approved_by == 1
-    assert any(chat_id == 10 and "загружен" in text for chat_id, text, _ in bot.messages)
+    assert not bot.messages
 
 
 class FakeTextMessage(FakeMessage):
