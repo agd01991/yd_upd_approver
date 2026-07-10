@@ -33,5 +33,3 @@ tmp
 *.tmp
 .DS_Store
 Thumbs.db
-
-!var/tmp_uploads/.gitkeep

@@ -11,9 +11,8 @@ COPY pyproject.toml ./
 COPY alembic.ini ./
 COPY alembic ./alembic
 COPY app ./app
-COPY var/tmp_uploads/.gitkeep ./var/tmp_uploads/.gitkeep
-
 RUN pip install --no-cache-dir . \
+    && mkdir -p /app/var/tmp_uploads \
     && chown -R app:app /app/var
 
 USER app
