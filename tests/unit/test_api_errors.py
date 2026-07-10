@@ -35,9 +35,17 @@ def build_app() -> FastAPI:
     async def api_error():
         raise ApiError(400, "file_too_large", "Файл превышает допустимый размер.", {"max": 1})
 
+    @app.get("/api-error-5xx")
+    async def api_error_5xx():
+        raise ApiError(503, "upstream_failed", "Апстрим временно недоступен.")
+
     @app.get("/http-error")
     async def http_error():
         raise HTTPException(403, "Admin access required", headers={"WWW-Authenticate": "Telegram"})
+
+    @app.get("/http-error-5xx")
+    async def http_error_5xx():
+        raise HTTPException(500, "upstream exploded")
 
     @app.get("/validation/{item_id}")
     async def validation(item_id: int):
@@ -45,11 +53,18 @@ def build_app() -> FastAPI:
 
     @app.get("/db")
     async def db():
-        raise SQLAlchemyError("postgresql://bot:secret@localhost/db")
+        dsn = "postgresql://bot:" + "secret" + "@localhost/db"
+        auth = "Authorization: Bearer " + "DBSECRET"
+        init_data = "initData=" + "DBINIT"
+        raise SQLAlchemyError(f"{dsn} {auth} {init_data}")
 
     @app.get("/boom")
     async def boom():
-        raise RuntimeError("secret traceback token")
+        marker = "diagnostic traceback marker"
+        auth = "Authorization: Bearer " + "SECRET"
+        init_data = "initData=" + "bad=secret"
+        dsn = "postgresql://bot:" + "secret" + "@localhost/db"
+        raise RuntimeError(f"{marker} {auth} {init_data} {dsn}")
 
     return app
 
@@ -112,15 +127,59 @@ def test_unhandled_exception_is_safe_and_logged(caplog):
         )
     body = assert_error_contract(response, "internal_error")
     assert response.status_code == 500
-    assert "secret traceback token" not in str(body)
+    assert "diagnostic traceback marker" not in str(body)
+    assert "Traceback (most recent call last)" not in str(body)
     assert body["request_id"] in caplog.text
-    assert "Authorization" not in caplog.text
+    assert "Traceback (most recent call last)" in caplog.text
+    assert "test_api_errors.py" in caplog.text
+    assert "boom" in caplog.text
+    assert "RuntimeError" in caplog.text
+    assert "NoneType: None" not in caplog.text
+    assert "diagnostic traceback marker" in caplog.text
+    assert "Authorization: Bearer SECRET" not in caplog.text
     assert "bad=secret" not in caplog.text
+    assert "postgresql://bot:secret@localhost/db" not in caplog.text
+    assert "Authorization: Bearer ***" in caplog.text
+    assert "postgresql://bot:***@localhost/db" in caplog.text
 
 
-def test_database_error_is_safe():
+def test_database_error_is_safe_and_logged(caplog):
     client = TestClient(build_app(), raise_server_exceptions=False)
-    response = client.get("/db")
+    with caplog.at_level(logging.ERROR, logger="app.api.errors"):
+        response = client.get("/db")
     body = assert_error_contract(response, "database_unavailable")
     assert response.status_code == 503
     assert "secret" not in str(body)
+    assert body["request_id"] in caplog.text
+    assert "Traceback (most recent call last)" in caplog.text
+    assert "test_api_errors.py" in caplog.text
+    assert "db" in caplog.text
+    assert "SQLAlchemyError" in caplog.text
+    assert "NoneType: None" not in caplog.text
+    assert "DBSECRET" not in caplog.text
+    assert "DBINIT" not in caplog.text
+    assert "postgresql://bot:secret@localhost/db" not in caplog.text
+
+
+def test_handled_5xx_errors_log_real_traceback(caplog):
+    client = TestClient(build_app(), raise_server_exceptions=False)
+    with caplog.at_level(logging.ERROR, logger="app.api.errors"):
+        api_response = client.get("/api-error-5xx")
+        http_response = client.get("/http-error-5xx")
+
+    api_body = assert_error_contract(api_response, "upstream_failed")
+    http_body = assert_error_contract(http_response, "http_error")
+    assert api_response.status_code == 503
+    assert http_response.status_code == 500
+    assert "Traceback (most recent call last)" not in str(api_body)
+    assert "Traceback (most recent call last)" not in str(http_body)
+    assert api_body["request_id"] in caplog.text
+    assert http_body["request_id"] in caplog.text
+    assert "Traceback (most recent call last)" in caplog.text
+    assert "api_error_5xx" in caplog.text
+    assert "http_error_5xx" in caplog.text
+    assert "ApiError" in caplog.text
+    assert "HTTPException" in caplog.text
+    assert "path=/api-error-5xx" in caplog.text
+    assert "path=/http-error-5xx" in caplog.text
+    assert "NoneType: None" not in caplog.text

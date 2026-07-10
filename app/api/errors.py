@@ -9,6 +9,8 @@ from fastapi.responses import JSONResponse
 from sqlalchemy.exc import SQLAlchemyError
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
+from app.logging_config import redact_text
+
 logger = logging.getLogger("app.api.errors")
 
 DEFAULT_MESSAGES = {
@@ -101,13 +103,19 @@ def error_response(
     )
 
 
+def sanitized_exc_info(exc: Exception) -> tuple[type[BaseException], BaseException, Any]:
+    safe_exc = RuntimeError(redact_text(exc)).with_traceback(exc.__traceback__)
+    return (RuntimeError, safe_exc, exc.__traceback__)
+
+
 def log_5xx(request: Request, exc: Exception) -> None:
-    logger.exception(
+    logger.error(
         "API request failed request_id=%s method=%s path=%s exc_type=%s",
         request_id(request),
         request.method,
         request.url.path,
         type(exc).__name__,
+        exc_info=sanitized_exc_info(exc),
     )
 
 
