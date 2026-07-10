@@ -1,4 +1,5 @@
 import logging
+import traceback
 import uuid
 from typing import Any
 
@@ -8,6 +9,8 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from sqlalchemy.exc import SQLAlchemyError
 from starlette.exceptions import HTTPException as StarletteHTTPException
+
+from app.logging_config import redact_text
 
 logger = logging.getLogger("app.api.errors")
 
@@ -101,13 +104,23 @@ def error_response(
     )
 
 
+def sanitized_traceback(exc: Exception) -> str:
+    traceback_exception = traceback.TracebackException.from_exception(
+        exc,
+        capture_locals=False,
+    )
+    rendered = "".join(traceback_exception.format(chain=True))
+    return redact_text(rendered)
+
+
 def log_5xx(request: Request, exc: Exception) -> None:
-    logger.exception(
-        "API request failed request_id=%s method=%s path=%s exc_type=%s",
+    logger.error(
+        "API request failed request_id=%s method=%s path=%s exc_type=%s\n%s",
         request_id(request),
         request.method,
         request.url.path,
         type(exc).__name__,
+        sanitized_traceback(exc),
     )
 
 
