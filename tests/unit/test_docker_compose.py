@@ -79,11 +79,15 @@ def test_dockerignore_excludes_env_and_temporary_uploads() -> None:
     assert "!.env.example" in DOCKERIGNORE
     assert "var/tmp_uploads" in DOCKERIGNORE
     assert "var/tmp_uploads/**" in DOCKERIGNORE
+    assert "!var/tmp_uploads/.gitkeep" not in DOCKERIGNORE
 
 
 def test_dockerfile_copies_explicit_paths_and_uses_non_root_user() -> None:
     assert "COPY . ." not in DOCKERFILE
     assert "COPY app ./app" in DOCKERFILE
     assert "COPY alembic ./alembic" in DOCKERFILE
+    assert "var/tmp_uploads/.gitkeep" not in DOCKERFILE
+    assert "mkdir -p /app/var/tmp_uploads" in DOCKERFILE
+    assert "chown -R app:app /app/var" in DOCKERFILE
     assert "USER app" in DOCKERFILE
     assert 'CMD ["python", "-m", "app.main"]' in DOCKERFILE
