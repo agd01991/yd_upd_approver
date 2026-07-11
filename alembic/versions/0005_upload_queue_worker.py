@@ -56,8 +56,6 @@ def upgrade() -> None:
                     FROM audit_log AS newer
                     WHERE newer.request_id = ur.id
                       AND newer.action IN (
-                          'upload_approve',
-                          'upload_retry',
                           'upload_overwrite',
                           'upload_copy',
                           'upload_copy_path'
@@ -85,7 +83,6 @@ def upgrade() -> None:
                     WHERE newer.request_id = ur.id
                       AND newer.action IN (
                           'upload_approve',
-                          'upload_retry',
                           'upload_overwrite',
                           'upload_copy',
                           'upload_copy_path'
