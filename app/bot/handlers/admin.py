@@ -34,6 +34,7 @@ from app.services.naming import (
 from app.services.upload_queue import (
     REJECTABLE_UPLOAD_STATUSES,
     UploadQueueError,
+    change_upload_folder,
     enqueue_upload_request,
     reject_upload_request,
 )
@@ -472,19 +473,13 @@ async def upload_callback(
         if folder not in (user.allowed_folders or []):
             await callback.answer("Недопустимая папка", show_alert=True)
             return
-        old = {"target_folder": request.target_folder, "target_path": request.target_path}
-        request.target_folder = folder
-        request.target_path = join_disk_path(folder, request.safe_filename)
-        await write_audit(
-            session,
-            actor_telegram_id=callback.from_user.id,
-            action="upload_folder_change",
-            request_id=request.id,
-            user_id=user.id,
-            old_value=old,
-            new_value={"target_folder": request.target_folder, "target_path": request.target_path},
-        )
-        await session.commit()
+        try:
+            request = await change_upload_folder(
+                session, request.id, folder, actor_telegram_id=callback.from_user.id
+            )
+        except UploadQueueError as exc:
+            await callback.answer(str(exc), show_alert=True)
+            return
         await callback.message.answer(
             format_upload_card(request, user), reply_markup=upload_keyboard(request)
         )

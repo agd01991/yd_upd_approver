@@ -47,13 +47,24 @@ class FakeCallback:
         self.answers.append((text, show_alert))
 
 
+class ScalarResult:
+    def __init__(self, value) -> None:  # noqa: ANN001
+        self.value = value
+
+    def scalar_one_or_none(self):  # noqa: ANN001
+        return self.value
+
+
 class FakeSession:
     def __init__(self, request, user) -> None:  # noqa: ANN001
         self.request = request
         self.user = user
         self.committed = False
 
-    async def get(self, model, ident):  # noqa: ANN001
+    async def execute(self, stmt):  # noqa: ANN001
+        return ScalarResult(self.request)
+
+    async def get(self, model, ident, **kwargs):  # noqa: ANN001
         if ident == self.request.id:
             return self.request
         return self.user
@@ -250,6 +261,7 @@ async def test_folder_selection_only_uses_allowed_folders() -> None:
         telegram_id=10,
         username="ivan",
         full_name="Ivan",
+        root_folder="disk:/root/u/",
         allowed_folders=["disk:/root/u/", "disk:/root/u/docs/"],
     )
     callback = FakeCallback(from_id=1)
