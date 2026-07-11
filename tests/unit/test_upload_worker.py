@@ -1,3 +1,4 @@
+import asyncio
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -108,8 +109,8 @@ async def test_process_job_copy_uses_persisted_target_path(monkeypatch, tmp_path
     async def fake_notify(*args, **kwargs) -> None:  # noqa: ANN002, ANN003
         return None
 
-    async def noop_heartbeat(*args, **kwargs) -> None:  # noqa: ANN002, ANN003
-        return None
+    async def noop_heartbeat(job, settings, stop) -> None:  # noqa: ANN001
+        await stop.wait()
 
     monkeypatch.setattr(upload_worker, "YandexDiskClient", FakeWorkerClient)
     monkeypatch.setattr(upload_worker, "finalize_success", fake_finalize)
@@ -162,8 +163,8 @@ async def test_process_job_redacts_upload_exception_from_logs(
     async def fake_notify(*args, **kwargs) -> None:  # noqa: ANN002, ANN003
         return None
 
-    async def noop_heartbeat(*args, **kwargs) -> None:  # noqa: ANN002, ANN003
-        return None
+    async def noop_heartbeat(job, settings, stop) -> None:  # noqa: ANN001
+        await stop.wait()
 
     monkeypatch.setattr(upload_worker, "YandexDiskClient", FailingSecretClient)
     monkeypatch.setattr(upload_worker, "finalize_failure", fake_finalize_failure)
@@ -301,3 +302,141 @@ async def test_success_admin_notification_has_no_retry_keyboard(monkeypatch, tmp
     bot = FakeNotifyBot()
     await upload_worker.notify_result(bot, make_job(tmp_path), UploadStatus.uploaded)
     assert bot.messages[0][2] is None
+
+
+@pytest.mark.anyio
+async def test_heartbeat_failure_cancels_upload_without_failure_finalize(
+    monkeypatch, tmp_path
+) -> None:  # noqa: ANN001
+    file_path = tmp_path / "a.txt"
+    file_path.write_text("hello")
+    upload_cancelled = asyncio.Event()
+    finalized_failure = False
+
+    async def blocking_upload(job, settings):  # noqa: ANN001
+        try:
+            await asyncio.sleep(60)
+        except asyncio.CancelledError:
+            upload_cancelled.set()
+            raise
+
+    async def failing_heartbeat(job, settings, stop):  # noqa: ANN001
+        await asyncio.sleep(0)
+        raise upload_worker.HeartbeatError("heartbeat failed")
+
+    async def fake_finalize_failure(job, message):  # noqa: ANN001
+        nonlocal finalized_failure
+        finalized_failure = True
+        return True
+
+    monkeypatch.setattr(upload_worker, "_upload_remote", blocking_upload)
+    monkeypatch.setattr(upload_worker, "heartbeat", failing_heartbeat)
+    monkeypatch.setattr(upload_worker, "finalize_failure", fake_finalize_failure)
+
+    await upload_worker.process_job(make_job(tmp_path), Settings(temp_storage_dir=tmp_path))
+
+    assert upload_cancelled.is_set()
+    assert not finalized_failure
+    assert file_path.exists()
+
+
+@pytest.mark.anyio
+async def test_lease_lost_cancels_upload_without_failure_finalize(monkeypatch, tmp_path) -> None:  # noqa: ANN001
+    upload_cancelled = asyncio.Event()
+    finalized_failure = False
+
+    async def blocking_upload(job, settings):  # noqa: ANN001
+        try:
+            await asyncio.sleep(60)
+        except asyncio.CancelledError:
+            upload_cancelled.set()
+            raise
+
+    async def lost_heartbeat(job, settings, stop):  # noqa: ANN001
+        raise upload_worker.LeaseLostError("lost")
+
+    async def fake_finalize_failure(job, message):  # noqa: ANN001
+        nonlocal finalized_failure
+        finalized_failure = True
+        return True
+
+    monkeypatch.setattr(upload_worker, "_upload_remote", blocking_upload)
+    monkeypatch.setattr(upload_worker, "heartbeat", lost_heartbeat)
+    monkeypatch.setattr(upload_worker, "finalize_failure", fake_finalize_failure)
+
+    await upload_worker.process_job(make_job(tmp_path), Settings(temp_storage_dir=tmp_path))
+
+    assert upload_cancelled.is_set()
+    assert not finalized_failure
+
+
+@pytest.mark.anyio
+async def test_remote_success_finalize_exception_does_not_mark_failed(
+    monkeypatch, tmp_path
+) -> None:  # noqa: ANN001
+    file_path = tmp_path / "a.txt"
+    file_path.write_text("hello")
+    failure_called = False
+    notified = False
+
+    async def successful_upload(job, settings):  # noqa: ANN001
+        return True
+
+    async def broken_finalize_success(job, target_path):  # noqa: ANN001
+        raise RuntimeError("db password=secret")
+
+    async def fake_finalize_failure(job, message):  # noqa: ANN001
+        nonlocal failure_called
+        failure_called = True
+        return True
+
+    async def fake_notify(*args, **kwargs):  # noqa: ANN001, ANN002, ANN003
+        nonlocal notified
+        notified = True
+
+    monkeypatch.setattr(upload_worker, "_run_upload_with_heartbeat", successful_upload)
+    monkeypatch.setattr(upload_worker, "finalize_success", broken_finalize_success)
+    monkeypatch.setattr(upload_worker, "finalize_failure", fake_finalize_failure)
+    monkeypatch.setattr(upload_worker, "notify_result", fake_notify)
+
+    await upload_worker.process_job(make_job(tmp_path), Settings(temp_storage_dir=tmp_path))
+
+    assert not failure_called
+    assert not notified
+    assert file_path.exists()
+
+
+@pytest.mark.anyio
+async def test_temp_delete_error_after_success_does_not_mark_failed(monkeypatch, tmp_path) -> None:  # noqa: ANN001
+    failure_called = False
+    notified = False
+
+    async def successful_upload(job, settings):  # noqa: ANN001
+        return True
+
+    async def successful_finalize(job, target_path):  # noqa: ANN001
+        return True
+
+    async def fake_finalize_failure(job, message):  # noqa: ANN001
+        nonlocal failure_called
+        failure_called = True
+        return True
+
+    async def fake_notify(*args, **kwargs):  # noqa: ANN001, ANN002, ANN003
+        nonlocal notified
+        notified = True
+
+    monkeypatch.setattr(upload_worker, "_run_upload_with_heartbeat", successful_upload)
+    monkeypatch.setattr(upload_worker, "finalize_success", successful_finalize)
+    monkeypatch.setattr(upload_worker, "finalize_failure", fake_finalize_failure)
+    monkeypatch.setattr(
+        upload_worker.TempStorage,
+        "delete",
+        lambda path: (_ for _ in ()).throw(RuntimeError("delete")),
+    )
+    monkeypatch.setattr(upload_worker, "notify_result", fake_notify)
+
+    await upload_worker.process_job(make_job(tmp_path), Settings(temp_storage_dir=tmp_path))
+
+    assert not failure_called
+    assert notified

@@ -29,6 +29,14 @@ logger = logging.getLogger(__name__)
 HEALTHCHECK_FILE = Path("/tmp/yd_upd_approver_worker_heartbeat")  # noqa: S108
 
 
+class LeaseLostError(RuntimeError):
+    """Raised when a worker can no longer prove upload job ownership."""
+
+
+class HeartbeatError(RuntimeError):
+    """Raised when the worker cannot safely extend the upload lease."""
+
+
 @dataclass(frozen=True)
 class UploadJob:
     id: int
@@ -149,29 +157,51 @@ async def claim_next_job(session: AsyncSession, settings: Settings) -> UploadJob
     )
 
 
+async def _extend_lease_once(job: UploadJob, settings: Settings) -> None:
+    async with SessionLocal() as session:
+        result = await session.execute(
+            update(UploadRequest)
+            .where(
+                UploadRequest.id == job.id,
+                UploadRequest.status == UploadStatus.uploading,
+                UploadRequest.worker_token == job.worker_token,
+            )
+            .values(
+                lease_expires_at=_now() + timedelta(seconds=settings.upload_worker_lease_seconds)
+            )
+        )
+        await session.commit()
+        if result.rowcount != 1:
+            raise LeaseLostError(f"Upload job {job.id} lease ownership lost")
+
+
 async def heartbeat(job: UploadJob, settings: Settings, stop: asyncio.Event) -> None:
+    timeout = max(
+        1.0,
+        min(
+            float(settings.upload_worker_heartbeat_seconds),
+            float(settings.upload_worker_lease_seconds - settings.upload_worker_heartbeat_seconds),
+        ),
+    )
     while not stop.is_set():
         with suppress(TimeoutError):
             await asyncio.wait_for(stop.wait(), timeout=settings.upload_worker_heartbeat_seconds)
         if stop.is_set():
             break
-        async with SessionLocal() as session:
-            result = await session.execute(
-                update(UploadRequest)
-                .where(
-                    UploadRequest.id == job.id,
-                    UploadRequest.status == UploadStatus.uploading,
-                    UploadRequest.worker_token == job.worker_token,
-                )
-                .values(
-                    lease_expires_at=_now()
-                    + timedelta(seconds=settings.upload_worker_lease_seconds)
-                )
+        try:
+            await asyncio.wait_for(_extend_lease_once(job, settings), timeout=timeout)
+        except LeaseLostError:
+            logger.warning("Lost ownership for upload job %s", job.id)
+            stop.set()
+            raise
+        except Exception as exc:
+            logger.warning(
+                "Heartbeat failed for upload job %s: category=%s",
+                job.id,
+                exc.__class__.__name__,
             )
-            await session.commit()
-            if result.rowcount != 1:
-                logger.warning("Lost ownership for upload job %s", job.id)
-                stop.set()
+            stop.set()
+            raise HeartbeatError(f"Upload job {job.id} heartbeat failed") from exc
 
 
 async def health_heartbeat(stop: asyncio.Event) -> None:
@@ -306,31 +336,92 @@ async def notify_result(
         )
 
 
-async def process_job(job: UploadJob, settings: Settings, bot: Bot | None = None) -> None:
-    stop = asyncio.Event()
-    hb = asyncio.create_task(heartbeat(job, settings, stop))
-    target = job.target_path
+async def _upload_remote(job: UploadJob, settings: Settings) -> bool:
+    path = Path(job.local_path)
+    if not path.is_file() or not _is_under_temp(job.local_path, settings):
+        raise FileNotFoundError(job.local_path)
+    client = YandexDiskClient(settings.yandex_disk_token)
     try:
-        path = Path(job.local_path)
-        if not path.is_file() or not _is_under_temp(job.local_path, settings):
-            raise FileNotFoundError(job.local_path)
-        client = YandexDiskClient(settings.yandex_disk_token)
-        try:
-            if await _remote_matches(client, target, job):
-                uploaded = True
+        if await _remote_matches(client, job.target_path, job):
+            return True
+        await client.mkdir_recursive(job.target_folder)
+        overwrite = job.upload_mode == UploadMode.overwrite
+        await client.upload_file(job.local_path, job.target_path, overwrite=overwrite)
+        return True
+    finally:
+        await client.close()
+
+
+async def _run_upload_with_heartbeat(job: UploadJob, settings: Settings) -> bool:
+    stop = asyncio.Event()
+    upload_task = asyncio.create_task(_upload_remote(job, settings))
+    heartbeat_task = asyncio.create_task(heartbeat(job, settings, stop))
+    try:
+        pending: set[asyncio.Task] = {upload_task, heartbeat_task}
+        while pending:
+            done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+            if upload_task in done:
+                try:
+                    return upload_task.result()
+                finally:
+                    stop.set()
+                    with suppress(Exception):
+                        await heartbeat_task
+            if heartbeat_task in done:
+                exc = heartbeat_task.exception()
+                if exc is not None:
+                    upload_task.cancel()
+                    with suppress(asyncio.CancelledError):
+                        await upload_task
+                    raise exc
+                if not stop.is_set() and not upload_task.done():
+                    logger.warning("Heartbeat stopped early for upload job %s", job.id)
+                    upload_task.cancel()
+                    with suppress(asyncio.CancelledError):
+                        await upload_task
+                    raise HeartbeatError(f"Upload job {job.id} heartbeat stopped early")
+                pending.discard(heartbeat_task)
+        return upload_task.result()
+    finally:
+        stop.set()
+        if not upload_task.done():
+            upload_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await upload_task
+        if not heartbeat_task.done():
+            with suppress(Exception):
+                await heartbeat_task
+
+
+async def process_job(job: UploadJob, settings: Settings, bot: Bot | None = None) -> None:
+    remote_confirmed = False
+    try:
+        remote_confirmed = await _run_upload_with_heartbeat(job, settings)
+        if remote_confirmed:
+            finalized = await finalize_success(job, job.target_path)
+            if finalized:
+                try:
+                    TempStorage.delete(job.local_path)
+                except Exception as exc:
+                    logger.warning(
+                        "Failed to delete temp file for uploaded job %s: category=%s",
+                        job.id,
+                        exc.__class__.__name__,
+                    )
+                await notify_result(bot, job, UploadStatus.uploaded)
             else:
-                await client.mkdir_recursive(job.target_folder)
-                overwrite = job.upload_mode == UploadMode.overwrite
-                await client.upload_file(job.local_path, target, overwrite=overwrite)
-                uploaded = True
-        finally:
-            await client.close()
-        if uploaded and await finalize_success(job, target):
-            TempStorage.delete(job.local_path)
-            await notify_result(bot, job, UploadStatus.uploaded)
+                logger.warning(
+                    "Success finalization deferred for upload job %s: ownership lost", job.id
+                )
     except asyncio.CancelledError:
         logger.info("Upload job %s cancelled; lease will expire", job.id)
         raise
+    except (LeaseLostError, HeartbeatError) as exc:
+        logger.warning(
+            "Upload job %s stopped before lease expiry: category=%s",
+            job.id,
+            exc.__class__.__name__,
+        )
     except Exception as exc:
         message = _safe_error(exc)
         logger.warning(
@@ -339,11 +430,13 @@ async def process_job(job: UploadJob, settings: Settings, bot: Bot | None = None
             exc.__class__.__name__,
             message,
         )
+        if remote_confirmed:
+            logger.warning(
+                "Success finalization deferred for upload job %s after remote success", job.id
+            )
+            return
         if await finalize_failure(job, message):
             await notify_result(bot, job, UploadStatus.failed, message)
-    finally:
-        stop.set()
-        await hb
 
 
 async def upload_approved_request(

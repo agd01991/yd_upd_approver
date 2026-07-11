@@ -36,6 +36,46 @@ def upgrade() -> None:
     op.add_column(
         "upload_requests", sa.Column("last_attempt_at", sa.DateTime(timezone=True), nullable=True)
     )
+    op.execute(
+        """
+        UPDATE upload_requests AS ur
+        SET upload_mode = 'copy'
+        WHERE ur.upload_mode IS NULL
+          AND ur.status = 'failed'
+          AND ur.target_path IS NOT NULL
+          AND ur.target_folder IS NOT NULL
+          AND ur.safe_filename IS NOT NULL
+          AND ur.target_path <> ur.target_folder || ur.safe_filename
+          AND EXISTS (
+              SELECT 1
+              FROM audit_log AS al
+              WHERE al.request_id = ur.id
+                AND al.action IN ('upload_copy', 'upload_copy_path')
+                AND NOT EXISTS (
+                    SELECT 1
+                    FROM audit_log AS newer
+                    WHERE newer.request_id = ur.id
+                      AND newer.action = 'upload_overwrite'
+                      AND newer.id > al.id
+                )
+          )
+        """
+    )
+    op.execute(
+        """
+        UPDATE upload_requests AS ur
+        SET upload_mode = 'overwrite'
+        WHERE ur.upload_mode IS NULL
+          AND ur.status = 'failed'
+          AND ur.target_path = ur.target_folder || ur.safe_filename
+          AND EXISTS (
+              SELECT 1
+              FROM audit_log AS al
+              WHERE al.request_id = ur.id
+                AND al.action = 'upload_overwrite'
+          )
+        """
+    )
     op.execute("UPDATE upload_requests SET upload_mode = 'normal' WHERE upload_mode IS NULL")
     op.execute("UPDATE upload_requests SET attempt_count = 0 WHERE attempt_count IS NULL")
     op.execute(
