@@ -212,3 +212,76 @@ def test_0005_legacy_upload_mode_regression_scenarios() -> None:
         )
         == "normal"
     )
+
+
+def _repair_migration_source() -> str:
+    return Path("alembic/versions/0006_repair_upload_mode_backfill.py").read_text()
+
+
+def test_0006_revision_repairs_upload_mode_after_0005() -> None:
+    migration = _repair_migration_source()
+
+    assert 'revision: str = "0006_repair_upload_mode_backfill"' in migration
+    assert 'down_revision: str | None = "0005_upload_queue_worker"' in migration
+    assert "WHERE ur.upload_mode IS NULL" not in migration
+    assert "IS DISTINCT FROM classified.repaired_upload_mode" in migration
+    assert "Data correction is intentionally irreversible" in migration
+
+
+def test_0006_limits_repair_to_unqueued_legacy_failed_rows() -> None:
+    sql = _constant_sql(_repair_migration_source(), "LEGACY_UPLOAD_MODE_REPAIR_SQL")
+
+    for predicate in (
+        "ur.status = 'failed'",
+        "ur.attempt_count = 0",
+        "ur.queued_at IS NULL",
+        "ur.last_attempt_at IS NULL",
+        "ur.worker_token IS NULL",
+        "ur.lease_expires_at IS NULL",
+    ):
+        assert predicate in sql
+
+
+def test_0006_repair_sql_preserves_final_legacy_classification_rules() -> None:
+    sql = _constant_sql(_repair_migration_source(), "LEGACY_UPLOAD_MODE_REPAIR_SQL")
+
+    assert "THEN 'copy'::uploadmode" in sql
+    assert "THEN 'overwrite'::uploadmode" in sql
+    assert "ELSE 'normal'::uploadmode" in sql
+    assert "al.action IN ('upload_copy', 'upload_copy_path')" in sql
+    assert "al.action = 'upload_overwrite'" in sql
+    assert "newer.request_id = ur.id" in sql
+    assert "newer.id > al.id" in sql
+    assert "'upload_retry'" not in sql.split("THEN 'copy'::uploadmode", maxsplit=1)[0]
+    assert "'upload_retry'" in sql.split("THEN 'copy'::uploadmode", maxsplit=1)[1]
+    assert "'upload_approve'" not in sql.split("THEN 'copy'::uploadmode", maxsplit=1)[0]
+    assert "'upload_approve'" in sql.split("THEN 'copy'::uploadmode", maxsplit=1)[1]
+
+
+def test_0006_legacy_filter_semantics() -> None:
+    def included(**overrides: object) -> bool:
+        row = {
+            "status": "failed",
+            "attempt_count": 0,
+            "queued_at": None,
+            "last_attempt_at": None,
+            "worker_token": None,
+            "lease_expires_at": None,
+        }
+        row.update(overrides)
+        return (
+            row["status"] == "failed"
+            and row["attempt_count"] == 0
+            and row["queued_at"] is None
+            and row["last_attempt_at"] is None
+            and row["worker_token"] is None
+            and row["lease_expires_at"] is None
+        )
+
+    assert included()
+    assert not included(attempt_count=1)
+    assert not included(queued_at="2026-07-11T00:00:00Z")
+    assert not included(last_attempt_at="2026-07-11T00:00:00Z")
+    assert not included(worker_token="token")
+    assert not included(lease_expires_at="2026-07-11T00:00:00Z")
+    assert not included(status="approved")
