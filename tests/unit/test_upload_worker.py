@@ -219,8 +219,8 @@ class FakeNotifyBot:
         self.fail_chats = set(fail_chats)
         self.messages = []
 
-    async def send_message(self, chat_id: int, text: str) -> None:
-        self.messages.append((chat_id, text))
+    async def send_message(self, chat_id: int, text: str, reply_markup=None) -> None:  # noqa: ANN001
+        self.messages.append((chat_id, text, reply_markup))
         if chat_id in self.fail_chats:
             raise RuntimeError("telegram https://upload.example.test/path?token=SUPER_SECRET")
 
@@ -249,7 +249,7 @@ async def test_notify_result_user_failure_does_not_block_admin(monkeypatch, tmp_
     )
     bot = FakeNotifyBot(fail_chats={2})
     await upload_worker.notify_result(bot, make_job(tmp_path), UploadStatus.uploaded)
-    assert [chat_id for chat_id, _ in bot.messages] == [3, 2]
+    assert [chat_id for chat_id, *_ in bot.messages] == [3, 2]
 
 
 @pytest.mark.anyio
@@ -259,8 +259,8 @@ async def test_notify_result_admin_failure_does_not_block_user(monkeypatch, tmp_
     )
     bot = FakeNotifyBot(fail_chats={3})
     await upload_worker.notify_result(bot, make_job(tmp_path), UploadStatus.failed, "safe failure")
-    assert [chat_id for chat_id, _ in bot.messages] == [3, 2]
-    assert all("SUPER_SECRET" not in text for _, text in bot.messages)
+    assert [chat_id for chat_id, *_ in bot.messages] == [3, 2]
+    assert all("SUPER_SECRET" not in text for _, text, _ in bot.messages)
 
 
 @pytest.mark.anyio
@@ -273,5 +273,31 @@ async def test_notify_result_all_failures_are_swallowed(monkeypatch, tmp_path, c
         await upload_worker.notify_result(
             bot, make_job(tmp_path), UploadStatus.failed, "safe failure"
         )
-    assert [chat_id for chat_id, _ in bot.messages] == [3, 2]
+    assert [chat_id for chat_id, *_ in bot.messages] == [3, 2]
     assert "SUPER_SECRET" not in caplog.text
+
+
+@pytest.mark.anyio
+async def test_failed_admin_notification_has_retry_keyboard(monkeypatch, tmp_path) -> None:  # noqa: ANN001
+    monkeypatch.setattr(
+        upload_worker, "SessionLocal", lambda: FakeNotifySession(SimpleNamespace(telegram_id=2))
+    )
+    bot = FakeNotifyBot()
+    await upload_worker.notify_result(bot, make_job(tmp_path), UploadStatus.failed, "safe failure")
+    admin_markup = bot.messages[0][2]
+    user_markup = bot.messages[1][2]
+    callbacks = [row[0].callback_data for row in admin_markup.inline_keyboard]
+    assert any(":retry:" in data or "action=retry" in data or "retry" in data for data in callbacks)
+    assert any("copy" in data for data in callbacks)
+    assert any("overwrite" in data for data in callbacks)
+    assert user_markup is None
+
+
+@pytest.mark.anyio
+async def test_success_admin_notification_has_no_retry_keyboard(monkeypatch, tmp_path) -> None:  # noqa: ANN001
+    monkeypatch.setattr(
+        upload_worker, "SessionLocal", lambda: FakeNotifySession(SimpleNamespace(telegram_id=2))
+    )
+    bot = FakeNotifyBot()
+    await upload_worker.notify_result(bot, make_job(tmp_path), UploadStatus.uploaded)
+    assert bot.messages[0][2] is None

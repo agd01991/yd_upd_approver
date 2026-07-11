@@ -24,16 +24,12 @@ from app.services.app_settings import (
 )
 from app.services.audit import write_audit
 from app.services.disk_paths import DiskPathValidationError, validate_yandex_disk_root
-from app.services.naming import (
-    FilenameEditError,
-    change_filename_extension,
-    change_filename_stem,
-    join_disk_path,
-    user_folder_for_user,
-)
+from app.services.naming import user_folder_for_user
 from app.services.upload_queue import (
     REJECTABLE_UPLOAD_STATUSES,
     UploadQueueError,
+    change_upload_filename_extension,
+    change_upload_filename_stem,
     change_upload_folder,
     enqueue_upload_request,
     reject_upload_request,
@@ -494,43 +490,17 @@ async def rename_upload(
         await state.clear()
         return
     data = await state.get_data()
-    request = await session.get(UploadRequest, data.get("request_id"))
-    if not request:
-        await message.answer("Заявка не найдена")
-        await state.clear()
-        return
-    if request.status in {
-        UploadStatus.approved,
-        UploadStatus.uploading,
-        UploadStatus.uploaded,
-        UploadStatus.rejected,
-    }:
-        await message.answer("Эту заявку уже нельзя переименовать")
-        await state.clear()
-        return
-    user = await session.get(User, request.user_id)
-    if not user:
-        await message.answer("Пользователь заявки не найден")
-        await state.clear()
-        return
-    old = {"safe_filename": request.safe_filename, "target_path": request.target_path}
+    request_id = data.get("request_id")
     try:
-        safe = change_filename_stem(request.safe_filename, message.text or "")
-    except FilenameEditError as exc:
+        request = await change_upload_filename_stem(
+            session, request_id, message.text or "", message.from_user.id
+        )
+    except UploadQueueError as exc:
         await message.answer(f"Не удалось изменить имя файла: {exc}")
+        if exc.code != "invalid_filename":
+            await state.clear()
         return
-    request.safe_filename = safe
-    request.target_path = join_disk_path(request.target_folder, safe)
-    await write_audit(
-        session,
-        actor_telegram_id=message.from_user.id,
-        action="upload_filename_stem_change",
-        request_id=request.id,
-        user_id=request.user_id,
-        old_value=old,
-        new_value={"safe_filename": request.safe_filename, "target_path": request.target_path},
-    )
-    await session.commit()
+    user = await session.get(User, request.user_id, populate_existing=True)
     await state.clear()
     await message.answer(format_upload_card(request, user), reply_markup=upload_keyboard(request))
 
@@ -572,42 +542,16 @@ async def rename_extension_upload(
         await state.clear()
         return
     data = await state.get_data()
-    request = await session.get(UploadRequest, data.get("request_id"))
-    if not request:
-        await message.answer("Заявка не найдена")
-        await state.clear()
-        return
-    if request.status in {
-        UploadStatus.approved,
-        UploadStatus.uploading,
-        UploadStatus.uploaded,
-        UploadStatus.rejected,
-    }:
-        await message.answer("Эту заявку уже нельзя переименовать")
-        await state.clear()
-        return
-    user = await session.get(User, request.user_id)
-    if not user:
-        await message.answer("Пользователь заявки не найден")
-        await state.clear()
-        return
-    old = {"safe_filename": request.safe_filename, "target_path": request.target_path}
+    request_id = data.get("request_id")
     try:
-        safe = change_filename_extension(request.safe_filename, message.text or "")
-    except FilenameEditError as exc:
+        request = await change_upload_filename_extension(
+            session, request_id, message.text or "", message.from_user.id
+        )
+    except UploadQueueError as exc:
         await message.answer(f"Не удалось изменить расширение файла: {exc}")
+        if exc.code != "invalid_filename":
+            await state.clear()
         return
-    request.safe_filename = safe
-    request.target_path = join_disk_path(request.target_folder, safe)
-    await write_audit(
-        session,
-        actor_telegram_id=message.from_user.id,
-        action="upload_filename_extension_change",
-        request_id=request.id,
-        user_id=request.user_id,
-        old_value=old,
-        new_value={"safe_filename": request.safe_filename, "target_path": request.target_path},
-    )
-    await session.commit()
+    user = await session.get(User, request.user_id, populate_existing=True)
     await state.clear()
     await message.answer(format_upload_card(request, user), reply_markup=upload_keyboard(request))

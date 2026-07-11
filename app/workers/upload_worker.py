@@ -11,6 +11,7 @@ from aiogram import Bot
 from sqlalchemy import or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.bot.keyboards import upload_keyboard
 from app.config import Settings, get_settings
 from app.db.models import UploadMode, UploadRequest, UploadStatus, User
 from app.db.session import SessionLocal
@@ -269,7 +270,12 @@ async def notify_result(
         user_text = f"Загрузка файла {job.request_code} не удалась. {safe_message}".strip()
 
     try:
-        await bot.send_message(job.admin_id, admin_text)
+        reply_markup = (
+            upload_keyboard(job.id, status=UploadStatus.failed)
+            if status == UploadStatus.failed
+            else None
+        )
+        await bot.send_message(job.admin_id, admin_text, reply_markup=reply_markup)
     except Exception as exc:
         logger.warning(
             "Failed to send upload notification to admin for job %s: %s",
