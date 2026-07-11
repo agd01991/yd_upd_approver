@@ -24,8 +24,11 @@ def user_moderation_keyboard(user_id: int) -> InlineKeyboardMarkup:
     )
 
 
-def upload_keyboard(request_id: int | object) -> InlineKeyboardMarkup:
-    status = getattr(request_id, "status", None)
+def upload_keyboard(
+    request_id: int | object, status: str | object | None = None
+) -> InlineKeyboardMarkup:
+    if status is None:
+        status = getattr(request_id, "status", None)
     real_id = getattr(request_id, "id", request_id)
     actions = [
         ("Открыть файл", "open"),

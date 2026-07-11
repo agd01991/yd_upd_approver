@@ -4,8 +4,14 @@ import pytest
 
 from app.bot.handlers import admin
 from app.config import Settings
-from app.db.models import UploadStatus
-from app.services.upload_queue import UploadQueueError, change_upload_folder
+from app.db.models import UploadMode, UploadStatus
+from app.services.upload_queue import (
+    UploadQueueError,
+    change_upload_filename_extension,
+    change_upload_filename_stem,
+    change_upload_folder,
+    enqueue_upload_request,
+)
 
 
 class ScalarResult:
@@ -59,6 +65,14 @@ def make_request(status: UploadStatus) -> SimpleNamespace:
         mime_type="text/plain",
         sha256="a" * 64,
         caption=None,
+        local_path="file.txt",
+        upload_mode=UploadMode.normal,
+        approved_at=None,
+        approved_by=None,
+        error_message=None,
+        worker_token=None,
+        lease_expires_at=None,
+        queued_at=None,
     )
 
 
@@ -164,3 +178,74 @@ async def test_old_folder_callback_for_approved_request_does_not_change_or_audit
     assert request.target_folder == "disk:/root/u/"
     assert session.added == []
     assert callback.answers[-1][1] is True
+
+
+@pytest.mark.anyio
+async def test_change_filename_stem_allowed_state_updates_name_and_path() -> None:
+    request = make_request(UploadStatus.pending_approval)
+    session = FakeLockedSession(request, make_user())
+
+    await change_upload_filename_stem(session, request.id, "новое", 1)
+
+    assert request.safe_filename == "новое.txt"
+    assert request.target_path == "disk:/root/u/новое.txt"
+    assert session.added
+    assert session.committed
+
+
+@pytest.mark.anyio
+async def test_change_filename_extension_allowed_state_updates_name_and_path() -> None:
+    request = make_request(UploadStatus.failed)
+    session = FakeLockedSession(request, make_user())
+
+    await change_upload_filename_extension(session, request.id, "pdf", 1)
+
+    assert request.safe_filename == "file.pdf"
+    assert request.target_path == "disk:/root/u/file.pdf"
+    assert session.added
+    assert session.committed
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("status", [UploadStatus.approved, UploadStatus.uploading])
+async def test_change_filename_stem_rejects_non_editable_without_audit(
+    status: UploadStatus,
+) -> None:
+    request = make_request(status)
+    session = FakeLockedSession(request, make_user())
+
+    with pytest.raises(UploadQueueError):
+        await change_upload_filename_stem(session, request.id, "new", 1)
+
+    assert request.safe_filename == "file.txt"
+    assert request.target_path == "disk:/root/u/file.txt"
+    assert session.added == []
+    assert not session.committed
+
+
+@pytest.mark.anyio
+async def test_failed_copy_retry_keeps_persisted_copy_path(monkeypatch) -> None:  # noqa: ANN001
+    request = make_request(UploadStatus.failed)
+    request.upload_mode = UploadMode.copy
+    request.target_path = "disk:/root/u/file REQ-copy.txt"
+    session = FakeLockedSession(request, make_user())
+    monkeypatch.setattr("pathlib.Path.is_file", lambda self: True)
+
+    await enqueue_upload_request(session, request.id, "retry", 1)
+
+    assert request.upload_mode == UploadMode.copy
+    assert request.target_path == "disk:/root/u/file REQ-copy.txt"
+
+
+@pytest.mark.anyio
+async def test_failed_copy_overwrite_resets_to_canonical_path(monkeypatch) -> None:  # noqa: ANN001
+    request = make_request(UploadStatus.failed)
+    request.upload_mode = UploadMode.copy
+    request.target_path = "disk:/root/u/file REQ-copy.txt"
+    session = FakeLockedSession(request, make_user())
+    monkeypatch.setattr("pathlib.Path.is_file", lambda self: True)
+
+    await enqueue_upload_request(session, request.id, "overwrite", 1)
+
+    assert request.upload_mode == UploadMode.overwrite
+    assert request.target_path == "disk:/root/u/file.txt"
