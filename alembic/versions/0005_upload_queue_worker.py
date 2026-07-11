@@ -18,6 +18,63 @@ branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
 
+COPY_UPLOAD_MODE_BACKFILL_SQL = """
+UPDATE upload_requests AS ur
+SET upload_mode = 'copy'
+WHERE ur.upload_mode IS NULL
+  AND ur.status = 'failed'
+  AND ur.target_path IS NOT NULL
+  AND ur.target_folder IS NOT NULL
+  AND ur.safe_filename IS NOT NULL
+  AND ur.target_path <> ur.target_folder || ur.safe_filename
+  AND EXISTS (
+      SELECT 1
+      FROM audit_log AS al
+      WHERE al.request_id = ur.id
+        AND al.action IN ('upload_copy', 'upload_copy_path')
+        AND NOT EXISTS (
+            SELECT 1
+            FROM audit_log AS newer
+            WHERE newer.request_id = ur.id
+              AND newer.action IN (
+                  'upload_overwrite',
+                  'upload_copy',
+                  'upload_copy_path'
+              )
+              AND newer.id > al.id
+        )
+  )
+"""
+
+
+OVERWRITE_UPLOAD_MODE_BACKFILL_SQL = """
+UPDATE upload_requests AS ur
+SET upload_mode = 'overwrite'
+WHERE ur.upload_mode IS NULL
+  AND ur.status = 'failed'
+  AND ur.target_path = ur.target_folder || ur.safe_filename
+  AND EXISTS (
+      SELECT 1
+      FROM audit_log AS al
+      WHERE al.request_id = ur.id
+        AND al.action = 'upload_overwrite'
+        AND NOT EXISTS (
+            SELECT 1
+            FROM audit_log AS newer
+            WHERE newer.request_id = ur.id
+              AND newer.action IN (
+                  'upload_approve',
+                  'upload_retry',
+                  'upload_overwrite',
+                  'upload_copy',
+                  'upload_copy_path'
+              )
+              AND newer.id > al.id
+        )
+  )
+"""
+
+
 def upgrade() -> None:
     bind = op.get_bind()
     upload_mode = postgresql.ENUM(
@@ -36,62 +93,10 @@ def upgrade() -> None:
     op.add_column(
         "upload_requests", sa.Column("last_attempt_at", sa.DateTime(timezone=True), nullable=True)
     )
-    op.execute(
-        """
-        UPDATE upload_requests AS ur
-        SET upload_mode = 'copy'
-        WHERE ur.upload_mode IS NULL
-          AND ur.status = 'failed'
-          AND ur.target_path IS NOT NULL
-          AND ur.target_folder IS NOT NULL
-          AND ur.safe_filename IS NOT NULL
-          AND ur.target_path <> ur.target_folder || ur.safe_filename
-          AND EXISTS (
-              SELECT 1
-              FROM audit_log AS al
-              WHERE al.request_id = ur.id
-                AND al.action IN ('upload_copy', 'upload_copy_path')
-                AND NOT EXISTS (
-                    SELECT 1
-                    FROM audit_log AS newer
-                    WHERE newer.request_id = ur.id
-                      AND newer.action IN (
-                          'upload_overwrite',
-                          'upload_copy',
-                          'upload_copy_path'
-                      )
-                      AND newer.id > al.id
-                )
-          )
-        """
-    )
-    op.execute(
-        """
-        UPDATE upload_requests AS ur
-        SET upload_mode = 'overwrite'
-        WHERE ur.upload_mode IS NULL
-          AND ur.status = 'failed'
-          AND ur.target_path = ur.target_folder || ur.safe_filename
-          AND EXISTS (
-              SELECT 1
-              FROM audit_log AS al
-              WHERE al.request_id = ur.id
-                AND al.action = 'upload_overwrite'
-                AND NOT EXISTS (
-                    SELECT 1
-                    FROM audit_log AS newer
-                    WHERE newer.request_id = ur.id
-                      AND newer.action IN (
-                          'upload_approve',
-                          'upload_overwrite',
-                          'upload_copy',
-                          'upload_copy_path'
-                      )
-                      AND newer.id > al.id
-                )
-          )
-        """
-    )
+    # Legacy retry reused target_path but called upload with overwrite=False.
+    # Therefore it preserves copy-path behavior but supersedes overwrite behavior.
+    op.execute(COPY_UPLOAD_MODE_BACKFILL_SQL)
+    op.execute(OVERWRITE_UPLOAD_MODE_BACKFILL_SQL)
     op.execute("UPDATE upload_requests SET upload_mode = 'normal' WHERE upload_mode IS NULL")
     op.execute("UPDATE upload_requests SET attempt_count = 0 WHERE attempt_count IS NULL")
     op.execute(
