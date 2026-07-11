@@ -469,10 +469,13 @@ async def patch_upload(
     session: AsyncSession = Depends(get_db),
 ) -> dict:
     result = await session.execute(
-        select(UploadRequest).where(UploadRequest.id == request_id).with_for_update()
+        select(UploadRequest)
+        .where(UploadRequest.id == request_id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
     )
     r = result.scalar_one_or_none()
-    user = await session.get(User, r.user_id) if r else None
+    user = await session.get(User, r.user_id, populate_existing=True) if r else None
     if not r or not user:
         raise ApiError(404, "request_not_found", "Заявка не найдена.")
     if r.status not in EDITABLE_UPLOAD_STATUSES:

@@ -64,7 +64,7 @@ class FakeSession:
     async def execute(self, stmt):  # noqa: ANN001
         return ScalarResult(self.request)
 
-    async def get(self, model, ident):  # noqa: ANN001
+    async def get(self, model, ident, **kwargs):  # noqa: ANN001
         if ident == self.request.id:
             return self.request
         return self.user

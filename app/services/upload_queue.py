@@ -156,13 +156,16 @@ async def change_upload_folder(
     actor_telegram_id: int,
 ) -> UploadRequest:
     result = await session.execute(
-        select(UploadRequest).where(UploadRequest.id == request_id).with_for_update()
+        select(UploadRequest)
+        .where(UploadRequest.id == request_id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
     )
     request = result.scalar_one_or_none()
     if request is None:
         raise UploadQueueError("Заявка не найдена.", "request_not_found")
 
-    user = await session.get(User, request.user_id)
+    user = await session.get(User, request.user_id, populate_existing=True)
     if user is None:
         raise UploadQueueError("Пользователь заявки не найден.", "request_not_found")
 
