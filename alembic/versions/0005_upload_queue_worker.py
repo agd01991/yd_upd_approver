@@ -55,7 +55,13 @@ def upgrade() -> None:
                     SELECT 1
                     FROM audit_log AS newer
                     WHERE newer.request_id = ur.id
-                      AND newer.action = 'upload_overwrite'
+                      AND newer.action IN (
+                          'upload_approve',
+                          'upload_retry',
+                          'upload_overwrite',
+                          'upload_copy',
+                          'upload_copy_path'
+                      )
                       AND newer.id > al.id
                 )
           )
@@ -73,6 +79,19 @@ def upgrade() -> None:
               FROM audit_log AS al
               WHERE al.request_id = ur.id
                 AND al.action = 'upload_overwrite'
+                AND NOT EXISTS (
+                    SELECT 1
+                    FROM audit_log AS newer
+                    WHERE newer.request_id = ur.id
+                      AND newer.action IN (
+                          'upload_approve',
+                          'upload_retry',
+                          'upload_overwrite',
+                          'upload_copy',
+                          'upload_copy_path'
+                      )
+                      AND newer.id > al.id
+                )
           )
         """
     )
