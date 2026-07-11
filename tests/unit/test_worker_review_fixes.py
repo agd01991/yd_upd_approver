@@ -23,12 +23,16 @@ class FakeLockedSession:
         self.committed = False
         self.added = []
         self.executed = False
+        self.last_stmt = None
+        self.last_get_kwargs = {}
 
     async def execute(self, stmt):  # noqa: ANN001
         self.executed = True
+        self.last_stmt = stmt
         return ScalarResult(self.request)
 
-    async def get(self, model, ident):  # noqa: ANN001
+    async def get(self, model, ident, **kwargs):  # noqa: ANN001
+        self.last_get_kwargs = kwargs
         if getattr(model, "__name__", "") == "UploadRequest":
             return self.request if ident == self.request.id else None
         if getattr(model, "__name__", "") == "User":
@@ -114,6 +118,18 @@ async def test_change_upload_folder_rejects_folder_removed_from_allowed_folders(
     assert exc.value.code == "folder_not_allowed"
     assert request.target_folder == "disk:/root/u/"
     assert session.added == []
+
+
+@pytest.mark.anyio
+async def test_change_upload_folder_locking_select_populates_existing() -> None:
+    request = make_request(UploadStatus.pending_approval)
+    session = FakeLockedSession(request, make_user())
+
+    await change_upload_folder(session, request.id, "disk:/root/u/docs/", 1)
+
+    assert session.last_stmt is not None
+    assert session.last_stmt.get_execution_options().get("populate_existing") is True
+    assert session.last_get_kwargs == {"populate_existing": True}
 
 
 class FakeCallback:

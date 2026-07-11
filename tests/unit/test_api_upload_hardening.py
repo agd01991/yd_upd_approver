@@ -31,7 +31,7 @@ class FakeSession:
     async def execute(self, stmt):  # noqa: ANN001
         return ScalarResult(self.upload)
 
-    async def get(self, model, ident):
+    async def get(self, model, ident, **kwargs):
         if model.__name__ == "UploadRequest" and ident == self.upload.id:
             return self.upload
         if model.__name__ == "User" and ident == self.user.id:
