@@ -13,12 +13,23 @@ from app.api.security import TelegramWebAppUser
 from app.db.models import UploadStatus, UserStatus
 
 
+class ScalarResult:
+    def __init__(self, value) -> None:
+        self.value = value
+
+    def scalar_one_or_none(self):
+        return self.value
+
+
 class FakeSession:
     def __init__(self, upload, user) -> None:
         self.upload = upload
         self.user = user
         self.added = []
         self.committed = False
+
+    async def execute(self, stmt):  # noqa: ANN001
+        return ScalarResult(self.upload)
 
     async def get(self, model, ident):
         if model.__name__ == "UploadRequest" and ident == self.upload.id:

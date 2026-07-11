@@ -140,3 +140,138 @@ async def test_process_job_copy_uses_persisted_target_path(monkeypatch, tmp_path
     assert client.info_paths == [persisted_target]
     assert client.uploads == [(str(file_path), persisted_target, False)]
     assert finalized["target_path"] == persisted_target
+
+
+class FailingSecretClient(FakeWorkerClient):
+    async def upload_file(self, local_path: str, target_path: str, overwrite: bool = False) -> None:
+        raise RuntimeError("boom https://upload.example.test/path?token=SUPER_SECRET raw-secret")
+
+
+@pytest.mark.anyio
+async def test_process_job_redacts_upload_exception_from_logs(
+    monkeypatch, tmp_path, caplog
+) -> None:  # noqa: ANN001
+    file_path = tmp_path / "a.txt"
+    file_path.write_text("hello")
+    finalized = {}
+
+    async def fake_finalize_failure(job: UploadJob, message: str) -> bool:
+        finalized["message"] = message
+        return True
+
+    async def fake_notify(*args, **kwargs) -> None:  # noqa: ANN002, ANN003
+        return None
+
+    async def noop_heartbeat(*args, **kwargs) -> None:  # noqa: ANN002, ANN003
+        return None
+
+    monkeypatch.setattr(upload_worker, "YandexDiskClient", FailingSecretClient)
+    monkeypatch.setattr(upload_worker, "finalize_failure", fake_finalize_failure)
+    monkeypatch.setattr(upload_worker, "notify_result", fake_notify)
+    monkeypatch.setattr(upload_worker, "heartbeat", noop_heartbeat)
+    job = UploadJob(
+        1,
+        "REQ-000001",
+        2,
+        3,
+        str(file_path),
+        "disk:/root/u/",
+        "disk:/root/u/a.txt",
+        "a.txt",
+        5,
+        "abc",
+        UploadMode.normal,
+        "token",
+    )
+
+    with caplog.at_level("WARNING", logger="app.workers.upload_worker"):
+        await upload_worker.process_job(
+            job, Settings(yandex_disk_token="token", temp_storage_dir=tmp_path)
+        )
+
+    log_text = caplog.text
+    assert finalized["message"] == "Не удалось загрузить файл. Повторите попытку позже."
+    assert "RuntimeError" in log_text
+    assert "SUPER_SECRET" not in log_text
+    assert "https://upload.example.test/path?token=SUPER_SECRET" not in log_text
+    assert "raw-secret" not in log_text
+
+
+class FakeNotifySession:
+    def __init__(self, user=None, fail_get: bool = False) -> None:  # noqa: ANN001
+        self.user = user
+        self.fail_get = fail_get
+
+    async def __aenter__(self):  # noqa: ANN001
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb) -> None:  # noqa: ANN001
+        return None
+
+    async def get(self, model, ident):  # noqa: ANN001
+        if self.fail_get:
+            raise RuntimeError("db https://upload.example.test/path?token=SUPER_SECRET")
+        return self.user
+
+
+class FakeNotifyBot:
+    def __init__(self, fail_chats=()) -> None:  # noqa: ANN001
+        self.fail_chats = set(fail_chats)
+        self.messages = []
+
+    async def send_message(self, chat_id: int, text: str) -> None:
+        self.messages.append((chat_id, text))
+        if chat_id in self.fail_chats:
+            raise RuntimeError("telegram https://upload.example.test/path?token=SUPER_SECRET")
+
+
+def make_job(tmp_path):  # noqa: ANN001
+    return UploadJob(
+        1,
+        "REQ-000001",
+        2,
+        3,
+        str(tmp_path / "a.txt"),
+        "disk:/root/u/",
+        "disk:/root/u/a.txt",
+        "a.txt",
+        5,
+        "abc",
+        UploadMode.normal,
+        "token",
+    )
+
+
+@pytest.mark.anyio
+async def test_notify_result_user_failure_does_not_block_admin(monkeypatch, tmp_path) -> None:  # noqa: ANN001
+    monkeypatch.setattr(
+        upload_worker, "SessionLocal", lambda: FakeNotifySession(SimpleNamespace(telegram_id=2))
+    )
+    bot = FakeNotifyBot(fail_chats={2})
+    await upload_worker.notify_result(bot, make_job(tmp_path), UploadStatus.uploaded)
+    assert [chat_id for chat_id, _ in bot.messages] == [3, 2]
+
+
+@pytest.mark.anyio
+async def test_notify_result_admin_failure_does_not_block_user(monkeypatch, tmp_path) -> None:  # noqa: ANN001
+    monkeypatch.setattr(
+        upload_worker, "SessionLocal", lambda: FakeNotifySession(SimpleNamespace(telegram_id=2))
+    )
+    bot = FakeNotifyBot(fail_chats={3})
+    await upload_worker.notify_result(bot, make_job(tmp_path), UploadStatus.failed, "safe failure")
+    assert [chat_id for chat_id, _ in bot.messages] == [3, 2]
+    assert all("SUPER_SECRET" not in text for _, text in bot.messages)
+
+
+@pytest.mark.anyio
+async def test_notify_result_all_failures_are_swallowed(monkeypatch, tmp_path, caplog) -> None:  # noqa: ANN001
+    monkeypatch.setattr(
+        upload_worker, "SessionLocal", lambda: FakeNotifySession(SimpleNamespace(telegram_id=2))
+    )
+    bot = FakeNotifyBot(fail_chats={2, 3})
+    with caplog.at_level("WARNING", logger="app.workers.upload_worker"):
+        await upload_worker.notify_result(
+            bot, make_job(tmp_path), UploadStatus.failed, "safe failure"
+        )
+    assert [chat_id for chat_id, _ in bot.messages] == [3, 2]
+    assert "SUPER_SECRET" not in caplog.text

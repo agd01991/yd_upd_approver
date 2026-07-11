@@ -41,6 +41,7 @@ from app.services.naming import (
     user_folder_for_user,
 )
 from app.services.upload_queue import (
+    EDITABLE_UPLOAD_STATUSES,
     UploadQueueError,
     enqueue_upload_request,
     reject_upload_request,
@@ -467,16 +468,14 @@ async def patch_upload(
     actor: TelegramWebAppUser = Depends(admin_user_dep),
     session: AsyncSession = Depends(get_db),
 ) -> dict:
-    r = await session.get(UploadRequest, request_id)
+    result = await session.execute(
+        select(UploadRequest).where(UploadRequest.id == request_id).with_for_update()
+    )
+    r = result.scalar_one_or_none()
     user = await session.get(User, r.user_id) if r else None
     if not r or not user:
         raise ApiError(404, "request_not_found", "Заявка не найдена.")
-    if r.status in {
-        UploadStatus.approved,
-        UploadStatus.uploading,
-        UploadStatus.uploaded,
-        UploadStatus.rejected,
-    }:
+    if r.status not in EDITABLE_UPLOAD_STATUSES:
         raise ApiError(400, "invalid_request_state", "Заявку нельзя изменить в текущем состоянии.")
     old = {
         "safe_filename": r.safe_filename,

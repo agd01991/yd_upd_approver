@@ -258,21 +258,46 @@ async def notify_result(
 ) -> None:
     if bot is None:
         return
+    safe_message = message or ""
+    admin_text = (
+        f"Итог загрузки {job.request_code}: "
+        f"{status.value}{': ' + safe_message if safe_message else ''}"
+    )
+    if status == UploadStatus.uploaded:
+        user_text = f"Ваш файл загружен: {job.request_code}"
+    else:
+        user_text = f"Загрузка файла {job.request_code} не удалась. {safe_message}".strip()
+
+    try:
+        await bot.send_message(job.admin_id, admin_text)
+    except Exception as exc:
+        logger.warning(
+            "Failed to send upload notification to admin for job %s: %s",
+            job.id,
+            _safe_error(exc),
+        )
+
+    user = None
     try:
         async with SessionLocal() as session:
             user = await session.get(User, job.user_id)
-        if status == UploadStatus.uploaded:
-            text = f"Ваш файл загружен: {job.request_code}"
-        else:
-            text = f"Загрузка файла {job.request_code} не удалась. {message or ''}".strip()
-        if user:
-            await bot.send_message(user.telegram_id, text)
-        await bot.send_message(
-            job.admin_id,
-            f"Итог загрузки {job.request_code}: {status.value}{': ' + message if message else ''}",
+    except Exception as exc:
+        logger.warning(
+            "Failed to load upload notification recipient for job %s: %s",
+            job.id,
+            _safe_error(exc),
         )
-    except Exception:
-        logger.exception("Failed to send upload notification for job %s", job.id)
+
+    if user is None:
+        return
+    try:
+        await bot.send_message(user.telegram_id, user_text)
+    except Exception as exc:
+        logger.warning(
+            "Failed to send upload notification to user for job %s: %s",
+            job.id,
+            _safe_error(exc),
+        )
 
 
 async def process_job(job: UploadJob, settings: Settings, bot: Bot | None = None) -> None:
@@ -301,8 +326,13 @@ async def process_job(job: UploadJob, settings: Settings, bot: Bot | None = None
         logger.info("Upload job %s cancelled; lease will expire", job.id)
         raise
     except Exception as exc:
-        logger.exception("Upload job %s failed safely", job.id)
         message = _safe_error(exc)
+        logger.warning(
+            "Upload job %s failed safely: category=%s message=%s",
+            job.id,
+            exc.__class__.__name__,
+            message,
+        )
         if await finalize_failure(job, message):
             await notify_result(bot, job, UploadStatus.failed, message)
     finally:

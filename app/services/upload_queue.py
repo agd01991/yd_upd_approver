@@ -6,6 +6,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.models import UploadMode, UploadRequest, UploadStatus, User
 from app.services.audit import write_audit
+from app.services.file_policy import folder_allowed
 from app.services.naming import copy_filename, join_disk_path
 
 
@@ -22,6 +23,7 @@ ACTION_TO_MODE = {
 }
 
 REJECTABLE_UPLOAD_STATUSES = {UploadStatus.pending_approval, UploadStatus.failed}
+EDITABLE_UPLOAD_STATUSES = {UploadStatus.pending_approval, UploadStatus.failed}
 REJECT_INVALID_STATE_MESSAGE = (
     "Заявка уже поставлена в очередь или загружается и не может быть отклонена."
 )
@@ -142,6 +144,44 @@ async def reject_upload_request(
         user_id=request.user_id,
         old_value={"status": old_status},
         new_value={"status": request.status.value, "reason": safe_reason},
+    )
+    await session.commit()
+    return request
+
+
+async def change_upload_folder(
+    session: AsyncSession,
+    request_id: int,
+    folder: str,
+    actor_telegram_id: int,
+) -> UploadRequest:
+    result = await session.execute(
+        select(UploadRequest).where(UploadRequest.id == request_id).with_for_update()
+    )
+    request = result.scalar_one_or_none()
+    if request is None:
+        raise UploadQueueError("Заявка не найдена.", "request_not_found")
+
+    user = await session.get(User, request.user_id)
+    if user is None:
+        raise UploadQueueError("Пользователь заявки не найден.", "request_not_found")
+
+    if request.status not in EDITABLE_UPLOAD_STATUSES:
+        raise UploadQueueError("Заявку нельзя изменить в текущем состоянии.")
+    if not folder_allowed(user, folder):
+        raise UploadQueueError("Папка недоступна пользователю.", "folder_not_allowed")
+
+    old = {"target_folder": request.target_folder, "target_path": request.target_path}
+    request.target_folder = folder
+    request.target_path = join_disk_path(folder, request.safe_filename)
+    await write_audit(
+        session,
+        actor_telegram_id=actor_telegram_id,
+        action="upload_folder_change",
+        request_id=request.id,
+        user_id=user.id,
+        old_value=old,
+        new_value={"target_folder": request.target_folder, "target_path": request.target_path},
     )
     await session.commit()
     return request
