@@ -266,7 +266,7 @@ function adminUploadActions(r) {
   const approve = canSubmit && r.status === "pending_approval" ? `<button onclick="uploadAction(${r.id}, 'approve')">${uploadActionLabel("approve")}</button>` : "";
   const conflict = canSubmit ? ["copy", "overwrite"].concat(r.status === "failed" ? ["retry"] : []).map((a) => `<button onclick="uploadAction(${r.id}, '${a}')">${uploadActionLabel(a)}</button>`).join("") : "";
   const edit = r.status === "pending_approval" || r.status === "failed" ? `<div><b>Редактирование</b><button onclick="changeStem(${r.id})">Изменить имя</button><button onclick="changeExtension(${r.id})">Изменить расширение</button><button onclick="changeFolder(${r.id})">Сменить папку этой заявки</button></div>` : "";
-  const reject = r.status !== "uploaded" && r.status !== "rejected" ? `<div><b>Опасное</b><button class="danger" onclick="rejectUpload(${r.id})">Отклонить</button></div>` : "";
+  const reject = ["pending_approval", "failed"].includes(r.status) ? `<div><b>Опасное</b><button class="danger" onclick="rejectUpload(${r.id})">Отклонить</button></div>` : "";
   return `${open}<div><b>Загрузка</b>${approve}${conflict}</div>${edit}${reject}`;
 }
 
