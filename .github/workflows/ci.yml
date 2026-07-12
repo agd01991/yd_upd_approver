@@ -25,6 +25,7 @@ jobs:
           --health-retries 5
     env:
       DATABASE_URL: postgresql+asyncpg://bot:bot@localhost:5432/bot
+      MIGRATION_DATABASE_URL: postgresql+asyncpg://bot:bot@localhost:5432/bot_migration_test
 
     steps:
       - name: Check out repository
@@ -67,6 +68,40 @@ jobs:
 
       - name: Migrations
         run: alembic upgrade head
+
+      - name: Create migration test database
+        run: |
+          python - <<'PY'
+          import asyncio
+          import os
+
+          import asyncpg
+          from sqlalchemy.engine import make_url
+
+          async def main():
+              url = make_url(os.environ["MIGRATION_DATABASE_URL"])
+              database = url.database
+              if database != "bot_migration_test":
+                  raise RuntimeError("Unexpected migration test database name")
+              admin_url = url.set(database="postgres")
+              conn = await asyncpg.connect(
+                  user=admin_url.username,
+                  password=admin_url.password,
+                  host=admin_url.host,
+                  port=admin_url.port or 5432,
+                  database=admin_url.database,
+              )
+              try:
+                  exists = await conn.fetchval(
+                      "SELECT 1 FROM pg_database WHERE datname = $1", database
+                  )
+                  if not exists:
+                      await conn.execute(f'CREATE DATABASE "{database}"')
+              finally:
+                  await conn.close()
+
+          asyncio.run(main())
+          PY
 
       - name: Tests
         run: pytest
