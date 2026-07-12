@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
@@ -73,6 +74,7 @@ async def _assert_connected_to_expected_database(
 def _migration_config() -> Config:
     cfg = Config("alembic.ini")
     cfg.attributes["database_url_override"] = MIGRATION_DATABASE_URL
+    cfg.attributes["configure_logging"] = False
     return cfg
 
 
@@ -371,3 +373,18 @@ def test_alembic_database_url_override_isolates_application_database(migration_d
         )
     )
     assert after == before
+
+
+def test_programmatic_alembic_preserves_pytest_logging(migration_db, caplog):
+    cfg, _expected_database = migration_db
+    logger_name = "app.tests.alembic_logging_regression"
+    logger = logging.getLogger(logger_name)
+    marker = "alembic-preserved-pytest-logging-marker"
+
+    assert logger.disabled is False
+    with caplog.at_level(logging.INFO, logger=logger_name):
+        command.upgrade(cfg, "head")
+        assert logger.disabled is False
+        logger.info(marker)
+
+    assert marker in caplog.text
