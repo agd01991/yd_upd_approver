@@ -9,6 +9,7 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     services:
       postgres:
         image: postgres:16-alpine
@@ -104,6 +105,7 @@ jobs:
           PY
 
       - name: Tests
+        timeout-minutes: 15
         run: pytest
 
       - name: Prepare Docker Compose environment
