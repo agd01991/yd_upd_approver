@@ -11,7 +11,8 @@ from alembic.config import Config
 from sqlalchemy import text
 from sqlalchemy.engine import make_url
 from sqlalchemy.exc import OperationalError
-from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, create_async_engine
+from sqlalchemy.ext.asyncio import AsyncConnection, create_async_engine
+from sqlalchemy.pool import NullPool
 
 from alembic import command
 
@@ -59,10 +60,9 @@ def _assert_safe_migration_url(migration_url: str, application_url: str | None) 
 
 
 async def _assert_connected_to_expected_database(
-    engine: AsyncEngine, expected_database: str
+    conn: AsyncConnection, expected_database: str
 ) -> None:
-    async with engine.connect() as conn:
-        actual_database = (await conn.execute(text("SELECT current_database()"))).scalar_one()
+    actual_database = (await conn.execute(text("SELECT current_database()"))).scalar_one()
     if actual_database != expected_database:
         raise AssertionError(
             "MIGRATION_DATABASE_URL connected to an unexpected database: "
@@ -76,35 +76,55 @@ def _migration_config() -> Config:
     return cfg
 
 
-async def _with_migration_connection[T](
-    engine: AsyncEngine, callback: Callable[[AsyncConnection], Awaitable[T]]
+async def _run_with_migration_engine[T](
+    database_url: str,
+    expected_database: str,
+    callback: Callable[[AsyncConnection], Awaitable[T]],
 ) -> T:
-    async with engine.begin() as conn:
-        return await callback(conn)
+    engine = create_async_engine(
+        database_url,
+        isolation_level="AUTOCOMMIT",
+        poolclass=NullPool,
+    )
+    try:
+        async with engine.begin() as conn:
+            await _assert_connected_to_expected_database(conn, expected_database)
+            return await callback(conn)
+    finally:
+        await engine.dispose()
+
+
+def _with_migration_connection[T](
+    expected_database: str, callback: Callable[[AsyncConnection], Awaitable[T]]
+) -> T:
+    assert MIGRATION_DATABASE_URL is not None
+    return _run_async(
+        _run_with_migration_engine(MIGRATION_DATABASE_URL, expected_database, callback)
+    )
 
 
 @pytest.fixture()
 def migration_db():
     assert MIGRATION_DATABASE_URL is not None
     expected_database = _assert_safe_migration_url(MIGRATION_DATABASE_URL, APPLICATION_DATABASE_URL)
-    engine = create_async_engine(MIGRATION_DATABASE_URL, isolation_level="AUTOCOMMIT")
+
+    async def check_connection(conn: AsyncConnection) -> None:
+        await _assert_connected_to_expected_database(conn, expected_database)
+
     try:
-        _run_async(_assert_connected_to_expected_database(engine, expected_database))
+        _with_migration_connection(expected_database, check_connection)
     except OperationalError as exc:
         raise AssertionError("MIGRATION_DATABASE_URL PostgreSQL database is unavailable") from exc
 
     cfg = _migration_config()
     command.downgrade(cfg, "base")
     try:
-        yield cfg, engine
+        yield cfg, expected_database
     finally:
-        _run_async(engine.dispose())
-        cleanup_engine = create_async_engine(MIGRATION_DATABASE_URL, isolation_level="AUTOCOMMIT")
         try:
-            _run_async(_assert_connected_to_expected_database(cleanup_engine, expected_database))
+            _with_migration_connection(expected_database, check_connection)
         finally:
-            _run_async(cleanup_engine.dispose())
-        command.downgrade(cfg, "base")
+            command.downgrade(cfg, "base")
 
 
 async def _seed(conn: AsyncConnection) -> None:
@@ -189,11 +209,10 @@ async def _modes(conn: AsyncConnection) -> dict[str, str]:
     return dict(rows)
 
 
-async def _revision(engine: AsyncEngine) -> str | None:
-    async with engine.connect() as conn:
-        return (
-            await conn.execute(text("SELECT version_num FROM alembic_version"))
-        ).scalar_one_or_none()
+async def _revision(conn: AsyncConnection) -> str | None:
+    return (
+        await conn.execute(text("SELECT version_num FROM alembic_version"))
+    ).scalar_one_or_none()
 
 
 async def _seed_legacy_0004(conn: AsyncConnection) -> None:
@@ -254,7 +273,7 @@ async def _seed_legacy_0004(conn: AsyncConnection) -> None:
 
 
 def test_existing_0005_database_is_repaired_by_head(migration_db):
-    cfg, engine = migration_db
+    cfg, expected_database = migration_db
     command.upgrade(cfg, "0005_upload_queue_worker")
 
     async def seed_and_check(conn: AsyncConnection) -> None:
@@ -263,7 +282,7 @@ def test_existing_0005_database_is_repaired_by_head(migration_db):
             await conn.execute(text("SELECT version_num FROM alembic_version"))
         ).scalar_one() == "0005_upload_queue_worker"
 
-    _run_async(_with_migration_connection(engine, seed_and_check))
+    _with_migration_connection(expected_database, seed_and_check)
     command.upgrade(cfg, "head")
 
     async def check_head(conn: AsyncConnection) -> dict[str, str]:
@@ -272,14 +291,14 @@ def test_existing_0005_database_is_repaired_by_head(migration_db):
         ).scalar_one() == "0006_repair_upload_mode_backfill"
         return await _modes(conn)
 
-    expected = _run_async(_with_migration_connection(engine, check_head))
+    expected = _with_migration_connection(expected_database, check_head)
     command.downgrade(cfg, "0005_upload_queue_worker")
     command.upgrade(cfg, "head")
 
     async def check_idempotent(conn: AsyncConnection) -> None:
         assert await _modes(conn) == expected
 
-    _run_async(_with_migration_connection(engine, check_idempotent))
+    _with_migration_connection(expected_database, check_idempotent)
     assert expected == {
         "copy_retry": "copy",
         "copy_path_approve": "copy",
@@ -295,9 +314,9 @@ def test_existing_0005_database_is_repaired_by_head(migration_db):
 
 
 def test_clean_install_path_runs_0005_then_0006_to_same_modes(migration_db):
-    cfg, engine = migration_db
+    cfg, expected_database = migration_db
     command.upgrade(cfg, "0004_user_folder_names")
-    _run_async(_with_migration_connection(engine, _seed_legacy_0004))
+    _with_migration_connection(expected_database, _seed_legacy_0004)
     command.upgrade(cfg, "head")
 
     async def check(conn: AsyncConnection) -> None:
@@ -315,21 +334,40 @@ def test_clean_install_path_runs_0005_then_0006_to_same_modes(migration_db):
             "same_timestamp": "normal",
         }
 
-    _run_async(_with_migration_connection(engine, check))
+    _with_migration_connection(expected_database, check)
 
 
 def test_alembic_database_url_override_isolates_application_database(migration_db):
-    cfg, migration_engine = migration_db
+    cfg, expected_database = migration_db
     assert APPLICATION_DATABASE_URL is not None
     app_database = _database_name(APPLICATION_DATABASE_URL)
     migration_database = _database_name(MIGRATION_DATABASE_URL)
+    assert app_database is not None
     assert app_database != migration_database
 
-    app_engine = create_async_engine(APPLICATION_DATABASE_URL)
-    try:
-        before = _run_async(_revision(app_engine))
-        command.upgrade(cfg, "0004_user_folder_names")
-        assert _run_async(_revision(migration_engine)) == "0004_user_folder_names"
-        assert _run_async(_revision(app_engine)) == before
-    finally:
-        _run_async(app_engine.dispose())
+    async def app_revision(conn: AsyncConnection) -> str | None:
+        return await _revision(conn)
+
+    async def migration_revision(conn: AsyncConnection) -> str | None:
+        return await _revision(conn)
+
+    before = _run_async(
+        _run_with_migration_engine(
+            APPLICATION_DATABASE_URL,
+            app_database,
+            app_revision,
+        )
+    )
+    command.upgrade(cfg, "0004_user_folder_names")
+    assert (
+        _with_migration_connection(expected_database, migration_revision)
+        == "0004_user_folder_names"
+    )
+    after = _run_async(
+        _run_with_migration_engine(
+            APPLICATION_DATABASE_URL,
+            app_database,
+            app_revision,
+        )
+    )
+    assert after == before
