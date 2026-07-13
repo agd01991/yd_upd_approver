@@ -21,6 +21,7 @@ WITH candidates AS (
     FROM upload_requests AS ur
     WHERE ur.status = 'approved'
       AND ur.queued_at IS NOT NULL
+      AND ur.queued_at = COALESCE(ur.approved_at, ur.created_at)
       AND ur.attempt_count = 0
       AND ur.last_attempt_at IS NULL
       AND ur.worker_token IS NULL
@@ -30,6 +31,7 @@ WITH candidates AS (
           FROM audit_log AS retry
           WHERE retry.request_id = ur.id
             AND retry.action = 'upload_retry'
+            AND NOT (COALESCE(retry.new_value, '{}'::jsonb) ?| ARRAY['upload_mode', 'queued_at'])
             AND NOT EXISTS (
                 SELECT 1
                 FROM audit_log AS newer
@@ -82,6 +84,7 @@ FROM classified
 WHERE classified.id = ur.id
   AND ur.status = 'approved'
   AND ur.queued_at IS NOT NULL
+  AND ur.queued_at = COALESCE(ur.approved_at, ur.created_at)
   AND ur.attempt_count = 0
   AND ur.last_attempt_at IS NULL
   AND ur.worker_token IS NULL
@@ -91,6 +94,7 @@ WHERE classified.id = ur.id
       FROM audit_log AS retry
       WHERE retry.request_id = ur.id
         AND retry.action = 'upload_retry'
+        AND NOT (COALESCE(retry.new_value, '{}'::jsonb) ?| ARRAY['upload_mode', 'queued_at'])
         AND NOT EXISTS (
             SELECT 1
             FROM audit_log AS newer
