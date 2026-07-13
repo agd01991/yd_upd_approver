@@ -35,3 +35,43 @@ def test_rename_selection_uses_version_to_ignore_stale_folder_candidates() -> No
     assert "selectedRenameUser = user;" in js
     assert "renameFolderCandidates = items;" in js
     assert "renameSelectionVersion += 1;" in js
+
+
+def test_upload_entries_retain_idempotency_keys_for_retry() -> None:
+    js = source()
+    assert "let selectedUploadEntries = [];" in js
+    assert "let uploadInProgress = false;" in js
+    assert "function createUploadEntry(file)" in js
+    assert "idempotencyKey: crypto.randomUUID()" in js
+    assert (
+        "selectedUploadEntries = Array.from(files || []).map((file) => createUploadEntry(file));"
+        in js
+    )
+    upload_body = js[
+        js.index("async function uploadSelectedFiles") : js.index("async function loadUserLists")
+    ]
+    assert "crypto.randomUUID()" not in upload_body
+    assert 'headers: { "Idempotency-Key": entry.idempotencyKey }' in upload_body
+    assert 'entry.status = "failed";' in upload_body
+    assert (
+        'selectedUploadEntries = selectedUploadEntries.filter((entry) => entry.status !== "done");'
+        in upload_body
+    )
+    assert (
+        "if (failedCount === 0) clearSelectedUploadFiles(form); else renderSelectedFiles();"
+        in upload_body
+    )
+    assert "form.reset();" not in upload_body
+
+
+def test_upload_new_selection_replaces_entries_with_new_keys() -> None:
+    js = source()
+    assert "input.onchange = () => setSelectedUploadFiles(input.files);" in js
+    selection_body = js[
+        js.index("function setSelectedUploadFiles") : js.index("function clearSelectedUploadFiles")
+    ]
+    assert (
+        "selectedUploadEntries = Array.from(files || []).map((file) => createUploadEntry(file));"
+        in selection_body
+    )
+    assert "renderSelectedFiles();" in selection_body

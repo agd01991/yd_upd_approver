@@ -16,6 +16,8 @@ let adminSearchTimer;
 let selectedRenameUser = null;
 let renameFolderCandidates = [];
 let renameSelectionVersion = 0;
+let selectedUploadEntries = [];
+let uploadInProgress = false;
 
 const STATUS_LABELS = {
   pending: "ожидает одобрения",
@@ -159,7 +161,7 @@ async function renderUser(me) {
     <div class="card"><h2>Файлы</h2><div id="files"></div></div>`;
   const form = document.querySelector("#up");
   const input = form.querySelector('input[type="file"]');
-  input.onchange = () => renderSelectedFiles(input.files);
+  input.onchange = () => setSelectedUploadFiles(input.files);
   form.onsubmit = async (event) => uploadSelectedFiles(event, form, input);
   document.querySelectorAll("[data-user-filter]").forEach((button) => {
     button.onclick = () => { userStatusFilter = button.dataset.userFilter; renderUserRequests(); };
@@ -167,38 +169,72 @@ async function renderUser(me) {
   await loadUserLists();
 }
 
-function renderSelectedFiles(files) {
+function createUploadEntry(file) {
+  return { file, idempotencyKey: crypto.randomUUID(), status: "pending", error: "" };
+}
+
+function setSelectedUploadFiles(files) {
+  selectedUploadEntries = Array.from(files || []).map((file) => createUploadEntry(file));
+  renderSelectedFiles();
+}
+
+function clearSelectedUploadFiles(form) {
+  selectedUploadEntries = [];
+  form.reset();
+  renderSelectedFiles();
+}
+
+function renderSelectedFiles() {
   const list = document.querySelector("#selected-files");
-  if (!files || files.length === 0) { list.textContent = "Файлы не выбраны"; return; }
-  list.innerHTML = `<b>Файлы выбраны: ${files.length}</b>` + Array.from(files).map((file, index) =>
-    `<div class="file-row"><span>${index + 1}. ${escapeHtml(file.name)}</span><span>${fmtSize(file.size)}</span></div>`
-  ).join("");
+  const remaining = selectedUploadEntries.filter((entry) => entry.status !== "done");
+  if (remaining.length === 0) { list.textContent = "Файлы не выбраны"; return; }
+  list.innerHTML = `<b>Файлы выбраны: ${remaining.length}</b>` + remaining.map((entry, index) => {
+    const retryText = entry.status === "failed" ? ` <span class="muted">ожидает повторной отправки</span>` : "";
+    return `<div class="file-row"><span>${index + 1}. ${escapeHtml(entry.file.name)}${retryText}</span><span>${fmtSize(entry.file.size)}</span></div>`;
+  }).join("");
 }
 
 async function uploadSelectedFiles(event, form, input) {
   event.preventDefault();
-  const files = Array.from(input.files || []);
   const msg = document.querySelector("#upmsg");
-  if (files.length === 0) { msg.textContent = "Выберите хотя бы один файл."; return; }
+  if (uploadInProgress) { msg.textContent = "Загрузка уже выполняется."; return; }
+  const entriesToUpload = selectedUploadEntries.filter((entry) => entry.status !== "done");
+  const files = entriesToUpload.map((entry) => entry.file);
+  if (entriesToUpload.length === 0) { msg.textContent = "Выберите хотя бы один файл."; return; }
+  uploadInProgress = true;
+  const submitButton = form.querySelector('button[type="submit"]');
+  if (submitButton) submitButton.disabled = true;
   const caption = form.querySelector("textarea").value;
   const results = [];
-  for (const [index, file] of files.entries()) {
-    msg.textContent = `Загружается ${index + 1} из ${files.length}: ${file.name}`;
-    const fd = new FormData();
-    fd.append("file", file);
-    fd.append("caption", caption);
-    try {
-      const idempotencyKey = crypto.randomUUID();
-      const result = await api("/api/uploads", { method: "POST", headers: { "Idempotency-Key": idempotencyKey }, body: fd });
-      results.push(`✅ ${file.name}: создана заявка ${result.request_code}`);
-    } catch (err) {
-      results.push(`❌ ${file.name}: ${safeErrorMessage(err)}`);
+  try {
+    for (const [index, entry] of entriesToUpload.entries()) {
+      const file = entry.file;
+      entry.status = "uploading";
+      msg.textContent = `Загружается ${index + 1} из ${files.length}: ${file.name}`;
+      const fd = new FormData();
+      fd.append("file", file);
+      fd.append("caption", caption);
+      try {
+        const result = await api("/api/uploads", { method: "POST", headers: { "Idempotency-Key": entry.idempotencyKey }, body: fd });
+        entry.status = "done";
+        entry.error = "";
+        results.push(`✅ ${file.name}: создана заявка ${result.request_code}`);
+      } catch (err) {
+        entry.status = "failed";
+        entry.error = safeErrorMessage(err);
+        results.push(`❌ ${file.name}: ${entry.error}`);
+      }
     }
+    selectedUploadEntries = selectedUploadEntries.filter((entry) => entry.status !== "done");
+    const failedCount = selectedUploadEntries.length;
+    const title = failedCount === 0 ? "Готово" : `Готово. Осталось для повторной отправки: ${failedCount}`;
+    msg.innerHTML = `<b>${escapeHtml(title)}</b>${results.map((item) => `<div>${escapeHtml(item)}</div>`).join("")}`;
+    if (failedCount === 0) clearSelectedUploadFiles(form); else renderSelectedFiles();
+    await loadUserLists();
+  } finally {
+    uploadInProgress = false;
+    if (submitButton) submitButton.disabled = false;
   }
-  msg.innerHTML = `<b>Готово</b>${results.map((item) => `<div>${escapeHtml(item)}</div>`).join("")}`;
-  form.reset();
-  renderSelectedFiles([]);
-  await loadUserLists();
 }
 
 async function loadUserLists() {
