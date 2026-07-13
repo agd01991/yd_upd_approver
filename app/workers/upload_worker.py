@@ -352,6 +352,38 @@ async def _upload_remote(job: UploadJob, settings: Settings) -> bool:
         await client.close()
 
 
+async def _cancel_upload_after_heartbeat_failure(
+    upload_task: asyncio.Task, job: UploadJob, heartbeat_exc: BaseException
+) -> None:
+    if not upload_task.done():
+        upload_task.cancel()
+    try:
+        await upload_task
+    except asyncio.CancelledError:
+        pass
+    except Exception as cleanup_exc:
+        logger.warning(
+            "Upload cleanup failed after heartbeat loss: job_id=%s, category=%s",
+            job.id,
+            cleanup_exc.__class__.__name__,
+        )
+    raise heartbeat_exc
+
+
+def _heartbeat_failure_from_done(job: UploadJob, heartbeat_task: asyncio.Task, stop: asyncio.Event):
+    if not heartbeat_task.done():
+        return None
+    exc = heartbeat_task.exception()
+    if isinstance(exc, (LeaseLostError, HeartbeatError)):
+        return exc
+    if exc is not None:
+        return exc
+    if not stop.is_set():
+        logger.warning("Heartbeat stopped early for upload job %s", job.id)
+        return HeartbeatError(f"Upload job {job.id} heartbeat stopped early")
+    return None
+
+
 async def _run_upload_with_heartbeat(job: UploadJob, settings: Settings) -> bool:
     stop = asyncio.Event()
     upload_task = asyncio.create_task(_upload_remote(job, settings))
@@ -360,37 +392,44 @@ async def _run_upload_with_heartbeat(job: UploadJob, settings: Settings) -> bool
         pending: set[asyncio.Task] = {upload_task, heartbeat_task}
         while pending:
             done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
-            if upload_task in done:
-                try:
-                    return upload_task.result()
-                finally:
-                    stop.set()
-                    with suppress(Exception):
-                        await heartbeat_task
+
             if heartbeat_task in done:
-                exc = heartbeat_task.exception()
-                if exc is not None:
-                    upload_task.cancel()
-                    with suppress(asyncio.CancelledError):
-                        await upload_task
-                    raise exc
-                if not stop.is_set() and not upload_task.done():
-                    logger.warning("Heartbeat stopped early for upload job %s", job.id)
-                    upload_task.cancel()
-                    with suppress(asyncio.CancelledError):
-                        await upload_task
-                    raise HeartbeatError(f"Upload job {job.id} heartbeat stopped early")
+                heartbeat_exc = _heartbeat_failure_from_done(job, heartbeat_task, stop)
+                if heartbeat_exc is not None:
+                    await _cancel_upload_after_heartbeat_failure(upload_task, job, heartbeat_exc)
                 pending.discard(heartbeat_task)
+
+            if upload_task in done:
+                upload_exc = upload_task.exception()
+                stop.set()
+                try:
+                    await heartbeat_task
+                except (LeaseLostError, HeartbeatError):
+                    raise
+                if upload_exc is not None:
+                    raise upload_exc
+                return upload_task.result()
+
         return upload_task.result()
-    finally:
+    except asyncio.CancelledError:
         stop.set()
         if not upload_task.done():
             upload_task.cancel()
-            with suppress(asyncio.CancelledError):
-                await upload_task
         if not heartbeat_task.done():
-            with suppress(Exception):
-                await heartbeat_task
+            heartbeat_task.cancel()
+        await asyncio.gather(upload_task, heartbeat_task, return_exceptions=True)
+        raise
+    finally:
+        stop.set()
+        cleanup_tasks = []
+        if not upload_task.done():
+            upload_task.cancel()
+            cleanup_tasks.append(upload_task)
+        if not heartbeat_task.done():
+            heartbeat_task.cancel()
+            cleanup_tasks.append(heartbeat_task)
+        if cleanup_tasks:
+            await asyncio.gather(*cleanup_tasks, return_exceptions=True)
 
 
 async def process_job(job: UploadJob, settings: Settings, bot: Bot | None = None) -> None:
