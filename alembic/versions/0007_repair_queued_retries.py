@@ -1,6 +1,6 @@
 """repair queued legacy retry upload modes
 
-Revision ID: 0007_repair_queued_legacy_retries
+Revision ID: 0007_repair_queued_retries
 Revises: 0006_repair_upload_mode_backfill
 Create Date: 2026-07-13
 """
@@ -9,7 +9,7 @@ from collections.abc import Sequence
 
 from alembic import op
 
-revision: str = "0007_repair_queued_legacy_retries"
+revision: str = "0007_repair_queued_retries"
 down_revision: str | None = "0006_repair_upload_mode_backfill"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
