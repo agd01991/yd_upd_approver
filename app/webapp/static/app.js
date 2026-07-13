@@ -161,7 +161,9 @@ async function renderUser(me) {
     <div class="card"><h2>Файлы</h2><div id="files"></div></div>`;
   const form = document.querySelector("#up");
   const input = form.querySelector('input[type="file"]');
-  input.onchange = () => setSelectedUploadFiles(input.files);
+  input.onchange = () => {
+    if (!setSelectedUploadFiles(input.files)) input.value = "";
+  };
   form.onsubmit = async (event) => uploadSelectedFiles(event, form, input);
   document.querySelectorAll("[data-user-filter]").forEach((button) => {
     button.onclick = () => { userStatusFilter = button.dataset.userFilter; renderUserRequests(); };
@@ -174,8 +176,10 @@ function createUploadEntry(file) {
 }
 
 function setSelectedUploadFiles(files) {
+  if (uploadInProgress) return false;
   selectedUploadEntries = Array.from(files || []).map((file) => createUploadEntry(file));
   renderSelectedFiles();
+  return true;
 }
 
 function clearSelectedUploadFiles(form) {
@@ -202,6 +206,7 @@ async function uploadSelectedFiles(event, form, input) {
   const files = entriesToUpload.map((entry) => entry.file);
   if (entriesToUpload.length === 0) { msg.textContent = "Выберите хотя бы один файл."; return; }
   uploadInProgress = true;
+  input.disabled = true;
   const submitButton = form.querySelector('button[type="submit"]');
   if (submitButton) submitButton.disabled = true;
   const caption = form.querySelector("textarea").value;
@@ -233,6 +238,7 @@ async function uploadSelectedFiles(event, form, input) {
     await loadUserLists();
   } finally {
     uploadInProgress = false;
+    input.disabled = false;
     if (submitButton) submitButton.disabled = false;
   }
 }
