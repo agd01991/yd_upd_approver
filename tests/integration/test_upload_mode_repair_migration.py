@@ -403,6 +403,18 @@ async def _seed_queued_legacy_retries(conn: AsyncConnection) -> None:
     last_attempt = datetime(2026, 7, 13, 2, tzinfo=UTC)
     rows = [
         (
+            99,
+            "unrelated_request",
+            "failed",
+            "/dst/unrelated.txt",
+            "normal",
+            0,
+            None,
+            None,
+            None,
+            None,
+        ),
+        (
             101,
             "queued_overwrite_retry",
             "approved",
