@@ -18,7 +18,13 @@ depends_on = None
 
 def upgrade() -> None:
     outbox_status = postgresql.ENUM(
-        "pending", "processing", "sent", "discarded", "dead", name="telegramoutboxstatus"
+        "pending",
+        "processing",
+        "sent",
+        "discarded",
+        "dead",
+        name="telegramoutboxstatus",
+        create_type=False,
     )
     outbox_status.create(op.get_bind(), checkfirst=True)
     op.add_column(
@@ -78,4 +84,6 @@ def downgrade() -> None:
     op.drop_table("telegram_outbox")
     op.drop_index("ix_upload_requests_source_event_key", table_name="upload_requests")
     op.drop_column("upload_requests", "source_event_key")
-    postgresql.ENUM(name="telegramoutboxstatus").drop(op.get_bind(), checkfirst=True)
+    postgresql.ENUM(name="telegramoutboxstatus", create_type=False).drop(
+        op.get_bind(), checkfirst=True
+    )
