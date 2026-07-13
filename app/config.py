@@ -26,6 +26,9 @@ class Settings(BaseSettings):
     webapp_url: str = ""
     webapp_auth_max_age_seconds: int = 86400
     cors_origins: list[str] = Field(default_factory=list)
+    upload_worker_poll_seconds: float = 2
+    upload_worker_lease_seconds: int = 600
+    upload_worker_heartbeat_seconds: int = 30
 
     @field_validator("telegram_admin_ids", mode="before")
     @classmethod
@@ -54,6 +57,25 @@ class Settings(BaseSettings):
         if not value:
             return []
         return [str(part).strip() for part in value if str(part).strip()]
+
+    @field_validator(
+        "upload_worker_poll_seconds",
+        "upload_worker_lease_seconds",
+        "upload_worker_heartbeat_seconds",
+    )
+    @classmethod
+    def positive_worker_timing(cls, value: float) -> float:
+        if value <= 0:
+            raise ValueError("worker timing values must be positive")
+        return value
+
+    def model_post_init(self, __context) -> None:  # type: ignore[no-untyped-def]
+        if self.upload_worker_heartbeat_seconds >= self.upload_worker_lease_seconds:
+            raise ValueError(
+                "UPLOAD_WORKER_HEARTBEAT_SECONDS must be less than UPLOAD_WORKER_LEASE_SECONDS"
+            )
+        if self.upload_worker_poll_seconds < 0.5:
+            raise ValueError("UPLOAD_WORKER_POLL_SECONDS must be at least 0.5 to avoid busy loop")
 
     @property
     def max_file_size_bytes(self) -> int:

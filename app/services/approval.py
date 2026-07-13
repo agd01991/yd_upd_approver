@@ -9,8 +9,8 @@ ALLOWED_TRANSITIONS = {
         UploadStatus.cancelled,
     },
     UploadStatus.approved: {UploadStatus.uploading},
-    UploadStatus.uploading: {UploadStatus.uploaded, UploadStatus.failed},
-    UploadStatus.failed: {UploadStatus.uploading, UploadStatus.rejected},
+    UploadStatus.uploading: {UploadStatus.uploaded, UploadStatus.failed, UploadStatus.approved},
+    UploadStatus.failed: {UploadStatus.approved, UploadStatus.rejected},
     UploadStatus.uploaded: {UploadStatus.deleted_temp},
 }
 

@@ -1,0 +1,278 @@
+from datetime import UTC, datetime
+from pathlib import Path
+
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.db.models import UploadMode, UploadRequest, UploadStatus, User
+from app.services.audit import write_audit
+from app.services.file_policy import folder_allowed
+from app.services.naming import (
+    FilenameEditError,
+    change_filename_extension,
+    change_filename_stem,
+    copy_filename,
+    join_disk_path,
+)
+
+
+class UploadQueueError(ValueError):
+    def __init__(self, message: str, code: str = "invalid_request_state") -> None:
+        super().__init__(message)
+        self.code = code
+
+
+ACTION_TO_MODE = {
+    "approve": UploadMode.normal,
+    "copy": UploadMode.copy,
+    "overwrite": UploadMode.overwrite,
+}
+
+REJECTABLE_UPLOAD_STATUSES = {UploadStatus.pending_approval, UploadStatus.failed}
+EDITABLE_UPLOAD_STATUSES = {UploadStatus.pending_approval, UploadStatus.failed}
+REJECT_INVALID_STATE_MESSAGE = (
+    "Заявка уже поставлена в очередь или загружается и не может быть отклонена."
+)
+
+
+def _same_mode(action: str, request: UploadRequest) -> UploadMode:
+    if action == "retry":
+        return request.upload_mode or UploadMode.normal
+    return ACTION_TO_MODE[action]
+
+
+async def _get_locked_upload_request(
+    session: AsyncSession, request_id: int
+) -> UploadRequest | None:
+    result = await session.execute(
+        select(UploadRequest)
+        .where(UploadRequest.id == request_id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    return result.scalar_one_or_none()
+
+
+async def _get_user_populated(session: AsyncSession, user_id: int) -> User | None:
+    try:
+        return await session.get(User, user_id, populate_existing=True)
+    except TypeError:  # compatibility with lightweight unit-test fakes
+        return await session.get(User, user_id)
+
+
+def _ensure_temp_file(request: UploadRequest) -> None:
+    if not request.local_path or not Path(request.local_path).is_file():
+        raise UploadQueueError(
+            "Временный файл не найден. Пользователь должен загрузить файл снова."
+        )
+
+
+async def enqueue_upload_request(
+    session: AsyncSession,
+    request_id: int,
+    action: str,
+    actor_telegram_id: int,
+) -> UploadRequest:
+    if action not in {"approve", "copy", "overwrite", "retry"}:
+        raise UploadQueueError("Неизвестное действие.", "not_found")
+
+    request = await _get_locked_upload_request(session, request_id)
+    if request is None:
+        raise UploadQueueError("Заявка не найдена.", "request_not_found")
+
+    user = await _get_user_populated(session, request.user_id)
+    if user is None:
+        raise UploadQueueError("Пользователь заявки не найден.", "request_not_found")
+
+    mode = _same_mode(action, request)
+    if request.status == UploadStatus.approved:
+        if request.upload_mode == mode:
+            return request
+        raise UploadQueueError("Заявка уже стоит в очереди с другим режимом загрузки.")
+    if request.status == UploadStatus.uploading:
+        raise UploadQueueError("Заявка уже загружается worker-процессом.")
+    if request.status in {UploadStatus.uploaded, UploadStatus.rejected}:
+        raise UploadQueueError("Эта заявка уже обработана.")
+    if action == "retry" and request.status != UploadStatus.failed:
+        raise UploadQueueError("Повтор доступен только для заявок с ошибкой.")
+    if action != "retry" and request.status not in {
+        UploadStatus.pending_approval,
+        UploadStatus.failed,
+    }:
+        raise UploadQueueError("Недопустимое состояние заявки.")
+
+    _ensure_temp_file(request)
+    now = datetime.now(UTC)
+    old_status = request.status.value
+    if mode == UploadMode.copy:
+        if action == "copy":
+            request.target_path = join_disk_path(
+                request.target_folder, copy_filename(request.safe_filename, request.request_code)
+            )
+    else:
+        request.target_path = join_disk_path(request.target_folder, request.safe_filename)
+    request.status = UploadStatus.approved
+    request.upload_mode = mode
+    request.queued_at = now
+    request.approved_at = request.approved_at or now
+    request.approved_by = actor_telegram_id
+    request.error_message = None
+    request.worker_token = None
+    request.lease_expires_at = None
+    await write_audit(
+        session,
+        actor_telegram_id=actor_telegram_id,
+        action=f"upload_{action}",
+        request_id=request.id,
+        user_id=request.user_id,
+        old_value={"status": old_status},
+        new_value={
+            "status": request.status.value,
+            "upload_mode": mode.value,
+            "queued_at": now.isoformat(),
+        },
+    )
+    await session.commit()
+    return request
+
+
+async def reject_upload_request(
+    session: AsyncSession,
+    request_id: int,
+    actor_telegram_id: int,
+    reason: str,
+) -> UploadRequest:
+    request = await _get_locked_upload_request(session, request_id)
+    if request is None:
+        raise UploadQueueError("Заявка не найдена.", "request_not_found")
+
+    user = await _get_user_populated(session, request.user_id)
+    if user is None:
+        raise UploadQueueError("Пользователь заявки не найден.", "request_not_found")
+
+    if request.status not in REJECTABLE_UPLOAD_STATUSES:
+        raise UploadQueueError(REJECT_INVALID_STATE_MESSAGE)
+
+    old_status = request.status.value
+    safe_reason = reason[:1000]
+    request.status = UploadStatus.rejected
+    request.rejected_at = datetime.now(UTC)
+    request.reject_reason = safe_reason
+    await write_audit(
+        session,
+        actor_telegram_id=actor_telegram_id,
+        action="upload_reject",
+        request_id=request.id,
+        user_id=request.user_id,
+        old_value={"status": old_status},
+        new_value={"status": request.status.value, "reason": safe_reason},
+    )
+    await session.commit()
+    return request
+
+
+async def change_upload_folder(
+    session: AsyncSession,
+    request_id: int,
+    folder: str,
+    actor_telegram_id: int,
+) -> UploadRequest:
+    request = await _get_locked_upload_request(session, request_id)
+    if request is None:
+        raise UploadQueueError("Заявка не найдена.", "request_not_found")
+
+    user = await _get_user_populated(session, request.user_id)
+    if user is None:
+        raise UploadQueueError("Пользователь заявки не найден.", "request_not_found")
+
+    if request.status not in EDITABLE_UPLOAD_STATUSES:
+        raise UploadQueueError("Заявку нельзя изменить в текущем состоянии.")
+    if not folder_allowed(user, folder):
+        raise UploadQueueError("Папка недоступна пользователю.", "folder_not_allowed")
+
+    old = {"target_folder": request.target_folder, "target_path": request.target_path}
+    request.target_folder = folder
+    request.target_path = join_disk_path(folder, request.safe_filename)
+    await write_audit(
+        session,
+        actor_telegram_id=actor_telegram_id,
+        action="upload_folder_change",
+        request_id=request.id,
+        user_id=user.id,
+        old_value=old,
+        new_value={"target_folder": request.target_folder, "target_path": request.target_path},
+    )
+    await session.commit()
+    return request
+
+
+async def change_upload_filename_stem(
+    session: AsyncSession,
+    request_id: int,
+    stem: str,
+    actor_telegram_id: int,
+) -> UploadRequest:
+    return await _change_upload_filename(
+        session,
+        request_id,
+        stem,
+        actor_telegram_id,
+        action="upload_filename_stem_change",
+        changer=change_filename_stem,
+    )
+
+
+async def change_upload_filename_extension(
+    session: AsyncSession,
+    request_id: int,
+    extension: str,
+    actor_telegram_id: int,
+) -> UploadRequest:
+    return await _change_upload_filename(
+        session,
+        request_id,
+        extension,
+        actor_telegram_id,
+        action="upload_filename_extension_change",
+        changer=change_filename_extension,
+    )
+
+
+async def _change_upload_filename(
+    session: AsyncSession,
+    request_id: int,
+    value: str,
+    actor_telegram_id: int,
+    *,
+    action: str,
+    changer,
+) -> UploadRequest:
+    request = await _get_locked_upload_request(session, request_id)
+    if request is None:
+        raise UploadQueueError("Заявка не найдена.", "request_not_found")
+
+    user = await _get_user_populated(session, request.user_id)
+    if user is None:
+        raise UploadQueueError("Пользователь заявки не найден.", "request_not_found")
+
+    if request.status not in EDITABLE_UPLOAD_STATUSES:
+        raise UploadQueueError("Эту заявку уже нельзя переименовать")
+
+    old = {"safe_filename": request.safe_filename, "target_path": request.target_path}
+    try:
+        safe = changer(request.safe_filename, value)
+    except FilenameEditError as exc:
+        raise UploadQueueError(str(exc), "invalid_filename") from exc
+    request.safe_filename = safe
+    request.target_path = join_disk_path(request.target_folder, safe)
+    await write_audit(
+        session,
+        actor_telegram_id=actor_telegram_id,
+        action=action,
+        request_id=request.id,
+        user_id=request.user_id,
+        old_value=old,
+        new_value={"safe_filename": request.safe_filename, "target_path": request.target_path},
+    )
+    await session.commit()
+    return request

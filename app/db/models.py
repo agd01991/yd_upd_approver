@@ -21,6 +21,12 @@ class UploadSource(StrEnum):
     mini_app = "mini_app"
 
 
+class UploadMode(StrEnum):
+    normal = "normal"
+    copy = "copy"
+    overwrite = "overwrite"
+
+
 class UploadStatus(StrEnum):
     new = "new"
     stored = "stored"
@@ -121,6 +127,14 @@ class UploadRequest(Base):
     uploaded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     rejected_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     error_message: Mapped[str | None] = mapped_column(Text)
+    upload_mode: Mapped[UploadMode] = mapped_column(
+        Enum(UploadMode), default=UploadMode.normal, index=True
+    )
+    queued_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    attempt_count: Mapped[int] = mapped_column(Integer, default=0)
+    worker_token: Mapped[str | None] = mapped_column(String(64), index=True)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    last_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
     user: Mapped[User] = relationship(back_populates="requests")
 

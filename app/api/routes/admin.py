@@ -40,9 +40,14 @@ from app.services.naming import (
     sanitize_filename,
     user_folder_for_user,
 )
+from app.services.upload_queue import (
+    EDITABLE_UPLOAD_STATUSES,
+    UploadQueueError,
+    enqueue_upload_request,
+    reject_upload_request,
+)
 from app.services.user_folders import change_yandex_disk_root_for_active_users
 from app.services.yandex_disk import YandexDiskClient
-from app.workers.upload_worker import upload_approved_request
 
 router = APIRouter(prefix="/admin", dependencies=[Depends(admin_user_dep)])
 
@@ -379,53 +384,14 @@ async def folder_items(
     }
 
 
-async def _run_action(
-    request_id: int, action: str, actor: int, session: AsyncSession, settings: Settings, bot
-) -> dict:
-    r = await session.get(UploadRequest, request_id)
-    user = await session.get(User, r.user_id) if r else None
-    if not r or not user:
-        raise ApiError(404, "request_not_found", "Заявка не найдена.")
-    if action == "retry" and r.status != UploadStatus.failed:
-        raise ApiError(400, "invalid_request_state", "Повтор доступен только для заявок с ошибкой.")
-    if action in {"approve", "overwrite", "retry", "copy"}:
-        if r.status not in {
-            UploadStatus.pending_approval,
-            UploadStatus.failed,
-            UploadStatus.approved,
-        }:
-            raise ApiError(400, "invalid_request_state", "Недопустимое состояние заявки.")
-        if action == "copy":
-            client = YandexDiskClient(settings.yandex_disk_token)
-            try:
-                r.target_path = await client.resolve_conflict_copy(
-                    r.target_folder, r.safe_filename, r.request_code
-                )
-            finally:
-                await client.close()
-        r.status = UploadStatus.approved
-        r.approved_at = datetime.now(UTC)
-        r.approved_by = actor
-        client = YandexDiskClient(settings.yandex_disk_token)
-        try:
-            await upload_approved_request(session, r, client, overwrite=action == "overwrite")
-        finally:
-            await client.close()
-        await write_audit(
-            session,
-            actor,
-            f"upload_{action}",
-            request_id=r.id,
-            user_id=user.id,
-            new_value={"status": r.status.value, "target_path": r.target_path},
-        )
-        await session.commit()
-        if bot:
-            await bot.send_message(
-                user.telegram_id, f"Статус заявки {r.request_code}: {r.status.value}"
-            )
-        return req_json(r, user)
-    raise ApiError(404, "not_found", "Unknown action")
+async def _run_action(request_id: int, action: str, actor: int, session: AsyncSession) -> dict:
+    try:
+        r = await enqueue_upload_request(session, request_id, action, actor)
+    except UploadQueueError as exc:
+        status_code = 404 if exc.code in {"request_not_found", "not_found"} else 400
+        raise ApiError(status_code, exc.code, str(exc)) from exc
+    user = await session.get(User, r.user_id)
+    return req_json(r, user)
 
 
 async def upload_action(
@@ -433,54 +399,44 @@ async def upload_action(
     action: str,
     actor: TelegramWebAppUser,
     session: AsyncSession,
-    settings: Settings,
-    bot,
 ) -> dict:
-    return await _run_action(request_id, action, actor.telegram_id, session, settings, bot)
+    return await _run_action(request_id, action, actor.telegram_id, session)
 
 
-@router.post("/uploads/{request_id}/approve")
+@router.post("/uploads/{request_id}/approve", status_code=202)
 async def upload_approve(
     request_id: int,
     actor: TelegramWebAppUser = Depends(admin_user_dep),
     session: AsyncSession = Depends(get_db),
-    settings: Settings = Depends(settings_dep),
-    bot=Depends(bot_dep),
 ) -> dict:
-    return await upload_action(request_id, "approve", actor, session, settings, bot)
+    return await upload_action(request_id, "approve", actor, session)
 
 
-@router.post("/uploads/{request_id}/copy")
+@router.post("/uploads/{request_id}/copy", status_code=202)
 async def upload_copy(
     request_id: int,
     actor: TelegramWebAppUser = Depends(admin_user_dep),
     session: AsyncSession = Depends(get_db),
-    settings: Settings = Depends(settings_dep),
-    bot=Depends(bot_dep),
 ) -> dict:
-    return await upload_action(request_id, "copy", actor, session, settings, bot)
+    return await upload_action(request_id, "copy", actor, session)
 
 
-@router.post("/uploads/{request_id}/overwrite")
+@router.post("/uploads/{request_id}/overwrite", status_code=202)
 async def upload_overwrite(
     request_id: int,
     actor: TelegramWebAppUser = Depends(admin_user_dep),
     session: AsyncSession = Depends(get_db),
-    settings: Settings = Depends(settings_dep),
-    bot=Depends(bot_dep),
 ) -> dict:
-    return await upload_action(request_id, "overwrite", actor, session, settings, bot)
+    return await upload_action(request_id, "overwrite", actor, session)
 
 
-@router.post("/uploads/{request_id}/retry")
+@router.post("/uploads/{request_id}/retry", status_code=202)
 async def upload_retry(
     request_id: int,
     actor: TelegramWebAppUser = Depends(admin_user_dep),
     session: AsyncSession = Depends(get_db),
-    settings: Settings = Depends(settings_dep),
-    bot=Depends(bot_dep),
 ) -> dict:
-    return await upload_action(request_id, "retry", actor, session, settings, bot)
+    return await upload_action(request_id, "retry", actor, session)
 
 
 @router.post("/uploads/{request_id}/reject")
@@ -491,26 +447,13 @@ async def reject_upload(
     session: AsyncSession = Depends(get_db),
     bot=Depends(bot_dep),
 ) -> dict:
-    r = await session.get(UploadRequest, request_id)
-    user = await session.get(User, r.user_id) if r else None
-    if not r or not user:
-        raise ApiError(404, "request_not_found", "Заявка не найдена.")
-    if r.status in {UploadStatus.uploaded, UploadStatus.rejected}:
-        raise ApiError(400, "invalid_request_state", "Заявку нельзя отклонить в текущем состоянии.")
-    old = r.status.value
-    r.status = UploadStatus.rejected
-    r.rejected_at = datetime.now(UTC)
-    r.reject_reason = body.reason[:1000]
-    await write_audit(
-        session,
-        actor.telegram_id,
-        "upload_reject",
-        request_id=r.id,
-        user_id=user.id,
-        old_value={"status": old},
-        new_value={"status": r.status.value, "reason": r.reject_reason},
-    )
-    await session.commit()
+    try:
+        r = await reject_upload_request(session, request_id, actor.telegram_id, body.reason)
+    except UploadQueueError as exc:
+        if exc.code == "request_not_found":
+            raise ApiError(404, exc.code, str(exc)) from exc
+        raise ApiError(409, exc.code, str(exc)) from exc
+    user = await session.get(User, r.user_id)
     if bot:
         await bot.send_message(
             user.telegram_id, f"Заявка {r.request_code} отклонена: {r.reject_reason}"
@@ -525,11 +468,17 @@ async def patch_upload(
     actor: TelegramWebAppUser = Depends(admin_user_dep),
     session: AsyncSession = Depends(get_db),
 ) -> dict:
-    r = await session.get(UploadRequest, request_id)
-    user = await session.get(User, r.user_id) if r else None
+    result = await session.execute(
+        select(UploadRequest)
+        .where(UploadRequest.id == request_id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    r = result.scalar_one_or_none()
+    user = await session.get(User, r.user_id, populate_existing=True) if r else None
     if not r or not user:
         raise ApiError(404, "request_not_found", "Заявка не найдена.")
-    if r.status in {UploadStatus.uploaded, UploadStatus.rejected}:
+    if r.status not in EDITABLE_UPLOAD_STATUSES:
         raise ApiError(400, "invalid_request_state", "Заявку нельзя изменить в текущем состоянии.")
     old = {
         "safe_filename": r.safe_filename,
