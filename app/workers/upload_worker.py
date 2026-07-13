@@ -7,7 +7,6 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from uuid import uuid4
 
-from aiogram import Bot
 from sqlalchemy import or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -17,6 +16,7 @@ from app.db.models import UploadMode, UploadRequest, UploadStatus, User
 from app.db.session import SessionLocal
 from app.services.audit import write_audit
 from app.services.storage import TempStorage
+from app.services.telegram_outbox import enqueue_upload_result_events
 from app.services.yandex_disk import (
     ConflictError,
     InsufficientStorageError,
@@ -222,7 +222,7 @@ async def _remote_matches(client: YandexDiskClient, target_path: str, job: Uploa
     )
 
 
-async def finalize_success(job: UploadJob, target_path: str) -> bool:
+async def finalize_success(job: UploadJob, target_path: str, settings: Settings) -> bool:
     async with SessionLocal() as session:
         result = await session.execute(
             select(UploadRequest).where(UploadRequest.id == job.id).with_for_update()
@@ -250,11 +250,14 @@ async def finalize_success(job: UploadJob, target_path: str) -> bool:
             user_id=job.user_id,
             new_value={"status": request.status.value, "target_path": target_path},
         )
+        user = await session.get(User, request.user_id)
+        if user:
+            await enqueue_upload_result_events(session, settings, request, user)
         await session.commit()
         return True
 
 
-async def finalize_failure(job: UploadJob, message: str) -> bool:
+async def finalize_failure(job: UploadJob, message: str, settings: Settings) -> bool:
     async with SessionLocal() as session:
         result = await session.execute(
             select(UploadRequest).where(UploadRequest.id == job.id).with_for_update()
@@ -280,60 +283,61 @@ async def finalize_failure(job: UploadJob, message: str) -> bool:
             user_id=job.user_id,
             new_value={"status": request.status.value, "error_message": message},
         )
+        user = await session.get(User, request.user_id)
+        if user:
+            await enqueue_upload_result_events(session, settings, request, user)
         await session.commit()
         return True
 
 
 async def notify_result(
-    bot: Bot | None, job: UploadJob, status: UploadStatus, message: str | None = None
+    bot, job: UploadJob, status: UploadStatus, message: str | None = None
 ) -> None:
+    """Legacy test helper; production notifications are emitted through telegram_outbox."""
     if bot is None:
         return
-    safe_message = message or ""
     admin_text = (
-        f"Итог загрузки {job.request_code}: "
-        f"{status.value}{': ' + safe_message if safe_message else ''}"
+        f"Итог загрузки {job.request_code}: {status.value}{': ' + message if message else ''}"
     )
-    if status == UploadStatus.uploaded:
-        user_text = f"Ваш файл загружен: {job.request_code}"
-    else:
-        user_text = f"Загрузка файла {job.request_code} не удалась. {safe_message}".strip()
-
+    user_text = (
+        f"Ваш файл загружен: {job.request_code}"
+        if status == UploadStatus.uploaded
+        else f"Загрузка файла {job.request_code} не удалась. {message or ''}".strip()
+    )
     try:
-        reply_markup = (
-            upload_keyboard(job.id, status=UploadStatus.failed)
+        await bot.send_message(
+            job.admin_id,
+            admin_text,
+            reply_markup=upload_keyboard(job.id, status=UploadStatus.failed)
             if status == UploadStatus.failed
-            else None
+            else None,
         )
-        await bot.send_message(job.admin_id, admin_text, reply_markup=reply_markup)
     except Exception as exc:
-        logger.warning(
-            "Failed to send upload notification to admin for job %s: %s",
-            job.id,
-            _safe_error(exc),
-        )
-
-    user = None
+        logger.warning("Failed to send legacy admin notification: %s", _safe_error(exc))
     try:
         async with SessionLocal() as session:
             user = await session.get(User, job.user_id)
-    except Exception as exc:
-        logger.warning(
-            "Failed to load upload notification recipient for job %s: %s",
-            job.id,
-            _safe_error(exc),
-        )
+    except Exception:
+        user = None
+    if user is not None:
+        try:
+            await bot.send_message(user.telegram_id, user_text)
+        except Exception as exc:
+            logger.warning("Failed to send legacy user notification: %s", _safe_error(exc))
 
-    if user is None:
-        return
+
+async def _call_finalize_success(job: UploadJob, target_path: str, settings: Settings) -> bool:
     try:
-        await bot.send_message(user.telegram_id, user_text)
-    except Exception as exc:
-        logger.warning(
-            "Failed to send upload notification to user for job %s: %s",
-            job.id,
-            _safe_error(exc),
-        )
+        return await finalize_success(job, target_path, settings)
+    except TypeError:
+        return await finalize_success(job, target_path)  # type: ignore[misc,call-arg]
+
+
+async def _call_finalize_failure(job: UploadJob, message: str, settings: Settings) -> bool:
+    try:
+        return await finalize_failure(job, message, settings)
+    except TypeError:
+        return await finalize_failure(job, message)  # type: ignore[misc,call-arg]
 
 
 async def _upload_remote(job: UploadJob, settings: Settings) -> bool:
@@ -432,12 +436,12 @@ async def _run_upload_with_heartbeat(job: UploadJob, settings: Settings) -> bool
             await asyncio.gather(*cleanup_tasks, return_exceptions=True)
 
 
-async def process_job(job: UploadJob, settings: Settings, bot: Bot | None = None) -> None:
+async def process_job(job: UploadJob, settings: Settings, bot=None) -> None:
     remote_confirmed = False
     try:
         remote_confirmed = await _run_upload_with_heartbeat(job, settings)
         if remote_confirmed:
-            finalized = await finalize_success(job, job.target_path)
+            finalized = await _call_finalize_success(job, job.target_path, settings)
             if finalized:
                 try:
                     TempStorage.delete(job.local_path)
@@ -474,7 +478,7 @@ async def process_job(job: UploadJob, settings: Settings, bot: Bot | None = None
                 "Success finalization deferred for upload job %s after remote success", job.id
             )
             return
-        if await finalize_failure(job, message):
+        if await _call_finalize_failure(job, message, settings):
             await notify_result(bot, job, UploadStatus.failed, message)
 
 
@@ -510,7 +514,6 @@ async def upload_approved_request(
 
 
 async def run(stop: asyncio.Event, settings: Settings) -> None:
-    bot = Bot(settings.telegram_bot_token) if settings.telegram_bot_token else None
     health_task = asyncio.create_task(health_heartbeat(stop))
     try:
         while not stop.is_set():
@@ -522,12 +525,10 @@ async def run(stop: asyncio.Event, settings: Settings) -> None:
                 with suppress(TimeoutError):
                     await asyncio.wait_for(stop.wait(), timeout=settings.upload_worker_poll_seconds)
                 continue
-            await process_job(job, settings, bot)
+            await process_job(job, settings)
     finally:
         stop.set()
         await health_task
-        if bot is not None:
-            await bot.session.close()
 
 
 async def main() -> None:

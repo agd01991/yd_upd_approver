@@ -6,7 +6,7 @@ from fastapi.responses import FileResponse
 from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.deps import admin_user_dep, bot_dep, get_db, settings_dep
+from app.api.deps import admin_user_dep, get_db, settings_dep
 from app.api.errors import ApiError
 from app.api.schemas import (
     AdminRenameFolderBody,
@@ -40,6 +40,7 @@ from app.services.naming import (
     sanitize_filename,
     user_folder_for_user,
 )
+from app.services.telegram_outbox import TelegramEventType, enqueue_telegram_event
 from app.services.upload_queue import (
     EDITABLE_UPLOAD_STATUSES,
     UploadQueueError,
@@ -197,7 +198,7 @@ async def admin_rename_folder(
 
 
 async def _moderate_user(
-    user_id: int, action: str, actor: int, session: AsyncSession, settings: Settings, bot
+    user_id: int, action: str, actor: int, session: AsyncSession, settings: Settings, bot=None
 ) -> dict:
     user = await session.get(User, user_id)
     if not user:
@@ -226,13 +227,10 @@ async def _moderate_user(
             ) from exc
         finally:
             await client.close()
-        msg = "Ваш доступ одобрен. Можете отправлять файлы."
     elif action == "reject":
         user.status = UserStatus.rejected
-        msg = "Ваша заявка на доступ отклонена."
     else:
         user.status = UserStatus.blocked
-        msg = "Ваш доступ заблокирован администратором."
     await write_audit(
         session,
         actor,
@@ -241,9 +239,15 @@ async def _moderate_user(
         old_value={"status": old},
         new_value={"status": user.status.value, "root_folder": user.root_folder},
     )
+    await enqueue_telegram_event(
+        session,
+        event_type=TelegramEventType.user_moderation_result,
+        recipient_telegram_id=user.telegram_id,
+        dedup_key=f"user:{user.id}:moderation:{user.status.value}",
+        payload={"status": user.status.value},
+        user_id=user.id,
+    )
     await session.commit()
-    if bot:
-        await bot.send_message(user.telegram_id, msg)
     return user_json(user)
 
 
@@ -254,7 +258,7 @@ async def moderate_user(
     actor: TelegramWebAppUser = Depends(admin_user_dep),
     session: AsyncSession = Depends(get_db),
     settings: Settings = Depends(settings_dep),
-    bot=Depends(bot_dep),
+    bot=None,
 ) -> dict:
     if action not in {"approve", "reject", "block"}:
         raise ApiError(404, "not_found", "Unknown action")
@@ -445,7 +449,6 @@ async def reject_upload(
     body: RejectBody,
     actor: TelegramWebAppUser = Depends(admin_user_dep),
     session: AsyncSession = Depends(get_db),
-    bot=Depends(bot_dep),
 ) -> dict:
     try:
         r = await reject_upload_request(session, request_id, actor.telegram_id, body.reason)
@@ -454,10 +457,6 @@ async def reject_upload(
             raise ApiError(404, exc.code, str(exc)) from exc
         raise ApiError(409, exc.code, str(exc)) from exc
     user = await session.get(User, r.user_id)
-    if bot:
-        await bot.send_message(
-            user.telegram_id, f"Заявка {r.request_code} отклонена: {r.reject_reason}"
-        )
     return req_json(r, user)
 
 
@@ -512,6 +511,13 @@ async def patch_upload(
     except FilenameEditError as exc:
         raise ApiError(400, "invalid_request", "Проверьте корректность введённых данных.") from exc
     r.target_path = join_disk_path(r.target_folder, r.safe_filename)
+    if old == {
+        "safe_filename": r.safe_filename,
+        "target_folder": r.target_folder,
+        "target_path": r.target_path,
+    }:
+        await session.commit()
+        return req_json(r, user)
     await write_audit(
         session,
         actor.telegram_id,
@@ -573,7 +579,6 @@ async def approve_folder_rename_request(
     actor: TelegramWebAppUser = Depends(admin_user_dep),
     session: AsyncSession = Depends(get_db),
     settings: Settings = Depends(settings_dep),
-    bot=Depends(bot_dep),
 ) -> dict:
     from app.services.user_folder_rename import rename_user_folder
 
@@ -593,6 +598,14 @@ async def approve_folder_rename_request(
         req.target_folder = target
         req.reviewed_at = datetime.now(UTC)
         req.reviewed_by = actor.telegram_id
+        await enqueue_telegram_event(
+            session,
+            event_type=TelegramEventType.folder_rename_result,
+            recipient_telegram_id=user.telegram_id,
+            dedup_key=f"folder-rename:{req.id}:approved:user:{user.telegram_id}",
+            payload={"text": f"Заявка на переименование папки одобрена: {target}"},
+            user_id=user.id,
+        )
         await session.commit()
     except ValueError as exc:
         await session.rollback()
@@ -604,10 +617,6 @@ async def approve_folder_rename_request(
         ) from exc
     finally:
         await client.close()
-    if bot:
-        await bot.send_message(
-            user.telegram_id, f"Заявка на переименование папки одобрена: {target}"
-        )
     return rename_request_json(req, user)
 
 
@@ -617,7 +626,6 @@ async def reject_folder_rename_request(
     body: FolderRenameRejectBody,
     actor: TelegramWebAppUser = Depends(admin_user_dep),
     session: AsyncSession = Depends(get_db),
-    bot=Depends(bot_dep),
 ) -> dict:
     req = await session.get(FolderRenameRequest, request_id)
     user = await session.get(User, req.user_id) if req else None
@@ -629,9 +637,13 @@ async def reject_folder_rename_request(
     req.reject_reason = body.reason
     req.reviewed_at = datetime.now(UTC)
     req.reviewed_by = actor.telegram_id
+    await enqueue_telegram_event(
+        session,
+        event_type=TelegramEventType.folder_rename_result,
+        recipient_telegram_id=user.telegram_id,
+        dedup_key=f"folder-rename:{req.id}:rejected:user:{user.telegram_id}",
+        payload={"text": f"Заявка на переименование папки отклонена: {body.reason}"},
+        user_id=user.id,
+    )
     await session.commit()
-    if bot:
-        await bot.send_message(
-            user.telegram_id, f"Заявка на переименование папки отклонена: {body.reason}"
-        )
     return rename_request_json(req, user)

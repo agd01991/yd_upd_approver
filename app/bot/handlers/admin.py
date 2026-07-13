@@ -25,6 +25,7 @@ from app.services.app_settings import (
 from app.services.audit import write_audit
 from app.services.disk_paths import DiskPathValidationError, validate_yandex_disk_root
 from app.services.naming import user_folder_for_user
+from app.services.telegram_outbox import TelegramEventType, enqueue_telegram_event
 from app.services.upload_queue import (
     REJECTABLE_UPLOAD_STATUSES,
     UploadQueueError,
@@ -40,7 +41,6 @@ from app.utils.formatting import (
     format_audit_action,
     format_folder_items,
     format_upload_card,
-    format_upload_result,
     format_user_status,
 )
 from app.utils.security import ensure_admin_callback, is_admin
@@ -229,7 +229,10 @@ async def user_callback(
     if not ensure_admin_callback(callback, settings):
         await callback.answer("Недостаточно прав", show_alert=True)
         return
-    user = await session.get(User, callback_data.user_id)
+    result = await session.execute(
+        select(User).where(User.id == callback_data.user_id).with_for_update()
+    )
+    user = result.scalar_one_or_none()
     if not user:
         await callback.answer("Пользователь не найден")
         return
@@ -259,13 +262,34 @@ async def user_callback(
             return
         finally:
             await client.close()
-        await bot.send_message(user.telegram_id, "Ваш доступ одобрен. Можете отправлять файлы.")
+        await enqueue_telegram_event(
+            session,
+            event_type=TelegramEventType.user_moderation_result,
+            recipient_telegram_id=user.telegram_id,
+            dedup_key=f"user:{user.id}:moderation:active",
+            payload={"status": "active"},
+            user_id=user.id,
+        )
     elif callback_data.action == "reject":
         user.status = UserStatus.rejected
-        await bot.send_message(user.telegram_id, "Ваша заявка на доступ отклонена.")
+        await enqueue_telegram_event(
+            session,
+            event_type=TelegramEventType.user_moderation_result,
+            recipient_telegram_id=user.telegram_id,
+            dedup_key=f"user:{user.id}:moderation:rejected",
+            payload={"status": "rejected"},
+            user_id=user.id,
+        )
     elif callback_data.action == "block":
         user.status = UserStatus.blocked
-        await bot.send_message(user.telegram_id, "Ваш доступ заблокирован администратором.")
+        await enqueue_telegram_event(
+            session,
+            event_type=TelegramEventType.user_moderation_result,
+            recipient_telegram_id=user.telegram_id,
+            dedup_key=f"user:{user.id}:moderation:blocked",
+            payload={"status": "blocked"},
+            user_id=user.id,
+        )
     await write_audit(
         session,
         actor_telegram_id=callback.from_user.id,
@@ -276,20 +300,6 @@ async def user_callback(
     )
     await session.commit()
     await callback.answer("Готово")
-
-
-async def _notify_upload_result(bot: Bot, admin_id: int, upload: UploadRequest, user: User) -> None:
-    text = format_upload_result(upload)
-    await bot.send_message(admin_id, text)
-    if upload.status == UploadStatus.uploaded:
-        await bot.send_message(user.telegram_id, f"Ваш файл загружен: {upload.request_code}")
-    elif upload.status == UploadStatus.failed:
-        await bot.send_message(
-            user.telegram_id,
-            f"Загрузка файла {upload.request_code} временно не удалась. Администратор может повторить.",
-        )
-    elif upload.status == UploadStatus.rejected:
-        await bot.send_message(user.telegram_id, text)
 
 
 async def _run_upload(
@@ -319,8 +329,7 @@ async def _reject_request(
     user: User,
     reason: str,
 ) -> None:
-    rejected = await reject_upload_request(session, request.id, admin_id, reason)
-    await _notify_upload_result(bot, admin_id, rejected, user)
+    await reject_upload_request(session, request.id, admin_id, reason)
 
 
 @router.callback_query(UploadModerationCallback.filter())

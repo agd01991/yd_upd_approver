@@ -115,3 +115,7 @@ Mini App поддерживает сохранение профиля папки
 - список pending-заявок пользователей на переименование с approve/reject.
 
 Все динамические данные в obvious render functions проходят через `escapeHtml`. Frontend не получает `YANDEX_DISK_TOKEN` и не формирует target path самостоятельно: он отправляет только выбранный server-side candidate и новое имя папки, а backend валидирует source и строит target path.
+
+## Upload idempotency
+
+`POST /api/uploads` requires an `Idempotency-Key` header. The Mini App generates a fresh UUID per selected file. The backend scopes the key to the authenticated user (`mini-app-upload:<user_id>:<key>`), so reusing another user's key cannot expose their request. Retrying the same request after a network error returns the existing `request_code` and `status`; using a new key intentionally creates a new upload, even for the same file contents.

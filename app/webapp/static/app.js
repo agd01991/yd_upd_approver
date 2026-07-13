@@ -188,7 +188,8 @@ async function uploadSelectedFiles(event, form, input) {
     fd.append("file", file);
     fd.append("caption", caption);
     try {
-      const result = await api("/api/uploads", { method: "POST", body: fd });
+      const idempotencyKey = crypto.randomUUID();
+      const result = await api("/api/uploads", { method: "POST", headers: { "Idempotency-Key": idempotencyKey }, body: fd });
       results.push(`✅ ${file.name}: создана заявка ${result.request_code}`);
     } catch (err) {
       results.push(`❌ ${file.name}: ${safeErrorMessage(err)}`);

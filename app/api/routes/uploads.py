@@ -1,18 +1,21 @@
-from fastapi import APIRouter, Depends, File, Form, UploadFile, status
+import re
+
+from fastapi import APIRouter, Depends, File, Form, Header, UploadFile, status
+from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.deps import bot_dep, current_user_dep, get_db, settings_dep
+from app.api.deps import current_user_dep, get_db, settings_dep
 from app.api.errors import ApiError
-from app.bot.keyboards import upload_keyboard
 from app.config import Settings
-from app.db.models import User, UserStatus
+from app.db.models import UploadRequest, User, UserStatus
 from app.db.repositories import create_upload_request, list_user_requests, next_request_code
 from app.services.file_policy import validate_size
 from app.services.naming import join_disk_path, sanitize_filename
 from app.services.storage import TempStorage
+from app.services.telegram_outbox import enqueue_admin_upload_pending
 from app.services.user_folders import ensure_user_folder_for_current_root
 from app.services.yandex_disk import YandexDiskClient
-from app.utils.formatting import format_upload_card
 
 router = APIRouter(prefix="/uploads")
 
@@ -52,7 +55,7 @@ async def create_upload(
     current: tuple[User, bool] = Depends(current_user_dep),
     session: AsyncSession = Depends(get_db),
     settings: Settings = Depends(settings_dep),
-    bot=Depends(bot_dep),
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
 ) -> dict:
     user, _ = current
     if user.status != UserStatus.active or not user.root_folder:
@@ -61,6 +64,19 @@ async def create_upload(
             "user_not_active",
             "Загрузка доступна только активным пользователям.",
         )
+    if not idempotency_key or not re.fullmatch(r"[A-Za-z0-9._:-]{1,128}", idempotency_key):
+        raise ApiError(
+            400, "invalid_idempotency_key", "Передайте корректный заголовок Idempotency-Key."
+        )
+    source_event_key = f"mini-app-upload:{user.id}:{idempotency_key}"
+    existing = await session.scalar(
+        select(UploadRequest).where(
+            UploadRequest.source_event_key == source_event_key, UploadRequest.user_id == user.id
+        )
+    )
+    if existing:
+        return {"request_code": existing.request_code, "status": existing.status.value}
+
     safe = sanitize_filename(file.filename or "file")
     request_code = await next_request_code(session)
     storage = TempStorage(settings.temp_storage_dir)
@@ -106,10 +122,20 @@ async def create_upload(
         local_path=str(destination),
         target_folder=target_folder,
         target_path=target_path,
+        source_event_key=source_event_key,
     )
-    await session.commit()
-    if bot:
-        card = format_upload_card(upload, user)
-        for admin_id in settings.telegram_admin_ids:
-            await bot.send_message(admin_id, card, reply_markup=upload_keyboard(upload.id))
+    await enqueue_admin_upload_pending(session, settings, upload, user)
+    try:
+        await session.commit()
+    except IntegrityError:
+        await session.rollback()
+        destination.unlink(missing_ok=True)
+        existing = await session.scalar(
+            select(UploadRequest).where(
+                UploadRequest.source_event_key == source_event_key, UploadRequest.user_id == user.id
+            )
+        )
+        if existing:
+            return {"request_code": existing.request_code, "status": existing.status.value}
+        raise
     return {"request_code": upload.request_code, "status": upload.status.value}

@@ -47,6 +47,14 @@ class FolderRenameRequestStatus(StrEnum):
     cancelled = "cancelled"
 
 
+class TelegramOutboxStatus(StrEnum):
+    pending = "pending"
+    processing = "processing"
+    sent = "sent"
+    discarded = "discarded"
+    dead = "dead"
+
+
 class User(Base):
     __tablename__ = "users"
 
@@ -107,6 +115,7 @@ class UploadRequest(Base):
     )
     telegram_file_id: Mapped[str | None] = mapped_column(String(512))
     telegram_file_unique_id: Mapped[str | None] = mapped_column(String(512))
+    source_event_key: Mapped[str | None] = mapped_column(String(256), unique=True, index=True)
     original_filename: Mapped[str] = mapped_column(String(512))
     safe_filename: Mapped[str] = mapped_column(String(512))
     mime_type: Mapped[str | None] = mapped_column(String(255))
@@ -137,6 +146,35 @@ class UploadRequest(Base):
     last_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
     user: Mapped[User] = relationship(back_populates="requests")
+
+
+class TelegramOutbox(Base):
+    __tablename__ = "telegram_outbox"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    event_type: Mapped[str] = mapped_column(String(64), index=True)
+    recipient_telegram_id: Mapped[int] = mapped_column(BigInteger, index=True)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSONB, default=dict)
+    dedup_key: Mapped[str] = mapped_column(String(512), unique=True, nullable=False)
+    status: Mapped[TelegramOutboxStatus] = mapped_column(
+        Enum(TelegramOutboxStatus), default=TelegramOutboxStatus.pending, index=True
+    )
+    attempt_count: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    next_attempt_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), index=True
+    )
+    lock_token: Mapped[str | None] = mapped_column(String(64), index=True)
+    locked_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    last_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    telegram_message_id: Mapped[int | None] = mapped_column(Integer)
+    last_error: Mapped[str | None] = mapped_column(Text)
+    request_id: Mapped[int | None] = mapped_column(ForeignKey("upload_requests.id"), index=True)
+    user_id: Mapped[int | None] = mapped_column(ForeignKey("users.id"), index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
 
 
 class AppSetting(Base):

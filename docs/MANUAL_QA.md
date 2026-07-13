@@ -197,3 +197,16 @@ uvicorn app.api.main:app --host 0.0.0.0 --port 8000
 13. `user.root_folder` обновляется, если переименована текущая папка пользователя; общая root folder не меняется.
 14. Совпадающие `allowed_folders` и старые `upload_requests.target_folder`/`target_path` обновляются на новый путь.
 15. Поиск пользователей в Mini App показывает выпадающий список, результаты экранируются, по клику пользователь выбирается для переименования без заявки.
+
+## Transactional Telegram outbox manual QA
+
+PostgreSQL is the source of truth for durable Telegram notifications. Redis is not used as a queue. Telegram delivery is at-least-once: if the outbox worker crashes after Telegram accepts a message but before the row is marked `sent`, a rare duplicate notification can be delivered.
+
+1. Stop only the `outbox-worker` service.
+2. Create an upload request from Telegram or the Mini App.
+3. Verify that the upload request is saved and a `telegram_outbox` row exists with `status='pending'`.
+4. Start `outbox-worker` and verify the row moves to `sent` with `sent_at` and `telegram_message_id` populated.
+5. Repeat the same admin action or callback and verify audit/outbox rows are not duplicated.
+6. Temporarily make Telegram unavailable and verify `attempt_count`, `last_error`, and `next_attempt_at` are updated with retry/backoff; permanent forbidden/bad-request errors move to `dead`.
+7. Repeat a Mini App upload with the same `Idempotency-Key` and verify the existing `request_code`/`status` is returned.
+8. Inspect stuck rows safely, for example: `select id,event_type,status,attempt_count,next_attempt_at,last_error from telegram_outbox where status in ('pending','dead') order by id;`.

@@ -13,7 +13,6 @@ from aiogram.types import (
 )
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.bot.keyboards import user_moderation_keyboard
 from app.config import Settings
 from app.db.models import UserStatus
 from app.db.repositories import get_or_create_user
@@ -22,7 +21,7 @@ from app.services.naming import (
     build_recommended_user_folder_name,
     validate_user_folder_name,
 )
-from app.utils.formatting import format_user_card
+from app.services.telegram_outbox import enqueue_admin_user_pending
 
 router = Router()
 
@@ -193,12 +192,9 @@ async def onboarding_confirm(
     user.contract_date = data["contract_date"]
     user.contract_full_name = data["contract_full_name"]
     user.folder_name = data["folder_name"]
+    await enqueue_admin_user_pending(session, settings, user)
     await session.commit()
     await state.clear()
-    for admin_id in settings.telegram_admin_ids:
-        await bot.send_message(
-            admin_id, format_user_card(user), reply_markup=user_moderation_keyboard(user.id)
-        )
     await message.answer(
         "Заявка отправлена администратору. Дождитесь одобрения.",
         reply_markup=ReplyKeyboardRemove(),

@@ -428,3 +428,17 @@ Worker использует lease/heartbeat. Claim выставляет `worker_
 При падении после принятия файла Яндекс.Диском, но до commit `uploaded`, повторный worker перед загрузкой пытается сверить существующий remote resource через `get_info()`: безопасное завершение возможно только при совпадении размера и SHA-256. Совпадения имени или размера недостаточно; при конфликте `normal`/`copy` job становится `failed`, а `overwrite` может повторить загрузку.
 
 Ручной retry разрешён только из `failed` и сохраняет предыдущий `upload_mode` (или использует `normal`, если режима ещё нет). Диагностировать failed job следует по безопасному `error_message`, audit events `upload_failed`, `upload_recovered`, `upload_started`, `upload_uploaded` и server logs без токенов, upload URL, DSN или содержимого файла.
+
+## Telegram transactional outbox
+
+Durable Telegram notifications are stored in PostgreSQL in `telegram_outbox` in the same transaction as the business state and audit row. API handlers, bot handlers, and the upload worker no longer depend on Telegram availability for saved business events; a separate process sends notifications:
+
+```bash
+python -m app.workers.telegram_outbox_worker
+```
+
+Configure it with `TELEGRAM_OUTBOX_POLL_SECONDS`, `TELEGRAM_OUTBOX_LEASE_SECONDS`, `TELEGRAM_OUTBOX_MAX_ATTEMPTS`, `TELEGRAM_OUTBOX_BASE_RETRY_SECONDS`, and `TELEGRAM_OUTBOX_MAX_RETRY_SECONDS`. Docker Compose includes a dedicated `outbox-worker` service and heartbeat healthcheck. Redis is not used as the outbox queue; PostgreSQL remains the source of truth.
+
+Delivery is durable at-least-once, not exactly-once. Telegram `sendMessage` has no idempotency key, so if the worker crashes after Telegram accepts a message but before the row is marked `sent`, a duplicate can be delivered. Temporary failures are retried with exponential backoff and jitter. Permanent forbidden/bad-request errors and exhausted retries are moved to `dead`. Operators can inspect pending/dead rows in `telegram_outbox` without exposing tokens or local temp paths.
+
+Mini App uploads require an `Idempotency-Key` header. The frontend generates a UUID per file; duplicate retries return the existing upload request while new keys allow intentional duplicate file submissions.
