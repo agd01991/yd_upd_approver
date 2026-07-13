@@ -26,7 +26,7 @@ WHERE ur.upload_mode IS NULL
   AND ur.target_path IS NOT NULL
   AND ur.target_folder IS NOT NULL
   AND ur.safe_filename IS NOT NULL
-  AND ur.target_path <> ur.target_folder || ur.safe_filename
+  AND ur.target_path <> rtrim(ur.target_folder, '/') || '/' || ur.safe_filename
   AND EXISTS (
       SELECT 1
       FROM audit_log AS al
@@ -52,7 +52,7 @@ UPDATE upload_requests AS ur
 SET upload_mode = 'overwrite'
 WHERE ur.upload_mode IS NULL
   AND ur.status = 'failed'
-  AND ur.target_path = ur.target_folder || ur.safe_filename
+  AND ur.target_path = rtrim(ur.target_folder, '/') || '/' || ur.safe_filename
   AND EXISTS (
       SELECT 1
       FROM audit_log AS al

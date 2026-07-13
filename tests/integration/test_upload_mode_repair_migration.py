@@ -176,6 +176,30 @@ async def _seed(conn: AsyncConnection) -> None:
                 "queued_at": queued_at,
             },
         )
+    path_rows = [
+        (20, "canonical_no_slash", "/dst", "/dst/file.txt", "copy"),
+        (21, "canonical_multi_slash", "/dst///", "/dst/file.txt", "copy"),
+        (22, "root_folder", "/", "/file.txt", "copy"),
+        (23, "true_copy_no_slash", "/dst", "/copies/file.txt", "copy"),
+        (24, "overwrite_no_slash", "/dst", "/dst/file.txt", "overwrite"),
+        (25, "other_audit_no_slash", "/dst", "/dst/file.txt", "normal"),
+    ]
+    for id_, code, folder, target_path, mode in path_rows:
+        await conn.execute(
+            text(
+                """
+                INSERT INTO upload_requests (
+                    id, request_code, user_id, source, telegram_file_id, original_filename,
+                    safe_filename, size_bytes, sha256, local_path, target_folder, target_path,
+                    status, upload_mode, attempt_count
+                ) VALUES (
+                    :id, :code, 1, 'telegram', 'file', 'file.txt', 'file.txt', 1, 'sha',
+                    '/tmp/file.txt', :folder, :target_path, 'failed', :mode, 0
+                )
+                """
+            ),
+            {"id": id_, "code": code, "folder": folder, "target_path": target_path, "mode": mode},
+        )
     events = [
         (1, 1, "upload_copy"),
         (2, 1, "upload_retry"),
@@ -192,6 +216,12 @@ async def _seed(conn: AsyncConnection) -> None:
         (13, 8, "upload_approve"),
         (14, 9, "upload_copy"),
         (15, 10, "upload_copy"),
+        (20, 20, "upload_copy"),
+        (21, 21, "upload_copy"),
+        (22, 22, "upload_copy"),
+        (23, 23, "upload_copy"),
+        (24, 24, "upload_overwrite"),
+        (25, 99, "upload_copy"),
     ]
     for id_, request_id, action in events:
         await conn.execute(
@@ -250,6 +280,28 @@ async def _seed_legacy_0004(conn: AsyncConnection) -> None:
                 """),
             {"id": id_, "code": code, "target_path": target_path},
         )
+    path_rows = [
+        (20, "canonical_no_slash", "/dst", "/dst/file.txt"),
+        (21, "canonical_multi_slash", "/dst///", "/dst/file.txt"),
+        (22, "root_folder", "/", "/file.txt"),
+        (23, "true_copy_no_slash", "/dst", "/copies/file.txt"),
+        (24, "overwrite_no_slash", "/dst", "/dst/file.txt"),
+        (25, "other_audit_no_slash", "/dst", "/dst/file.txt"),
+    ]
+    for id_, code, folder, target_path in path_rows:
+        await conn.execute(
+            text("""
+                INSERT INTO upload_requests (
+                    id, request_code, user_id, source, telegram_file_id, original_filename,
+                    safe_filename, size_bytes, sha256, local_path, target_folder, target_path,
+                    status
+                ) VALUES (
+                    :id, :code, 1, 'telegram', 'file', 'file.txt', 'file.txt', 1, 'sha',
+                    '/tmp/file.txt', :folder, :target_path, 'failed'
+                )
+                """),
+            {"id": id_, "code": code, "folder": folder, "target_path": target_path},
+        )
     events = [
         (1, 1, "upload_copy"),
         (2, 1, "upload_retry"),
@@ -264,6 +316,12 @@ async def _seed_legacy_0004(conn: AsyncConnection) -> None:
         (11, 99, "upload_overwrite"),
         (12, 8, "upload_overwrite"),
         (13, 8, "upload_approve"),
+        (20, 20, "upload_copy"),
+        (21, 21, "upload_copy"),
+        (22, 22, "upload_copy"),
+        (23, 23, "upload_copy"),
+        (24, 24, "upload_overwrite"),
+        (25, 99, "upload_copy"),
     ]
     for id_, request_id, action in events:
         await conn.execute(
@@ -313,6 +371,12 @@ def test_existing_0005_database_is_repaired_by_head(migration_db):
         "same_timestamp": "normal",
         "new_attempt": "normal",
         "new_queued": "normal",
+        "canonical_no_slash": "normal",
+        "canonical_multi_slash": "normal",
+        "root_folder": "normal",
+        "true_copy_no_slash": "copy",
+        "overwrite_no_slash": "overwrite",
+        "other_audit_no_slash": "normal",
     }
 
 
@@ -335,6 +399,12 @@ def test_clean_install_path_runs_0005_to_head_to_same_modes(migration_db):
             "normal": "normal",
             "other_audit": "normal",
             "same_timestamp": "normal",
+            "canonical_no_slash": "normal",
+            "canonical_multi_slash": "normal",
+            "root_folder": "normal",
+            "true_copy_no_slash": "copy",
+            "overwrite_no_slash": "overwrite",
+            "other_audit_no_slash": "normal",
         }
 
     _with_migration_connection(expected_database, check)
@@ -669,6 +739,30 @@ async def _seed_queued_legacy_retries(conn: AsyncConnection) -> None:
             None,
             None,
         ),
+        (
+            123,
+            "queued_canonical_no_slash",
+            "approved",
+            "/dst/file.txt",
+            "copy",
+            0,
+            queued_at,
+            None,
+            None,
+            None,
+        ),
+        (
+            124,
+            "queued_true_copy_no_slash",
+            "approved",
+            "/copies/file.txt",
+            "overwrite",
+            0,
+            queued_at,
+            None,
+            None,
+            None,
+        ),
     ]
     for row in rows:
         await conn.execute(
@@ -680,7 +774,7 @@ async def _seed_queued_legacy_retries(conn: AsyncConnection) -> None:
                     last_attempt_at, worker_token, lease_expires_at
                 ) VALUES (
                     :id, :code, 1, 'telegram', 'file', 'file.txt', 'file.txt', 1, 'sha',
-                    '/tmp/file.txt', '/dst/', :target_path, :status, :mode, :attempts,
+                    '/tmp/file.txt', CASE WHEN :id IN (123, 124) THEN '/dst' ELSE '/dst/' END, :target_path, :status, :mode, :attempts,
                     :queued_at, :created_at, :created_at, :last_attempt_at,
                     :worker_token, :lease_expires_at
                 )
@@ -763,6 +857,10 @@ async def _seed_queued_legacy_retries(conn: AsyncConnection) -> None:
         ),
         (135, 121, "upload_retry", {"upload_mode": "overwrite"}),
         (136, 122, "upload_retry", {"queued_at": queued_at.isoformat()}),
+        (137, 123, "upload_copy"),
+        (138, 123, "upload_retry"),
+        (139, 124, "upload_copy"),
+        (140, 124, "upload_retry"),
     ]
     for event in events:
         id_, request_id, action, *metadata = event
@@ -787,7 +885,7 @@ async def _queued_modes(conn: AsyncConnection) -> dict[str, str]:
             text("""
                 SELECT request_code, upload_mode::text
                 FROM upload_requests
-                WHERE id BETWEEN 101 AND 122
+                WHERE id BETWEEN 101 AND 124
                 ORDER BY id
                 """)
         )
@@ -810,7 +908,7 @@ async def _queued_stable_columns(conn: AsyncConnection) -> dict[str, tuple]:
                     last_attempt_at,
                     target_path
                 FROM upload_requests
-                WHERE id BETWEEN 101 AND 122
+                WHERE id BETWEEN 101 AND 124
                 ORDER BY id
                 """)
         )
@@ -859,6 +957,8 @@ def test_existing_0006_database_repairs_queued_legacy_retries(migration_db):
         "modern_normal_retry": "normal",
         "modern_same_time_mode": "overwrite",
         "modern_same_time_queued": "overwrite",
+        "queued_canonical_no_slash": "normal",
+        "queued_true_copy_no_slash": "copy",
     }
 
     command.downgrade(cfg, "0006_repair_upload_mode_backfill")

@@ -24,7 +24,7 @@ def _legacy_mode(
     Legacy retry reused target_path but called upload with overwrite=False. Therefore it preserves
     copy-path behavior but supersedes overwrite behavior.
     """
-    canonical_path = target_folder + safe_filename
+    canonical_path = target_folder.rstrip("/") + "/" + safe_filename
 
     has_current_copy_marker = False
     has_current_overwrite_marker = False
@@ -78,8 +78,10 @@ def test_0005_backfill_sql_uses_asymmetric_retry_superseding_rules() -> None:
         assert "AND NOT EXISTS" in sql
         assert "ur.status = 'failed'" in sql
 
-    assert "ur.target_path <> ur.target_folder || ur.safe_filename" in copy_sql
-    assert "ur.target_path = ur.target_folder || ur.safe_filename" in overwrite_sql
+    assert "ur.target_path <> rtrim(ur.target_folder, '/') || '/' || ur.safe_filename" in copy_sql
+    assert (
+        "ur.target_path = rtrim(ur.target_folder, '/') || '/' || ur.safe_filename" in overwrite_sql
+    )
     assert "AND al.action IN ('upload_copy', 'upload_copy_path')" in copy_sql
     assert "AND al.action = 'upload_overwrite'" in overwrite_sql
     assert (

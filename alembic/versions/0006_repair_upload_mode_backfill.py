@@ -32,7 +32,7 @@ WITH legacy_failed AS (
             WHEN ur.target_path IS NOT NULL
              AND ur.target_folder IS NOT NULL
              AND ur.safe_filename IS NOT NULL
-             AND ur.target_path <> ur.target_folder || ur.safe_filename
+             AND ur.target_path <> rtrim(ur.target_folder, '/') || '/' || ur.safe_filename
              AND EXISTS (
                 SELECT 1
                 FROM audit_log AS al
@@ -54,7 +54,7 @@ WITH legacy_failed AS (
             WHEN ur.target_path IS NOT NULL
              AND ur.target_folder IS NOT NULL
              AND ur.safe_filename IS NOT NULL
-             AND ur.target_path = ur.target_folder || ur.safe_filename
+             AND ur.target_path = rtrim(ur.target_folder, '/') || '/' || ur.safe_filename
              AND EXISTS (
                 SELECT 1
                 FROM audit_log AS al

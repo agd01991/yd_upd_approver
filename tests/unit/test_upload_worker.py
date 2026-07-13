@@ -440,3 +440,276 @@ async def test_temp_delete_error_after_success_does_not_mark_failed(monkeypatch,
 
     assert not failure_called
     assert notified
+
+
+@pytest.mark.anyio
+async def test_simultaneous_upload_success_heartbeat_error_wins(monkeypatch, tmp_path) -> None:  # noqa: ANN001
+    file_path = tmp_path / "a.txt"
+    file_path.write_text("hello")
+    success_called = False
+    failure_called = False
+    original_wait = asyncio.wait
+
+    async def successful_upload(job, settings):  # noqa: ANN001
+        return True
+
+    async def failing_heartbeat(job, settings, stop):  # noqa: ANN001
+        raise upload_worker.HeartbeatError("heartbeat failed")
+
+    async def deterministic_wait(tasks, return_when):  # noqa: ANN001
+        await asyncio.sleep(0)
+        return set(tasks), set()
+
+    async def fake_finalize_success(job, target_path):  # noqa: ANN001
+        nonlocal success_called
+        success_called = True
+        return True
+
+    async def fake_finalize_failure(job, message):  # noqa: ANN001
+        nonlocal failure_called
+        failure_called = True
+        return True
+
+    monkeypatch.setattr(upload_worker, "_upload_remote", successful_upload)
+    monkeypatch.setattr(upload_worker, "heartbeat", failing_heartbeat)
+    monkeypatch.setattr(upload_worker.asyncio, "wait", deterministic_wait)
+    monkeypatch.setattr(upload_worker, "finalize_success", fake_finalize_success)
+    monkeypatch.setattr(upload_worker, "finalize_failure", fake_finalize_failure)
+
+    await upload_worker.process_job(make_job(tmp_path), Settings(temp_storage_dir=tmp_path))
+
+    monkeypatch.setattr(upload_worker.asyncio, "wait", original_wait)
+    assert not success_called
+    assert not failure_called
+    assert file_path.exists()
+
+
+@pytest.mark.anyio
+async def test_simultaneous_upload_success_lease_lost_wins(monkeypatch, tmp_path) -> None:  # noqa: ANN001
+    success_called = False
+    failure_called = False
+
+    async def successful_upload(job, settings):  # noqa: ANN001
+        return True
+
+    async def lost_heartbeat(job, settings, stop):  # noqa: ANN001
+        raise upload_worker.LeaseLostError("lost")
+
+    async def deterministic_wait(tasks, return_when):  # noqa: ANN001
+        await asyncio.sleep(0)
+        return set(tasks), set()
+
+    async def fake_finalize_success(job, target_path):  # noqa: ANN001
+        nonlocal success_called
+        success_called = True
+        return True
+
+    async def fake_finalize_failure(job, message):  # noqa: ANN001
+        nonlocal failure_called
+        failure_called = True
+        return True
+
+    monkeypatch.setattr(upload_worker, "_upload_remote", successful_upload)
+    monkeypatch.setattr(upload_worker, "heartbeat", lost_heartbeat)
+    monkeypatch.setattr(upload_worker.asyncio, "wait", deterministic_wait)
+    monkeypatch.setattr(upload_worker, "finalize_success", fake_finalize_success)
+    monkeypatch.setattr(upload_worker, "finalize_failure", fake_finalize_failure)
+
+    await upload_worker.process_job(make_job(tmp_path), Settings(temp_storage_dir=tmp_path))
+
+    assert not success_called
+    assert not failure_called
+
+
+@pytest.mark.anyio
+async def test_heartbeat_error_preserved_when_cancel_cleanup_raises(
+    monkeypatch, tmp_path, caplog
+) -> None:  # noqa: ANN001
+    secret = "SUPER_SECRET"
+    upload_cancelled = asyncio.Event()
+    failure_called = False
+
+    async def cleanup_fails_upload(job, settings):  # noqa: ANN001
+        try:
+            await asyncio.sleep(60)
+        except asyncio.CancelledError:
+            upload_cancelled.set()
+            raise RuntimeError(f"cleanup failed token={secret}") from None
+
+    async def failing_heartbeat(job, settings, stop):  # noqa: ANN001
+        raise upload_worker.HeartbeatError("heartbeat failed")
+
+    async def fake_finalize_failure(job, message):  # noqa: ANN001
+        nonlocal failure_called
+        failure_called = True
+        return True
+
+    monkeypatch.setattr(upload_worker, "_upload_remote", cleanup_fails_upload)
+    monkeypatch.setattr(upload_worker, "heartbeat", failing_heartbeat)
+    monkeypatch.setattr(upload_worker, "finalize_failure", fake_finalize_failure)
+
+    with caplog.at_level("WARNING", logger="app.workers.upload_worker"):
+        await upload_worker.process_job(make_job(tmp_path), Settings(temp_storage_dir=tmp_path))
+
+    assert upload_cancelled.is_set()
+    assert not failure_called
+    assert "category=RuntimeError" in caplog.text
+    assert secret not in caplog.text
+
+
+@pytest.mark.anyio
+async def test_lease_lost_preserved_when_cancel_cleanup_raises(
+    monkeypatch, tmp_path, caplog
+) -> None:  # noqa: ANN001
+    secret = "SUPER_SECRET"
+    failure_called = False
+
+    async def cleanup_fails_upload(job, settings):  # noqa: ANN001
+        try:
+            await asyncio.sleep(60)
+        except asyncio.CancelledError:
+            raise RuntimeError(f"cleanup failed token={secret}") from None
+
+    async def lost_heartbeat(job, settings, stop):  # noqa: ANN001
+        raise upload_worker.LeaseLostError("lost")
+
+    async def fake_finalize_failure(job, message):  # noqa: ANN001
+        nonlocal failure_called
+        failure_called = True
+        return True
+
+    monkeypatch.setattr(upload_worker, "_upload_remote", cleanup_fails_upload)
+    monkeypatch.setattr(upload_worker, "heartbeat", lost_heartbeat)
+    monkeypatch.setattr(upload_worker, "finalize_failure", fake_finalize_failure)
+
+    with caplog.at_level("WARNING", logger="app.workers.upload_worker"):
+        await upload_worker.process_job(make_job(tmp_path), Settings(temp_storage_dir=tmp_path))
+
+    assert not failure_called
+    assert "category=RuntimeError" in caplog.text
+    assert secret not in caplog.text
+
+
+@pytest.mark.anyio
+async def test_run_upload_success_waits_for_clean_heartbeat_stop(monkeypatch, tmp_path) -> None:  # noqa: ANN001
+    async def successful_upload(job, settings):  # noqa: ANN001
+        return True
+
+    async def clean_heartbeat(job, settings, stop):  # noqa: ANN001
+        await stop.wait()
+
+    monkeypatch.setattr(upload_worker, "_upload_remote", successful_upload)
+    monkeypatch.setattr(upload_worker, "heartbeat", clean_heartbeat)
+
+    assert (
+        await upload_worker._run_upload_with_heartbeat(
+            make_job(tmp_path), Settings(temp_storage_dir=tmp_path)
+        )
+        is True
+    )
+
+
+@pytest.mark.anyio
+async def test_upload_success_final_heartbeat_error_wins(monkeypatch, tmp_path) -> None:  # noqa: ANN001
+    async def successful_upload(job, settings):  # noqa: ANN001
+        return True
+
+    async def final_failing_heartbeat(job, settings, stop):  # noqa: ANN001
+        await stop.wait()
+        raise upload_worker.HeartbeatError("final heartbeat failed")
+
+    monkeypatch.setattr(upload_worker, "_upload_remote", successful_upload)
+    monkeypatch.setattr(upload_worker, "heartbeat", final_failing_heartbeat)
+
+    with pytest.raises(upload_worker.HeartbeatError):
+        await upload_worker._run_upload_with_heartbeat(
+            make_job(tmp_path), Settings(temp_storage_dir=tmp_path)
+        )
+
+
+@pytest.mark.anyio
+async def test_heartbeat_stops_early_cancels_upload(monkeypatch, tmp_path) -> None:  # noqa: ANN001
+    upload_cancelled = asyncio.Event()
+
+    async def blocking_upload(job, settings):  # noqa: ANN001
+        try:
+            await asyncio.sleep(60)
+        except asyncio.CancelledError:
+            upload_cancelled.set()
+            raise
+
+    async def early_heartbeat(job, settings, stop):  # noqa: ANN001
+        return None
+
+    monkeypatch.setattr(upload_worker, "_upload_remote", blocking_upload)
+    monkeypatch.setattr(upload_worker, "heartbeat", early_heartbeat)
+
+    with pytest.raises(upload_worker.HeartbeatError, match="heartbeat stopped early"):
+        await upload_worker._run_upload_with_heartbeat(
+            make_job(tmp_path), Settings(temp_storage_dir=tmp_path)
+        )
+    assert upload_cancelled.is_set()
+
+
+@pytest.mark.anyio
+async def test_upload_error_preserved_when_heartbeat_stops_cleanly(monkeypatch, tmp_path) -> None:  # noqa: ANN001
+    upload_exc = upload_worker.YandexNetworkError("network")
+
+    async def failing_upload(job, settings):  # noqa: ANN001
+        raise upload_exc
+
+    async def clean_heartbeat(job, settings, stop):  # noqa: ANN001
+        await stop.wait()
+
+    monkeypatch.setattr(upload_worker, "_upload_remote", failing_upload)
+    monkeypatch.setattr(upload_worker, "heartbeat", clean_heartbeat)
+
+    with pytest.raises(upload_worker.YandexNetworkError) as exc_info:
+        await upload_worker._run_upload_with_heartbeat(
+            make_job(tmp_path), Settings(temp_storage_dir=tmp_path)
+        )
+    assert exc_info.value is upload_exc
+
+
+@pytest.mark.anyio
+async def test_external_cancellation_awaits_upload_and_heartbeat(monkeypatch, tmp_path) -> None:  # noqa: ANN001
+    upload_cancelled = asyncio.Event()
+    heartbeat_cancelled = asyncio.Event()
+    upload_done = asyncio.Event()
+    heartbeat_done = asyncio.Event()
+
+    async def blocking_upload(job, settings):  # noqa: ANN001
+        try:
+            await asyncio.sleep(60)
+        except asyncio.CancelledError:
+            upload_cancelled.set()
+            raise
+        finally:
+            upload_done.set()
+
+    async def blocking_heartbeat(job, settings, stop):  # noqa: ANN001
+        try:
+            await asyncio.sleep(60)
+        except asyncio.CancelledError:
+            heartbeat_cancelled.set()
+            raise
+        finally:
+            heartbeat_done.set()
+
+    monkeypatch.setattr(upload_worker, "_upload_remote", blocking_upload)
+    monkeypatch.setattr(upload_worker, "heartbeat", blocking_heartbeat)
+
+    task = asyncio.create_task(
+        upload_worker._run_upload_with_heartbeat(
+            make_job(tmp_path), Settings(temp_storage_dir=tmp_path)
+        )
+    )
+    await asyncio.sleep(0)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert upload_cancelled.is_set()
+    assert heartbeat_cancelled.is_set()
+    assert upload_done.is_set()
+    assert heartbeat_done.is_set()
