@@ -125,8 +125,13 @@ async def test_api_repeated_terminal_moderation_is_noop(monkeypatch, action, sta
     async def fake_outbox(*args, **kwargs):
         calls["outbox"] += 1
 
+    def fake_user_json(received_user):
+        assert session.rolled_back is False
+        return {"id": received_user.id, "status": received_user.status.value}
+
     monkeypatch.setattr("app.api.routes.admin.write_audit", fake_audit)
     monkeypatch.setattr("app.api.routes.admin.enqueue_telegram_event", fake_outbox)
+    monkeypatch.setattr("app.api.routes.admin.user_json", fake_user_json)
     result = await _moderate_user(1, action, 99, session, Settings(), bot=None)
     assert result["status"] == status.value
     assert calls == {"audit": 0, "outbox": 0}

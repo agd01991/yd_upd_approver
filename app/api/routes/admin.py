@@ -233,13 +233,15 @@ async def _moderate_user(
             await client.close()
     elif action == "reject":
         if user.status == UserStatus.rejected:
+            response = user_json(user)
             await session.rollback()
-            return user_json(user)
+            return response
         user.status = UserStatus.rejected
     else:
         if user.status == UserStatus.blocked:
+            response = user_json(user)
             await session.rollback()
-            return user_json(user)
+            return response
         user.status = UserStatus.blocked
     await write_audit(
         session,
