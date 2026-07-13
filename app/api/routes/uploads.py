@@ -106,26 +106,26 @@ async def create_upload(
     finally:
         await client.close()
     target_path = join_disk_path(target_folder, safe)
-    upload = await create_upload_request(
-        session,
-        request_code=request_code,
-        user_id=user.id,
-        source="mini_app",
-        telegram_file_id=None,
-        telegram_file_unique_id=None,
-        original_filename=file.filename or safe,
-        safe_filename=safe,
-        mime_type=file.content_type,
-        size_bytes=size,
-        sha256=storage.sha256(destination),
-        caption=caption,
-        local_path=str(destination),
-        target_folder=target_folder,
-        target_path=target_path,
-        source_event_key=source_event_key,
-    )
-    await enqueue_admin_upload_pending(session, settings, upload, user)
     try:
+        upload = await create_upload_request(
+            session,
+            request_code=request_code,
+            user_id=user.id,
+            source="mini_app",
+            telegram_file_id=None,
+            telegram_file_unique_id=None,
+            original_filename=file.filename or safe,
+            safe_filename=safe,
+            mime_type=file.content_type,
+            size_bytes=size,
+            sha256=storage.sha256(destination),
+            caption=caption,
+            local_path=str(destination),
+            target_folder=target_folder,
+            target_path=target_path,
+            source_event_key=source_event_key,
+        )
+        await enqueue_admin_upload_pending(session, settings, upload, user)
         await session.commit()
     except IntegrityError:
         await session.rollback()
