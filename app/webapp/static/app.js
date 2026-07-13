@@ -18,6 +18,7 @@ let renameFolderCandidates = [];
 let renameSelectionVersion = 0;
 let selectedUploadEntries = [];
 let uploadInProgress = false;
+let idempotencyFallbackCounter = 0;
 
 const STATUS_LABELS = {
   pending: "ожидает одобрения",
@@ -171,8 +172,40 @@ async function renderUser(me) {
   await loadUserLists();
 }
 
+function createIdempotencyKey() {
+  const cryptoApi = globalThis.crypto;
+  if (typeof cryptoApi?.randomUUID === "function") {
+    try {
+      const uuid = cryptoApi.randomUUID();
+      if (/^[A-Za-z0-9._:-]{1,128}$/.test(uuid)) return uuid;
+    } catch {
+      // Fall through to Web Crypto byte generation for older WebViews.
+    }
+  }
+  if (typeof cryptoApi?.getRandomValues === "function") {
+    try {
+      const bytes = new Uint8Array(16);
+      cryptoApi.getRandomValues(bytes);
+      const hex = Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
+      return `webcrypto-${hex}`;
+    } catch {
+      // Fall through to the local non-cryptographic fallback.
+    }
+  }
+
+  idempotencyFallbackCounter += 1;
+  const timestamp = Date.now().toString(36);
+  const counter = idempotencyFallbackCounter.toString(36);
+  const perf = typeof globalThis.performance?.now === "function"
+    ? Math.floor(globalThis.performance.now() * 1000).toString(36)
+    : "0";
+  const random = Array.from({ length: 4 }, () => Math.random().toString(36).slice(2)).join("");
+  const key = `local-${timestamp}-${counter}-${perf}-${random}`.replace(/[^A-Za-z0-9._:-]/g, "").slice(0, 128);
+  return key || `local-${timestamp}-${counter}`.slice(0, 128);
+}
+
 function createUploadEntry(file) {
-  return { file, idempotencyKey: crypto.randomUUID(), status: "pending", error: "" };
+  return { file, idempotencyKey: createIdempotencyKey(), status: "pending", error: "" };
 }
 
 function setSelectedUploadFiles(files) {
@@ -216,6 +249,12 @@ async function uploadSelectedFiles(event, form, input) {
       const file = entry.file;
       entry.status = "uploading";
       msg.textContent = `Загружается ${index + 1} из ${files.length}: ${file.name}`;
+      if (!/^[A-Za-z0-9._:-]{1,128}$/.test(entry.idempotencyKey || "")) {
+        entry.status = "failed";
+        entry.error = "Не удалось подготовить безопасный ключ загрузки. Выберите файл заново и повторите попытку.";
+        results.push(`❌ ${file.name}: ${entry.error}`);
+        continue;
+      }
       const fd = new FormData();
       fd.append("file", file);
       fd.append("caption", caption);

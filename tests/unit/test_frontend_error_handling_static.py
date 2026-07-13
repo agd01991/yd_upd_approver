@@ -41,8 +41,10 @@ def test_upload_entries_retain_idempotency_keys_for_retry() -> None:
     js = source()
     assert "let selectedUploadEntries = [];" in js
     assert "let uploadInProgress = false;" in js
+    assert "let idempotencyFallbackCounter = 0;" in js
+    assert "function createIdempotencyKey()" in js
     assert "function createUploadEntry(file)" in js
-    assert "idempotencyKey: crypto.randomUUID()" in js
+    assert "idempotencyKey: createIdempotencyKey()" in js
     assert (
         "selectedUploadEntries = Array.from(files || []).map((file) => createUploadEntry(file));"
         in js
@@ -50,6 +52,7 @@ def test_upload_entries_retain_idempotency_keys_for_retry() -> None:
     upload_body = js[
         js.index("async function uploadSelectedFiles") : js.index("async function loadUserLists")
     ]
+    assert "createIdempotencyKey()" not in upload_body
     assert "crypto.randomUUID()" not in upload_body
     assert 'headers: { "Idempotency-Key": entry.idempotencyKey }' in upload_body
     assert 'entry.status = "failed";' in upload_body
@@ -62,6 +65,43 @@ def test_upload_entries_retain_idempotency_keys_for_retry() -> None:
         in upload_body
     )
     assert "form.reset();" not in upload_body
+
+
+def test_create_idempotency_key_has_webview_safe_fallbacks() -> None:
+    js = source()
+    helper_body = js[
+        js.index("function createIdempotencyKey") : js.index("function createUploadEntry")
+    ]
+    assert 'typeof cryptoApi?.randomUUID === "function"' in helper_body
+    assert "cryptoApi.randomUUID()" in helper_body
+    assert "catch {" in helper_body
+    assert 'typeof cryptoApi?.getRandomValues === "function"' in helper_body
+    assert "new Uint8Array(16)" in helper_body
+    assert "cryptoApi.getRandomValues(bytes)" in helper_body
+    assert 'toString(16).padStart(2, "0")' in helper_body
+    assert "webcrypto-${hex}" in helper_body
+    assert "idempotencyFallbackCounter += 1;" in helper_body
+    assert "Date.now()" in helper_body
+    assert "globalThis.performance?.now" in helper_body
+    assert "Math.random()" in helper_body
+    assert ".slice(0, 128)" in helper_body
+    assert "/^[A-Za-z0-9._:-]{1,128}$/" in helper_body
+    assert "btoa" not in helper_body
+    assert "base64" not in helper_body.lower()
+    assert "+" not in "webcrypto-${hex}"
+
+
+def test_upload_rejects_invalid_idempotency_key_before_request() -> None:
+    js = source()
+    upload_body = js[
+        js.index("async function uploadSelectedFiles") : js.index("async function loadUserLists")
+    ]
+    validation_index = upload_body.index(
+        'if (!/^[A-Za-z0-9._:-]{1,128}$/.test(entry.idempotencyKey || ""))'
+    )
+    api_index = upload_body.index('await api("/api/uploads"')
+    assert validation_index < api_index
+    assert "Не удалось подготовить безопасный ключ загрузки" in upload_body
 
 
 def test_upload_new_selection_replaces_entries_with_new_keys() -> None:
