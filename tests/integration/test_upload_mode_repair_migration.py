@@ -290,7 +290,7 @@ def test_existing_0005_database_is_repaired_by_head(migration_db):
     async def check_head(conn: AsyncConnection) -> dict[str, str]:
         assert (
             await conn.execute(text("SELECT version_num FROM alembic_version"))
-        ).scalar_one() == "0007_repair_queued_legacy_retries"
+        ).scalar_one() == "0007_repair_queued_retries"
         return await _modes(conn)
 
     expected = _with_migration_connection(expected_database, check_head)
@@ -324,7 +324,7 @@ def test_clean_install_path_runs_0005_to_head_to_same_modes(migration_db):
     async def check(conn: AsyncConnection) -> None:
         assert (
             await conn.execute(text("SELECT version_num FROM alembic_version"))
-        ).scalar_one() == "0007_repair_queued_legacy_retries"
+        ).scalar_one() == "0007_repair_queued_retries"
         assert await _modes(conn) == {
             "copy_retry": "copy",
             "copy_path_approve": "copy",
@@ -402,6 +402,18 @@ async def _seed_queued_legacy_retries(conn: AsyncConnection) -> None:
     lease = datetime(2026, 7, 13, 1, tzinfo=UTC)
     last_attempt = datetime(2026, 7, 13, 2, tzinfo=UTC)
     rows = [
+        (
+            99,
+            "unrelated_request",
+            "failed",
+            "/dst/unrelated.txt",
+            "normal",
+            0,
+            None,
+            None,
+            None,
+            None,
+        ),
         (
             101,
             "queued_overwrite_retry",
@@ -666,7 +678,7 @@ def test_existing_0006_database_repairs_queued_legacy_retries(migration_db):
     command.upgrade(cfg, "head")
 
     async def check(conn: AsyncConnection) -> dict[str, str]:
-        assert await _revision(conn) == "0007_repair_queued_legacy_retries"
+        assert await _revision(conn) == "0007_repair_queued_retries"
         return await _queued_modes(conn)
 
     expected = _with_migration_connection(expected_database, check)
@@ -692,7 +704,7 @@ def test_existing_0006_database_repairs_queued_legacy_retries(migration_db):
     command.upgrade(cfg, "head")
 
     async def check_idempotent(conn: AsyncConnection) -> None:
-        assert await _revision(conn) == "0007_repair_queued_legacy_retries"
+        assert await _revision(conn) == "0007_repair_queued_retries"
         assert await _queued_modes(conn) == expected
 
     _with_migration_connection(expected_database, check_idempotent)
