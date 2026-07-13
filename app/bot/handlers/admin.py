@@ -271,6 +271,10 @@ async def user_callback(
             user_id=user.id,
         )
     elif callback_data.action == "reject":
+        if user.status == UserStatus.rejected:
+            await session.rollback()
+            await callback.answer("Пользователь уже отклонён")
+            return
         user.status = UserStatus.rejected
         await enqueue_telegram_event(
             session,
@@ -281,6 +285,10 @@ async def user_callback(
             user_id=user.id,
         )
     elif callback_data.action == "block":
+        if user.status == UserStatus.blocked:
+            await session.rollback()
+            await callback.answer("Пользователь уже заблокирован")
+            return
         user.status = UserStatus.blocked
         await enqueue_telegram_event(
             session,

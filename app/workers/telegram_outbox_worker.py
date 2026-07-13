@@ -24,6 +24,7 @@ from app.bot.keyboards import upload_keyboard, user_moderation_keyboard
 from app.config import Settings, get_settings
 from app.db.models import TelegramOutbox, TelegramOutboxStatus, UploadRequest, UploadStatus, User
 from app.db.session import SessionLocal
+from app.logging_config import redact_text
 from app.utils.formatting import format_upload_card, format_upload_result, format_user_card
 
 logger = logging.getLogger(__name__)
@@ -35,7 +36,13 @@ def _now() -> datetime:
 
 
 def _safe_error(exc: Exception) -> str:
-    return f"{exc.__class__.__name__}: {str(exc).splitlines()[0][:300]}"
+    try:
+        text = redact_text(str(exc)).strip()
+        first_line = next((line.strip() for line in text.splitlines() if line.strip()), "")
+        detail = first_line[:300] or "no error details"
+        return f"{exc.__class__.__name__}: {detail}"
+    except Exception:
+        return f"{exc.__class__.__name__}: no error details"
 
 
 def _backoff(settings: Settings, attempts: int, retry_after: int | None = None) -> datetime:
@@ -174,18 +181,36 @@ async def _render(session: AsyncSession, event: TelegramOutbox):
         return format_upload_result(upload), markup
     if event.event_type == "user_moderation_result":
         status = event.payload.get("status")
+        user = await session.get(User, event.user_id or event.payload.get("user_id"))
+        if not user or status not in {"active", "rejected", "blocked"}:
+            return None
+        if user.status.value != status:
+            return None
         text = {
             "active": "Ваш доступ одобрен. Можете отправлять файлы.",
             "rejected": "Ваша заявка на доступ отклонена.",
             "blocked": "Ваш доступ заблокирован администратором.",
-        }.get(status)
-        return (text, None) if text else None
+        }[status]
+        return text, None
     if event.event_type in {"folder_rename_result", "admin_folder_rename_pending"}:
         return event.payload.get("text"), None
     return None
 
 
-async def dispatch_event(bot: Bot, event: TelegramOutbox) -> None:
+ADMIN_TARGETED_EVENT_TYPES = {
+    "admin_user_pending",
+    "admin_upload_pending",
+    "admin_folder_rename_pending",
+    "upload_result_admin",
+}
+
+
+async def dispatch_event(bot: Bot, event: TelegramOutbox, settings: Settings) -> None:
+    if event.event_type in ADMIN_TARGETED_EVENT_TYPES and event.recipient_telegram_id not in set(
+        settings.telegram_admin_ids
+    ):
+        await mark_discarded(event.id, event.lock_token or "", "recipient is no longer admin")
+        return
     async with SessionLocal() as session:
         rendered = await _render(session, event)
     if not rendered or not rendered[0]:
@@ -218,7 +243,7 @@ async def run(stop: asyncio.Event, settings: Settings) -> None:
                     )
                 continue
             try:
-                await dispatch_event(bot, event)
+                await dispatch_event(bot, event, settings)
             except TelegramRetryAfter as exc:
                 await mark_failed(event, settings, exc, retry_after=exc.retry_after)
             except (TelegramForbiddenError, TelegramBadRequest) as exc:

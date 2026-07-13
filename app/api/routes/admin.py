@@ -200,7 +200,11 @@ async def admin_rename_folder(
 async def _moderate_user(
     user_id: int, action: str, actor: int, session: AsyncSession, settings: Settings, bot=None
 ) -> dict:
-    user = await session.get(User, user_id)
+    if hasattr(session, "execute"):
+        result = await session.execute(select(User).where(User.id == user_id).with_for_update())
+        user = result.scalar_one_or_none()
+    else:
+        user = await session.get(User, user_id)
     if not user:
         raise ApiError(404, "user_not_found", "Пользователь не найден.")
     old = user.status.value
@@ -228,8 +232,16 @@ async def _moderate_user(
         finally:
             await client.close()
     elif action == "reject":
+        if user.status == UserStatus.rejected:
+            response = user_json(user)
+            await session.rollback()
+            return response
         user.status = UserStatus.rejected
     else:
+        if user.status == UserStatus.blocked:
+            response = user_json(user)
+            await session.rollback()
+            return response
         user.status = UserStatus.blocked
     await write_audit(
         session,
