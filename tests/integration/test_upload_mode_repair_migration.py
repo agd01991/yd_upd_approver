@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 from collections.abc import Awaitable, Callable
@@ -399,6 +400,7 @@ async def _seed_queued_legacy_retries(conn: AsyncConnection) -> None:
             """)
     )
     queued_at = datetime(2026, 7, 13, tzinfo=UTC)
+    modern_queued_at = datetime(2026, 7, 13, 3, tzinfo=UTC)
     lease = datetime(2026, 7, 13, 1, tzinfo=UTC)
     last_attempt = datetime(2026, 7, 13, 2, tzinfo=UTC)
     rows = [
@@ -583,6 +585,90 @@ async def _seed_queued_legacy_retries(conn: AsyncConnection) -> None:
             None,
             None,
         ),
+        (
+            116,
+            "legacy_null_metadata",
+            "approved",
+            "/dst/file.txt",
+            "overwrite",
+            0,
+            queued_at,
+            None,
+            None,
+            None,
+        ),
+        (
+            117,
+            "legacy_status_metadata",
+            "approved",
+            "/dst/file.txt",
+            "overwrite",
+            0,
+            queued_at,
+            None,
+            None,
+            None,
+        ),
+        (
+            118,
+            "modern_overwrite_retry",
+            "approved",
+            "/dst/file.txt",
+            "overwrite",
+            0,
+            modern_queued_at,
+            None,
+            None,
+            None,
+        ),
+        (
+            119,
+            "modern_copy_retry",
+            "approved",
+            "/dst/file-copy.txt",
+            "copy",
+            0,
+            modern_queued_at,
+            None,
+            None,
+            None,
+        ),
+        (
+            120,
+            "modern_normal_retry",
+            "approved",
+            "/dst/file.txt",
+            "normal",
+            0,
+            modern_queued_at,
+            None,
+            None,
+            None,
+        ),
+        (
+            121,
+            "modern_same_time_mode",
+            "approved",
+            "/dst/file.txt",
+            "overwrite",
+            0,
+            queued_at,
+            None,
+            None,
+            None,
+        ),
+        (
+            122,
+            "modern_same_time_queued",
+            "approved",
+            "/dst/file.txt",
+            "overwrite",
+            0,
+            queued_at,
+            None,
+            None,
+            None,
+        ),
     ]
     for row in rows:
         await conn.execute(
@@ -590,12 +676,13 @@ async def _seed_queued_legacy_retries(conn: AsyncConnection) -> None:
                 INSERT INTO upload_requests (
                     id, request_code, user_id, source, telegram_file_id, original_filename,
                     safe_filename, size_bytes, sha256, local_path, target_folder, target_path,
-                    status, upload_mode, attempt_count, queued_at, last_attempt_at,
-                    worker_token, lease_expires_at
+                    status, upload_mode, attempt_count, queued_at, approved_at, created_at,
+                    last_attempt_at, worker_token, lease_expires_at
                 ) VALUES (
                     :id, :code, 1, 'telegram', 'file', 'file.txt', 'file.txt', 1, 'sha',
                     '/tmp/file.txt', '/dst/', :target_path, :status, :mode, :attempts,
-                    :queued_at, :last_attempt_at, :worker_token, :lease_expires_at
+                    :queued_at, :created_at, :created_at, :last_attempt_at,
+                    :worker_token, :lease_expires_at
                 )
                 """),
             {
@@ -606,6 +693,7 @@ async def _seed_queued_legacy_retries(conn: AsyncConnection) -> None:
                 "mode": row[4],
                 "attempts": row[5],
                 "queued_at": row[6],
+                "created_at": queued_at,
                 "last_attempt_at": row[7],
                 "worker_token": row[8],
                 "lease_expires_at": row[9],
@@ -639,16 +727,57 @@ async def _seed_queued_legacy_retries(conn: AsyncConnection) -> None:
         (125, 113, "upload_approve"),
         (126, 114, "upload_overwrite"),
         (127, 114, "upload_retry"),
-        (128, 115, "upload_overwrite"),
-        (129, 115, "upload_retry"),
+        (128, 115, "upload_overwrite", {}),
+        (129, 115, "upload_retry", {}),
+        (130, 116, "upload_retry", None),
+        (131, 117, "upload_retry", {"status": "approved"}),
+        (
+            132,
+            118,
+            "upload_retry",
+            {
+                "status": "approved",
+                "upload_mode": "overwrite",
+                "queued_at": modern_queued_at.isoformat(),
+            },
+        ),
+        (
+            133,
+            119,
+            "upload_retry",
+            {
+                "status": "approved",
+                "upload_mode": "copy",
+                "queued_at": modern_queued_at.isoformat(),
+            },
+        ),
+        (
+            134,
+            120,
+            "upload_retry",
+            {
+                "status": "approved",
+                "upload_mode": "normal",
+                "queued_at": modern_queued_at.isoformat(),
+            },
+        ),
+        (135, 121, "upload_retry", {"upload_mode": "overwrite"}),
+        (136, 122, "upload_retry", {"queued_at": queued_at.isoformat()}),
     ]
-    for id_, request_id, action in events:
+    for event in events:
+        id_, request_id, action, *metadata = event
+        new_value = metadata[0] if metadata else {}
         await conn.execute(
             text("""
                 INSERT INTO audit_log (id, actor_telegram_id, action, request_id, user_id, old_value, new_value, created_at)
-                VALUES (:id, 1, :action, :request_id, 1, '{}'::jsonb, '{}'::jsonb, '2026-07-13T00:00:00Z')
+                VALUES (:id, 1, :action, :request_id, 1, '{}'::jsonb, CAST(:new_value AS jsonb), '2026-07-13T00:00:00Z')
                 """),
-            {"id": id_, "request_id": request_id, "action": action},
+            {
+                "id": id_,
+                "request_id": request_id,
+                "action": action,
+                "new_value": None if new_value is None else json.dumps(new_value),
+            },
         )
 
 
@@ -658,7 +787,7 @@ async def _queued_modes(conn: AsyncConnection) -> dict[str, str]:
             text("""
                 SELECT request_code, upload_mode::text
                 FROM upload_requests
-                WHERE id BETWEEN 101 AND 115
+                WHERE id BETWEEN 101 AND 122
                 ORDER BY id
                 """)
         )
@@ -666,26 +795,53 @@ async def _queued_modes(conn: AsyncConnection) -> dict[str, str]:
     return dict(rows)
 
 
+async def _queued_stable_columns(conn: AsyncConnection) -> dict[str, tuple]:
+    rows = (
+        await conn.execute(
+            text("""
+                SELECT
+                    request_code,
+                    status::text,
+                    queued_at,
+                    approved_at,
+                    attempt_count,
+                    worker_token,
+                    lease_expires_at,
+                    last_attempt_at,
+                    target_path
+                FROM upload_requests
+                WHERE id BETWEEN 101 AND 122
+                ORDER BY id
+                """)
+        )
+    ).all()
+    return {row[0]: tuple(row[1:]) for row in rows}
+
+
 def test_existing_0006_database_repairs_queued_legacy_retries(migration_db):
     cfg, expected_database = migration_db
     command.upgrade(cfg, "0006_repair_upload_mode_backfill")
 
-    async def seed_and_check(conn: AsyncConnection) -> None:
+    async def seed_and_check(conn: AsyncConnection) -> dict[str, tuple]:
         await _seed_queued_legacy_retries(conn)
         assert await _revision(conn) == "0006_repair_upload_mode_backfill"
+        return await _queued_stable_columns(conn)
 
-    _with_migration_connection(expected_database, seed_and_check)
+    before_stable_columns = _with_migration_connection(expected_database, seed_and_check)
     command.upgrade(cfg, "head")
 
-    async def check(conn: AsyncConnection) -> dict[str, str]:
+    async def check(conn: AsyncConnection) -> tuple[dict[str, str], dict[str, tuple]]:
         assert await _revision(conn) == "0007_repair_queued_retries"
-        return await _queued_modes(conn)
+        return await _queued_modes(conn), await _queued_stable_columns(conn)
 
-    expected = _with_migration_connection(expected_database, check)
+    expected, after_stable_columns = _with_migration_connection(expected_database, check)
+    assert after_stable_columns == before_stable_columns
     assert expected == {
         "queued_overwrite_retry": "normal",
         "queued_copy_retry": "copy",
         "queued_normal_retry": "normal",
+        "legacy_null_metadata": "normal",
+        "legacy_status_metadata": "normal",
         "explicit_overwrite": "overwrite",
         "explicit_copy": "copy",
         "explicit_approve": "normal",
@@ -698,6 +854,11 @@ def test_existing_0006_database_repairs_queued_legacy_retries(migration_db):
         "newer_after_retry": "overwrite",
         "uploaded_retry": "overwrite",
         "rejected_retry": "overwrite",
+        "modern_overwrite_retry": "overwrite",
+        "modern_copy_retry": "copy",
+        "modern_normal_retry": "normal",
+        "modern_same_time_mode": "overwrite",
+        "modern_same_time_queued": "overwrite",
     }
 
     command.downgrade(cfg, "0006_repair_upload_mode_backfill")
