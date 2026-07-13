@@ -123,8 +123,9 @@ async def create_my_folder_rename_request(
             recipient_telegram_id=admin_id,
             dedup_key=f"folder-rename:{req.id}:pending:admin:{admin_id}",
             payload={
+                "folder_rename_request_id": req.id,
                 "text": format_folder_rename_request(req, user)
-                + "\nОткройте Mini App → Заявки на переименование."
+                + "\nОткройте Mini App → Заявки на переименование.",
             },
             user_id=user.id,
         )

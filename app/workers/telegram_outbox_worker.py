@@ -22,7 +22,15 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.bot.keyboards import upload_keyboard, user_moderation_keyboard
 from app.config import Settings, get_settings
-from app.db.models import TelegramOutbox, TelegramOutboxStatus, UploadRequest, UploadStatus, User
+from app.db.models import (
+    FolderRenameRequest,
+    FolderRenameRequestStatus,
+    TelegramOutbox,
+    TelegramOutboxStatus,
+    UploadRequest,
+    UploadStatus,
+    User,
+)
 from app.db.session import SessionLocal
 from app.logging_config import redact_text
 from app.utils.formatting import format_upload_card, format_upload_result, format_user_card
@@ -192,7 +200,22 @@ async def _render(session: AsyncSession, event: TelegramOutbox):
             "blocked": "Ваш доступ заблокирован администратором.",
         }[status]
         return text, None
-    if event.event_type in {"folder_rename_result", "admin_folder_rename_pending"}:
+    if event.event_type == "admin_folder_rename_pending":
+        request_id = event.payload.get("folder_rename_request_id")
+        if not isinstance(request_id, int) or isinstance(request_id, bool):
+            return None
+        rename_request = await session.get(FolderRenameRequest, request_id)
+        text = event.payload.get("text")
+        if (
+            not rename_request
+            or rename_request.status != FolderRenameRequestStatus.pending
+            or (event.user_id is not None and rename_request.user_id != event.user_id)
+            or not isinstance(text, str)
+            or not text.strip()
+        ):
+            return None
+        return text, None
+    if event.event_type == "folder_rename_result":
         return event.payload.get("text"), None
     return None
 
