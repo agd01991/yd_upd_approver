@@ -14,7 +14,7 @@
 docker compose up --build
 ```
 
-Compose запускает PostgreSQL с healthcheck, затем one-shot сервис `migrate` выполняет `alembic upgrade head`, и только после успешного завершения миграций стартуют `api` и `bot`. `api` и `bot` не запускают Alembic самостоятельно.
+Compose запускает PostgreSQL с healthcheck, затем one-shot сервис `migrate` выполняет `alembic upgrade head`, и только после успешного завершения миграций стартуют `api`, `bot`, `outbox-worker`, `worker` и зависимости. `api` и `bot` не запускают Alembic самостоятельно.
 
 Если локальная БД уже была частично обновлена старой версией Compose после race condition, обычно достаточно повторить запуск без удаления PostgreSQL volume:
 
@@ -26,7 +26,7 @@ docker compose up --build
 
 ```bash
 docker compose up -d migrate
-docker compose up -d api bot
+docker compose up -d api bot outbox-worker worker
 ```
 
 Не используйте `docker compose down -v` как основной способ восстановления, потому что он удаляет локальные данные PostgreSQL.
@@ -37,11 +37,21 @@ docker compose up -d api bot
 alembic upgrade head
 ```
 
-## 4. Non-Docker local: запуск бота или API
+## 4. Non-Docker local: запуск бота и outbox worker
+
+После миграций одновременно держите запущенными два процесса. Терминал 1 — бот принимает Telegram updates и пишет durable-события в PostgreSQL:
 
 ```bash
 python -m app.main
 ```
+
+Терминал 2 — отдельный worker доставляет Telegram outbox notifications:
+
+```bash
+python -m app.workers.telegram_outbox_worker
+```
+
+Один только `python -m app.main` не доставляет durable outbox notifications, поэтому администратор не получит moderation card без worker.
 
 или API:
 

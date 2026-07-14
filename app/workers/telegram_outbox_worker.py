@@ -174,6 +174,12 @@ async def _render(session: AsyncSession, event: TelegramOutbox):
         )
         if not upload:
             return None
+        if event.event_type in {"upload_result_admin", "upload_result_user"}:
+            expected_attempt = event.payload.get("attempt_count")
+            if not isinstance(expected_attempt, int) or isinstance(expected_attempt, bool):
+                return None
+            if expected_attempt < 0 or expected_attempt != (upload.attempt_count or 0):
+                return None
         expected = event.payload.get("status")
         if expected and upload.status.value != expected:
             return None

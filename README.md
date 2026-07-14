@@ -23,8 +23,13 @@ python -m venv .venv
 source .venv/bin/activate
 pip install -e ".[dev]"
 alembic upgrade head
+# Терминал 1: Telegram polling bot (принимает updates и пишет durable-события в PostgreSQL)
 python -m app.main
+# Терминал 2: Telegram outbox delivery (доставляет уведомления администраторам и пользователям)
+python -m app.workers.telegram_outbox_worker
 ```
+
+Оба non-Docker процесса должны оставаться запущенными: `python -m app.main` сам не доставляет durable outbox notifications.
 
 Docker:
 
@@ -34,12 +39,25 @@ docker compose up --build
 
 В Docker Compose миграции выполняет отдельный one-shot сервис `migrate`. Он ждёт healthy-состояния PostgreSQL, один раз запускает `alembic upgrade head`, а сервисы `api` и `bot` стартуют только после успешного завершения миграций. `api` и `bot` больше не запускают Alembic параллельно, поэтому при `docker compose up --build` не возникает race condition на создании таблиц.
 
-Для non-Docker local запуска миграции по-прежнему выполняются вручную перед стартом нужного процесса:
+Для non-Docker local запуска миграции по-прежнему выполняются вручную, затем одновременно запускаются два долгоживущих процесса:
 
 ```bash
 alembic upgrade head
+```
+
+Терминал 1 — бот принимает Telegram updates и записывает события в PostgreSQL:
+
+```bash
 python -m app.main
 ```
+
+Терминал 2 — отдельный worker доставляет Telegram outbox notifications:
+
+```bash
+python -m app.workers.telegram_outbox_worker
+```
+
+Если запустить только `python -m app.main`, заявки будут создаваться, но durable outbox notifications (например, moderation card администратору) не будут доставлены.
 
 или отдельно API:
 
@@ -131,10 +149,32 @@ ruff format .
 ruff check .
 pytest
 alembic upgrade head
+# Терминал 1
 python -m app.main
+# Терминал 2
+python -m app.workers.telegram_outbox_worker
 ```
 
-Для Docker-проверки достаточно `docker compose up --build`: Compose сначала запускает `migrate`, затем `api` и `bot`. После старта API healthcheck можно проверить командой `curl http://localhost:8000/health`.
+Для Docker-проверки достаточно `docker compose up --build`: Compose сначала запускает `migrate`, затем `api`, `bot`, `outbox-worker`, `worker` и необходимые зависимости. После старта API healthcheck можно проверить командой `curl http://localhost:8000/health`.
+
+## Telegram transactional outbox
+
+### Docker Compose
+
+Отдельные команды для outbox не нужны: `docker compose up --build` автоматически запускает `bot`, `outbox-worker`, `worker`, `api` и необходимые зависимости после миграций.
+
+### Non-Docker local mode
+
+После `alembic upgrade head` держите запущенными два процесса: `python -m app.main` для Telegram polling и `python -m app.workers.telegram_outbox_worker` для доставки durable outbox notifications. Бот только принимает updates и записывает события в PostgreSQL; доставкой занимается worker.
+
+### Диагностика worker
+
+Для проверки доставки без Docker можно запустить worker отдельно в отдельном терминале:
+
+```bash
+python -m app.workers.telegram_outbox_worker
+```
+
 
 ## Runtime root Яндекс.Диска
 
