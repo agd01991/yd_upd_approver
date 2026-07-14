@@ -281,19 +281,35 @@ def make_upload(status=UploadStatus.failed, attempt_count=2):
     )
 
 
-def upload_event(payload, event_type="upload_result_admin"):
+def upload_event(
+    payload,
+    event_type="upload_result_admin",
+    dedup_key=None,
+    recipient_telegram_id=99,
+    request_id=42,
+):
     return SimpleNamespace(
         id=12,
         lock_token="lock",
         event_type=event_type,
-        recipient_telegram_id=99,
-        request_id=42,
+        recipient_telegram_id=recipient_telegram_id,
+        request_id=request_id,
         user_id=7,
         payload=payload,
+        dedup_key=dedup_key
+        or f"upload:{request_id}:attempt:{payload.get('attempt_count', 2)}:{payload.get('status', 'failed')}:admin:{recipient_telegram_id}",
     )
 
 
-async def dispatch_upload_event(monkeypatch, upload, payload, event_type="upload_result_admin"):
+async def dispatch_upload_event(
+    monkeypatch,
+    upload,
+    payload,
+    event_type="upload_result_admin",
+    dedup_key=None,
+    recipient_telegram_id=99,
+    request_id=42,
+):
     discarded = []
     sent = []
     monkeypatch.setattr(worker, "SessionLocal", lambda: FakeUploadSession(upload=upload))
@@ -310,7 +326,13 @@ async def dispatch_upload_event(monkeypatch, upload, payload, event_type="upload
     bot = FakeBot()
     await worker.dispatch_event(
         bot,
-        upload_event(payload, event_type=event_type),
+        upload_event(
+            payload,
+            event_type=event_type,
+            dedup_key=dedup_key,
+            recipient_telegram_id=recipient_telegram_id,
+            request_id=request_id,
+        ),
         Settings(telegram_admin_ids=[99]),
     )
     return bot, discarded, sent
@@ -379,9 +401,7 @@ async def test_current_upload_attempt_is_rendered_and_sent(monkeypatch) -> None:
     [None, "2", True, -1],
 )
 async def test_invalid_upload_attempt_payload_is_discarded(monkeypatch, attempt_count) -> None:
-    payload = {"request_id": 42, "status": "failed"}
-    if attempt_count is not None:
-        payload["attempt_count"] = attempt_count
+    payload = {"request_id": 42, "status": "failed", "attempt_count": attempt_count}
     bot, discarded, sent = await dispatch_upload_event(
         monkeypatch,
         make_upload(status=UploadStatus.failed, attempt_count=2),
@@ -409,6 +429,78 @@ async def test_upload_result_status_check_still_discards_mismatch(monkeypatch) -
         monkeypatch,
         make_upload(status=UploadStatus.uploaded, attempt_count=2),
         {"request_id": 42, "status": "failed", "attempt_count": 2},
+    )
+    assert bot.sent == []
+    assert sent == []
+    assert discarded == [(12, "lock", "obsolete or invalid event")]
+
+
+async def test_legacy_admin_upload_attempt_from_dedup_key_is_sent(monkeypatch) -> None:
+    bot, discarded, sent = await dispatch_upload_event(
+        monkeypatch,
+        make_upload(status=UploadStatus.failed, attempt_count=2),
+        {"request_id": 42, "status": "failed"},
+        dedup_key="upload:42:attempt:2:failed:admin:99",
+    )
+    assert bot.sent
+    assert discarded == []
+    assert sent == [(12, "lock", 123)]
+
+
+async def test_legacy_user_upload_attempt_from_dedup_key_is_sent(monkeypatch) -> None:
+    bot, discarded, sent = await dispatch_upload_event(
+        monkeypatch,
+        make_upload(status=UploadStatus.uploaded, attempt_count=2),
+        {"request_id": 42, "status": "uploaded"},
+        event_type="upload_result_user",
+        dedup_key="upload:42:attempt:2:uploaded:user:99",
+    )
+    assert bot.sent[0][0] == (99, "Ваш файл загружен: REQ-000042")
+    assert discarded == []
+    assert sent == [(12, "lock", 123)]
+
+
+async def test_legacy_stale_upload_attempt_is_discarded(monkeypatch) -> None:
+    bot, discarded, sent = await dispatch_upload_event(
+        monkeypatch,
+        make_upload(status=UploadStatus.failed, attempt_count=2),
+        {"request_id": 42, "status": "failed"},
+        dedup_key="upload:42:attempt:1:failed:admin:99",
+    )
+    assert bot.sent == []
+    assert sent == []
+    assert discarded == [(12, "lock", "obsolete or invalid event")]
+
+
+@pytest.mark.parametrize(
+    "dedup_key",
+    [
+        "broken",
+        "prefix:upload:42:attempt:2:failed:admin:99",
+        "upload:43:attempt:2:failed:admin:99",
+        "upload:42:attempt:2:uploaded:admin:99",
+        "upload:42:attempt:2:failed:user:99",
+        "upload:42:attempt:2:failed:admin:100",
+    ],
+)
+async def test_invalid_legacy_upload_attempt_dedup_key_is_discarded(monkeypatch, dedup_key) -> None:
+    bot, discarded, sent = await dispatch_upload_event(
+        monkeypatch,
+        make_upload(status=UploadStatus.failed, attempt_count=2),
+        {"request_id": 42, "status": "failed"},
+        dedup_key=dedup_key,
+    )
+    assert bot.sent == []
+    assert sent == []
+    assert discarded == [(12, "lock", "obsolete or invalid event")]
+
+
+async def test_explicit_invalid_attempt_does_not_fall_back_to_legacy_dedup_key(monkeypatch) -> None:
+    bot, discarded, sent = await dispatch_upload_event(
+        monkeypatch,
+        make_upload(status=UploadStatus.failed, attempt_count=2),
+        {"request_id": 42, "status": "failed", "attempt_count": "2"},
+        dedup_key="upload:42:attempt:2:failed:admin:99",
     )
     assert bot.sent == []
     assert sent == []
