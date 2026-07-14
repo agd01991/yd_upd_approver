@@ -1,6 +1,8 @@
+import asyncio
 from types import SimpleNamespace
 
 import pytest
+from aiogram.exceptions import TelegramBadRequest, TelegramNetworkError, TelegramRetryAfter
 
 from app.api.routes import user as user_route
 from app.api.schemas import FolderRenameRequestCreate
@@ -136,6 +138,10 @@ async def dispatch_rename_event(monkeypatch, rename_request, payload, user_id=1)
         sent.append((event_id, lock_token, message_id))
         return True
 
+    async def fake_extend_lease_once(event_id, lock_token, settings):
+        return None
+
+    monkeypatch.setattr(worker, "_extend_lease_once", fake_extend_lease_once)
     monkeypatch.setattr(worker, "mark_discarded", fake_mark_discarded)
     monkeypatch.setattr(worker, "mark_sent", fake_mark_sent)
     bot = FakeBot()
@@ -219,6 +225,10 @@ async def test_folder_rename_result_does_not_require_pending_status(monkeypatch)
         sent.append((event_id, lock_token, message_id))
         return True
 
+    async def fake_extend_lease_once(event_id, lock_token, settings):
+        return None
+
+    monkeypatch.setattr(worker, "_extend_lease_once", fake_extend_lease_once)
     monkeypatch.setattr(worker, "mark_sent", fake_mark_sent)
     bot = FakeBot()
     await worker.dispatch_event(bot, event, Settings(telegram_admin_ids=[]))
@@ -321,6 +331,10 @@ async def dispatch_upload_event(
         sent.append((event_id, lock_token, message_id))
         return True
 
+    async def fake_extend_lease_once(event_id, lock_token, settings):
+        return None
+
+    monkeypatch.setattr(worker, "_extend_lease_once", fake_extend_lease_once)
     monkeypatch.setattr(worker, "mark_discarded", fake_mark_discarded)
     monkeypatch.setattr(worker, "mark_sent", fake_mark_sent)
     bot = FakeBot()
@@ -505,3 +519,216 @@ async def test_explicit_invalid_attempt_does_not_fall_back_to_legacy_dedup_key(m
     assert bot.sent == []
     assert sent == []
     assert discarded == [(12, "lock", "obsolete or invalid event")]
+
+
+class ExecuteSession:
+    def __init__(self, rowcount=1):
+        self.rowcount = rowcount
+        self.statement = None
+        self.committed = False
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *args):
+        return None
+
+    async def execute(self, statement):
+        self.statement = statement
+        return SimpleNamespace(rowcount=self.rowcount)
+
+    async def commit(self):
+        self.committed = True
+
+
+async def test_extend_lease_once_filters_by_id_status_and_lock_token(monkeypatch) -> None:
+    session = ExecuteSession(rowcount=1)
+    monkeypatch.setattr(worker, "SessionLocal", lambda: session)
+
+    await worker._extend_lease_once(12, "expected-token", Settings(telegram_admin_ids=[]))
+
+    compiled = str(session.statement.compile(compile_kwargs={"literal_binds": True}))
+    assert "telegram_outbox.id = 12" in compiled
+    assert "telegram_outbox.status = 'processing'" in compiled
+    assert "telegram_outbox.lock_token = 'expected-token'" in compiled
+    assert "locked_until" in compiled
+    assert session.committed is True
+
+
+async def test_extend_lease_once_raises_when_rowcount_zero(monkeypatch) -> None:
+    monkeypatch.setattr(worker, "SessionLocal", lambda: ExecuteSession(rowcount=0))
+
+    with pytest.raises(worker.OutboxLeaseLostError):
+        await worker._extend_lease_once(12, "stale-token", Settings(telegram_admin_ids=[]))
+
+
+class SlowBot:
+    def __init__(self):
+        self.sent = 0
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+        self.cancelled = False
+
+    async def send_message(self, *args, **kwargs):
+        self.sent += 1
+        self.started.set()
+        try:
+            await self.release.wait()
+        except asyncio.CancelledError:
+            self.cancelled = True
+            raise
+        return SimpleNamespace(message_id=456)
+
+
+def simple_event():
+    return SimpleNamespace(
+        id=55,
+        lock_token="lock",
+        event_type="folder_rename_result",
+        recipient_telegram_id=99,
+        user_id=None,
+        payload={"text": "hello"},
+    )
+
+
+async def test_slow_send_extends_lease_and_marks_sent_once(monkeypatch) -> None:
+    bot = SlowBot()
+    extends = []
+    enough_extends = asyncio.Event()
+    sent = []
+    monkeypatch.setattr(worker, "SessionLocal", lambda: FakeSession())
+    monkeypatch.setattr(worker, "_lease_heartbeat_interval", lambda settings: 0.01)
+
+    async def fake_extend(event_id, lock_token, settings):
+        extends.append((event_id, lock_token))
+        if len(extends) >= 3:
+            enough_extends.set()
+
+    async def fake_mark_sent(event_id, lock_token, message_id):
+        sent.append((event_id, lock_token, message_id))
+        return True
+
+    monkeypatch.setattr(worker, "_extend_lease_once", fake_extend)
+    monkeypatch.setattr(worker, "mark_sent", fake_mark_sent)
+    task = asyncio.create_task(
+        worker.dispatch_event(bot, simple_event(), Settings(telegram_admin_ids=[]))
+    )
+    await bot.started.wait()
+    await asyncio.wait_for(enough_extends.wait(), timeout=1)
+    bot.release.set()
+    await task
+
+    assert bot.sent == 1
+    assert len(extends) >= 3
+    assert sent == [(55, "lock", 456)]
+
+
+async def test_lease_lost_before_send_skips_telegram_and_markers(monkeypatch) -> None:
+    bot = FakeBot()
+    marked = []
+    monkeypatch.setattr(worker, "SessionLocal", lambda: FakeSession())
+
+    async def fake_extend(event_id, lock_token, settings):
+        raise worker.OutboxLeaseLostError("lost")
+
+    async def fake_mark_sent(*args):
+        marked.append(("sent", args))
+
+    async def fake_mark_failed(*args, **kwargs):
+        marked.append(("failed", args, kwargs))
+
+    monkeypatch.setattr(worker, "_extend_lease_once", fake_extend)
+    monkeypatch.setattr(worker, "mark_sent", fake_mark_sent)
+    monkeypatch.setattr(worker, "mark_failed", fake_mark_failed)
+
+    with pytest.raises(worker.OutboxLeaseLostError):
+        await worker.dispatch_event(bot, simple_event(), Settings(telegram_admin_ids=[]))
+
+    assert bot.sent == []
+    assert marked == []
+
+
+async def test_lease_lost_during_slow_send_cancels_send(monkeypatch) -> None:
+    bot = SlowBot()
+    calls = 0
+    monkeypatch.setattr(worker, "_lease_heartbeat_interval", lambda settings: 0.01)
+
+    async def fake_extend(event_id, lock_token, settings):
+        nonlocal calls
+        calls += 1
+        if calls > 1:
+            raise worker.OutboxLeaseLostError("lost")
+
+    monkeypatch.setattr(worker, "_extend_lease_once", fake_extend)
+
+    with pytest.raises(worker.OutboxLeaseLostError):
+        await worker._send_with_lease_heartbeat(
+            bot, simple_event(), "hello", None, Settings(telegram_admin_ids=[])
+        )
+
+    assert bot.sent == 1
+    assert bot.cancelled is True
+
+
+async def test_mark_sent_false_is_lease_lost(monkeypatch) -> None:
+    monkeypatch.setattr(worker, "SessionLocal", lambda: FakeSession())
+
+    async def fake_extend(event_id, lock_token, settings):
+        return None
+
+    async def fake_mark_sent(event_id, lock_token, message_id):
+        return False
+
+    monkeypatch.setattr(worker, "_extend_lease_once", fake_extend)
+    monkeypatch.setattr(worker, "mark_sent", fake_mark_sent)
+
+    with pytest.raises(worker.OutboxLeaseLostError):
+        await worker.dispatch_event(FakeBot(), simple_event(), Settings(telegram_admin_ids=[]))
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        TelegramRetryAfter(method="sendMessage", message="retry", retry_after=1),
+        TelegramNetworkError(method="sendMessage", message="network"),
+        TelegramBadRequest(method="sendMessage", message="bad"),
+        TimeoutError(),
+    ],
+)
+async def test_send_errors_preserve_original_and_stop_heartbeat(monkeypatch, exc) -> None:
+    class ErrorBot:
+        async def send_message(self, *args, **kwargs):
+            raise exc
+
+    extends = []
+
+    async def fake_extend(event_id, lock_token, settings):
+        extends.append(event_id)
+
+    monkeypatch.setattr(worker, "_extend_lease_once", fake_extend)
+
+    with pytest.raises(type(exc)):
+        await worker._send_with_lease_heartbeat(
+            ErrorBot(), simple_event(), "hello", None, Settings(telegram_admin_ids=[])
+        )
+
+    assert extends == [55]
+
+
+async def test_send_with_heartbeat_cancellation_cleans_up(monkeypatch) -> None:
+    bot = SlowBot()
+
+    async def fake_extend(event_id, lock_token, settings):
+        return None
+
+    monkeypatch.setattr(worker, "_extend_lease_once", fake_extend)
+    task = asyncio.create_task(
+        worker._send_with_lease_heartbeat(
+            bot, simple_event(), "hello", None, Settings(telegram_admin_ids=[])
+        )
+    )
+    await bot.started.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert bot.cancelled is True

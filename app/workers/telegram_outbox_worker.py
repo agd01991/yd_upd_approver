@@ -40,6 +40,14 @@ logger = logging.getLogger(__name__)
 HEALTHCHECK_FILE = Path("/tmp/yd_upd_approver_outbox_heartbeat")  # noqa: S108
 
 
+class OutboxLeaseLostError(RuntimeError):
+    """Raised when this worker no longer owns a telegram outbox row."""
+
+
+class OutboxHeartbeatError(RuntimeError):
+    """Raised when the lease heartbeat cannot safely keep ownership."""
+
+
 def _now() -> datetime:
     return datetime.now(UTC)
 
@@ -93,6 +101,119 @@ async def claim_next_event(session: AsyncSession, settings: Settings) -> Telegra
     row.attempt_count = (row.attempt_count or 0) + 1
     await session.commit()
     return row
+
+
+async def _extend_lease_once(
+    event_id: int,
+    lock_token: str,
+    settings: Settings,
+) -> None:
+    async with SessionLocal() as session:
+        result = await session.execute(
+            update(TelegramOutbox)
+            .where(
+                TelegramOutbox.id == event_id,
+                TelegramOutbox.status == TelegramOutboxStatus.processing,
+                TelegramOutbox.lock_token == lock_token,
+            )
+            .values(locked_until=_now() + timedelta(seconds=settings.telegram_outbox_lease_seconds))
+        )
+        await session.commit()
+        if result.rowcount != 1:
+            raise OutboxLeaseLostError(f"telegram outbox lease lost for event {event_id}")
+
+
+def _lease_heartbeat_interval(settings: Settings) -> float:
+    return max(0.05, settings.telegram_outbox_lease_seconds / 3)
+
+
+async def _lease_heartbeat(
+    event_id: int,
+    lock_token: str,
+    settings: Settings,
+    stop: asyncio.Event,
+) -> None:
+    interval = _lease_heartbeat_interval(settings)
+    while not stop.is_set():
+        with suppress(TimeoutError):
+            await asyncio.wait_for(stop.wait(), timeout=interval)
+        if stop.is_set():
+            return
+        try:
+            await _extend_lease_once(event_id, lock_token, settings)
+        except OutboxLeaseLostError:
+            raise
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            raise OutboxHeartbeatError(
+                f"telegram outbox heartbeat failed for event {event_id}: {_safe_error(exc)}"
+            ) from exc
+
+
+async def _await_cancelled(task: asyncio.Task) -> None:
+    task.cancel()
+    with suppress(asyncio.CancelledError):
+        await task
+
+
+async def _send_with_lease_heartbeat(
+    bot: Bot,
+    event: TelegramOutbox,
+    text: str,
+    reply_markup,
+    settings: Settings,
+):
+    lock_token = event.lock_token or ""
+    await _extend_lease_once(event.id, lock_token, settings)
+
+    stop = asyncio.Event()
+    send_task = asyncio.create_task(
+        bot.send_message(event.recipient_telegram_id, text, reply_markup=reply_markup)
+    )
+    heartbeat_task = asyncio.create_task(_lease_heartbeat(event.id, lock_token, settings, stop))
+    try:
+        done, _pending = await asyncio.wait(
+            {send_task, heartbeat_task}, return_when=asyncio.FIRST_COMPLETED
+        )
+        if heartbeat_task in done:
+            try:
+                await heartbeat_task
+            except OutboxLeaseLostError:
+                await _await_cancelled(send_task)
+                raise
+            except Exception as exc:
+                await _await_cancelled(send_task)
+                raise exc
+
+        try:
+            return await send_task
+        finally:
+            stop.set()
+            try:
+                await heartbeat_task
+            except asyncio.CancelledError:
+                raise
+            except Exception as cleanup_exc:
+                if send_task.cancelled() or send_task.exception() is not None:
+                    logger.warning(
+                        "Outbox heartbeat cleanup failed: id=%s category=%s",
+                        event.id,
+                        cleanup_exc.__class__.__name__,
+                    )
+                else:
+                    raise
+    except asyncio.CancelledError:
+        stop.set()
+        await _await_cancelled(send_task)
+        await _await_cancelled(heartbeat_task)
+        raise
+    finally:
+        stop.set()
+        if not heartbeat_task.done():
+            await _await_cancelled(heartbeat_task)
+        if not send_task.done():
+            await _await_cancelled(send_task)
 
 
 async def mark_sent(event_id: int, lock_token: str, message_id: int | None) -> bool:
@@ -289,8 +410,10 @@ async def dispatch_event(bot: Bot, event: TelegramOutbox, settings: Settings) ->
     if not rendered or not rendered[0]:
         await mark_discarded(event.id, event.lock_token or "", "obsolete or invalid event")
         return
-    msg = await bot.send_message(event.recipient_telegram_id, rendered[0], reply_markup=rendered[1])
-    await mark_sent(event.id, event.lock_token or "", getattr(msg, "message_id", None))
+    msg = await _send_with_lease_heartbeat(bot, event, rendered[0], rendered[1], settings)
+    if not await mark_sent(event.id, event.lock_token or "", getattr(msg, "message_id", None)):
+        logger.warning("Outbox event lease lost before mark_sent: id=%s", event.id)
+        raise OutboxLeaseLostError(f"telegram outbox lease lost for event {event.id}")
 
 
 async def health_heartbeat(stop: asyncio.Event) -> None:
@@ -317,6 +440,18 @@ async def run(stop: asyncio.Event, settings: Settings) -> None:
                 continue
             try:
                 await dispatch_event(bot, event, settings)
+            except OutboxLeaseLostError as exc:
+                logger.warning(
+                    "Outbox event ownership lost: id=%s category=%s",
+                    event.id,
+                    exc.__class__.__name__,
+                )
+            except OutboxHeartbeatError as exc:
+                logger.warning(
+                    "Outbox event heartbeat failed: id=%s category=%s",
+                    event.id,
+                    exc.__class__.__name__,
+                )
             except TelegramRetryAfter as exc:
                 await mark_failed(event, settings, exc, retry_after=exc.retry_after)
             except (TelegramForbiddenError, TelegramBadRequest) as exc:
