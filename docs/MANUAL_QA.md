@@ -14,7 +14,7 @@
 docker compose up --build
 ```
 
-Compose запускает PostgreSQL с healthcheck, затем one-shot сервис `migrate` выполняет `alembic upgrade head`, и только после успешного завершения миграций стартуют `api` и `bot`. `api` и `bot` не запускают Alembic самостоятельно.
+Compose запускает PostgreSQL с healthcheck, затем one-shot сервис `migrate` выполняет `alembic upgrade head`, и только после успешного завершения миграций стартуют `api`, `bot`, `outbox-worker`, `worker` и зависимости. `api` и `bot` не запускают Alembic самостоятельно.
 
 Если локальная БД уже была частично обновлена старой версией Compose после race condition, обычно достаточно повторить запуск без удаления PostgreSQL volume:
 
@@ -26,7 +26,7 @@ docker compose up --build
 
 ```bash
 docker compose up -d migrate
-docker compose up -d api bot
+docker compose up -d api bot outbox-worker worker
 ```
 
 Не используйте `docker compose down -v` как основной способ восстановления, потому что он удаляет локальные данные PostgreSQL.
@@ -37,13 +37,29 @@ docker compose up -d api bot
 alembic upgrade head
 ```
 
-## 4. Non-Docker local: запуск бота или API
+## 4. Non-Docker local: запуск бота, upload worker и outbox worker
+
+После миграций одновременно держите запущенными три процесса. Терминал 1 — `app.main` принимает Telegram updates и пишет состояние/outbox в PostgreSQL:
 
 ```bash
 python -m app.main
 ```
 
-или API:
+Терминал 2 — `upload_worker` забирает одобренные заявки и загружает файлы на Яндекс.Диск:
+
+```bash
+python -m app.workers.upload_worker
+```
+
+Терминал 3 — `telegram_outbox_worker` доставляет durable Telegram-уведомления:
+
+```bash
+python -m app.workers.telegram_outbox_worker
+```
+
+Один только `python -m app.main` не выполняет загрузки на Яндекс.Диск и не доставляет durable outbox notifications: после Approve/Retry заявки останутся в очереди и администратор не получит moderation/result notifications без workers.
+
+Если тестируется Mini App или HTTP-интерфейс, отдельно запустите четвёртый процесс API:
 
 ```bash
 uvicorn app.api.main:app --host 0.0.0.0 --port 8000
