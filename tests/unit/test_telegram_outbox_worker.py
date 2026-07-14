@@ -686,6 +686,104 @@ async def test_mark_sent_false_is_lease_lost(monkeypatch) -> None:
         await worker.dispatch_event(FakeBot(), simple_event(), Settings(telegram_admin_ids=[]))
 
 
+async def test_successful_send_suppresses_cleanup_heartbeat_failure(monkeypatch, caplog) -> None:
+    heartbeat_entered = asyncio.Event()
+    finish_send = asyncio.Event()
+    sent = []
+    extend_calls = 0
+
+    class CoordinatedBot:
+        sent = 0
+
+        async def send_message(self, *args, **kwargs):
+            self.sent += 1
+            await heartbeat_entered.wait()
+            finish_send.set()
+            return SimpleNamespace(message_id=789)
+
+    async def fake_extend(event_id, lock_token, settings):
+        nonlocal extend_calls
+        extend_calls += 1
+        if extend_calls == 1:
+            return None
+        heartbeat_entered.set()
+        await finish_send.wait()
+        raise TimeoutError("temporary db outage")
+
+    async def fake_mark_sent(event_id, lock_token, message_id):
+        sent.append((event_id, lock_token, message_id))
+        return True
+
+    monkeypatch.setattr(worker, "SessionLocal", lambda: FakeSession())
+    monkeypatch.setattr(worker, "_lease_heartbeat_interval", lambda settings: 0.01)
+    monkeypatch.setattr(worker, "_extend_lease_once", fake_extend)
+    monkeypatch.setattr(worker, "mark_sent", fake_mark_sent)
+
+    bot = CoordinatedBot()
+    with caplog.at_level("WARNING", logger=worker.logger.name):
+        await worker.dispatch_event(bot, simple_event(), Settings(telegram_admin_ids=[]))
+
+    assert bot.sent == 1
+    assert sent == [(55, "lock", 789)]
+    assert "Outbox heartbeat cleanup failed after send success" in caplog.text
+    assert "id=55" in caplog.text
+    assert "category=OutboxHeartbeatError" in caplog.text
+
+
+async def test_simultaneous_send_success_wins_over_heartbeat_error(monkeypatch) -> None:
+    sent = []
+
+    async def fake_extend(event_id, lock_token, settings):
+        return None
+
+    async def fake_heartbeat(event_id, lock_token, settings, stop):
+        raise worker.OutboxHeartbeatError("heartbeat failed")
+
+    async def fake_mark_sent(event_id, lock_token, message_id):
+        sent.append((event_id, lock_token, message_id))
+        return True
+
+    monkeypatch.setattr(worker, "SessionLocal", lambda: FakeSession())
+    monkeypatch.setattr(worker, "_extend_lease_once", fake_extend)
+    monkeypatch.setattr(worker, "_lease_heartbeat", fake_heartbeat)
+    monkeypatch.setattr(worker, "mark_sent", fake_mark_sent)
+
+    await worker.dispatch_event(FakeBot(), simple_event(), Settings(telegram_admin_ids=[]))
+
+    assert sent == [(55, "lock", 123)]
+
+
+async def test_successful_send_attempts_mark_sent_false_after_cleanup_failure(monkeypatch) -> None:
+    marked_sent = []
+    marked_failed = []
+
+    async def fake_extend(event_id, lock_token, settings):
+        return None
+
+    async def fake_heartbeat(event_id, lock_token, settings, stop):
+        await stop.wait()
+        raise worker.OutboxHeartbeatError("cleanup failed")
+
+    async def fake_mark_sent(event_id, lock_token, message_id):
+        marked_sent.append((event_id, lock_token, message_id))
+        return False
+
+    async def fake_mark_failed(*args, **kwargs):
+        marked_failed.append((args, kwargs))
+
+    monkeypatch.setattr(worker, "SessionLocal", lambda: FakeSession())
+    monkeypatch.setattr(worker, "_extend_lease_once", fake_extend)
+    monkeypatch.setattr(worker, "_lease_heartbeat", fake_heartbeat)
+    monkeypatch.setattr(worker, "mark_sent", fake_mark_sent)
+    monkeypatch.setattr(worker, "mark_failed", fake_mark_failed)
+
+    with pytest.raises(worker.OutboxLeaseLostError):
+        await worker.dispatch_event(FakeBot(), simple_event(), Settings(telegram_admin_ids=[]))
+
+    assert marked_sent == [(55, "lock", 123)]
+    assert marked_failed == []
+
+
 @pytest.mark.parametrize(
     "exc",
     [
@@ -715,6 +813,31 @@ async def test_send_errors_preserve_original_and_stop_heartbeat(monkeypatch, exc
     assert extends == [55]
 
 
+async def test_send_exception_is_not_replaced_by_cleanup_heartbeat_exception(monkeypatch) -> None:
+    original_exc = TelegramNetworkError(method="sendMessage", message="network")
+
+    class ErrorBot:
+        async def send_message(self, *args, **kwargs):
+            raise original_exc
+
+    async def fake_extend(event_id, lock_token, settings):
+        return None
+
+    async def fake_heartbeat(event_id, lock_token, settings, stop):
+        await stop.wait()
+        raise worker.OutboxHeartbeatError("cleanup failed")
+
+    monkeypatch.setattr(worker, "_extend_lease_once", fake_extend)
+    monkeypatch.setattr(worker, "_lease_heartbeat", fake_heartbeat)
+
+    with pytest.raises(TelegramNetworkError) as exc_info:
+        await worker._send_with_lease_heartbeat(
+            ErrorBot(), simple_event(), "hello", None, Settings(telegram_admin_ids=[])
+        )
+
+    assert exc_info.value is original_exc
+
+
 async def test_send_with_heartbeat_cancellation_cleans_up(monkeypatch) -> None:
     bot = SlowBot()
 
@@ -732,3 +855,37 @@ async def test_send_with_heartbeat_cancellation_cleans_up(monkeypatch) -> None:
     with pytest.raises(asyncio.CancelledError):
         await task
     assert bot.cancelled is True
+
+
+async def test_send_with_heartbeat_cancellation_awaits_heartbeat(monkeypatch) -> None:
+    bot = SlowBot()
+    heartbeat_cancelled = asyncio.Event()
+    heartbeat_finally = asyncio.Event()
+
+    async def fake_extend(event_id, lock_token, settings):
+        return None
+
+    async def fake_heartbeat(event_id, lock_token, settings, stop):
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            heartbeat_cancelled.set()
+            raise
+        finally:
+            heartbeat_finally.set()
+
+    monkeypatch.setattr(worker, "_extend_lease_once", fake_extend)
+    monkeypatch.setattr(worker, "_lease_heartbeat", fake_heartbeat)
+    task = asyncio.create_task(
+        worker._send_with_lease_heartbeat(
+            bot, simple_event(), "hello", None, Settings(telegram_admin_ids=[])
+        )
+    )
+    await bot.started.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert bot.cancelled is True
+    assert heartbeat_cancelled.is_set()
+    assert heartbeat_finally.is_set()

@@ -157,6 +157,33 @@ async def _await_cancelled(task: asyncio.Task) -> None:
         await task
 
 
+async def _stop_heartbeat_after_send(
+    heartbeat_task: asyncio.Task,
+    stop: asyncio.Event,
+    event_id: int,
+) -> None:
+    stop.set()
+    try:
+        await heartbeat_task
+    except asyncio.CancelledError:
+        raise
+    except Exception as cleanup_exc:
+        logger.warning(
+            "Outbox heartbeat cleanup failed after send success: id=%s category=%s",
+            event_id,
+            cleanup_exc.__class__.__name__,
+        )
+
+
+async def _stop_heartbeat_after_send_failure(
+    heartbeat_task: asyncio.Task,
+    stop: asyncio.Event,
+) -> None:
+    stop.set()
+    with suppress(Exception):
+        await heartbeat_task
+
+
 async def _send_with_lease_heartbeat(
     bot: Bot,
     event: TelegramOutbox,
@@ -173,36 +200,38 @@ async def _send_with_lease_heartbeat(
     )
     heartbeat_task = asyncio.create_task(_lease_heartbeat(event.id, lock_token, settings, stop))
     try:
-        done, _pending = await asyncio.wait(
-            {send_task, heartbeat_task}, return_when=asyncio.FIRST_COMPLETED
-        )
-        if heartbeat_task in done:
-            try:
-                await heartbeat_task
-            except OutboxLeaseLostError:
-                await _await_cancelled(send_task)
-                raise
-            except Exception as exc:
-                await _await_cancelled(send_task)
-                raise exc
+        while True:
+            await asyncio.wait({send_task, heartbeat_task}, return_when=asyncio.FIRST_COMPLETED)
 
-        try:
-            return await send_task
-        finally:
-            stop.set()
-            try:
-                await heartbeat_task
-            except asyncio.CancelledError:
-                raise
-            except Exception as cleanup_exc:
-                if send_task.cancelled() or send_task.exception() is not None:
-                    logger.warning(
-                        "Outbox heartbeat cleanup failed: id=%s category=%s",
-                        event.id,
-                        cleanup_exc.__class__.__name__,
-                    )
-                else:
+            if send_task.done():
+                try:
+                    message = await send_task
+                except asyncio.CancelledError:
+                    stop.set()
+                    await _await_cancelled(heartbeat_task)
                     raise
+                except Exception:
+                    await _stop_heartbeat_after_send_failure(heartbeat_task, stop)
+                    raise
+
+                await _stop_heartbeat_after_send(heartbeat_task, stop, event.id)
+                return message
+
+            if heartbeat_task.done():
+                try:
+                    await heartbeat_task
+                except asyncio.CancelledError:
+                    stop.set()
+                    await _await_cancelled(send_task)
+                    raise
+                except Exception as exc:
+                    await _await_cancelled(send_task)
+                    raise exc
+
+                await _await_cancelled(send_task)
+                raise OutboxHeartbeatError(
+                    f"telegram outbox heartbeat stopped unexpectedly for event {event.id}"
+                )
     except asyncio.CancelledError:
         stop.set()
         await _await_cancelled(send_task)
