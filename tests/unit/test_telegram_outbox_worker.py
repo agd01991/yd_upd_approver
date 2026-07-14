@@ -648,6 +648,151 @@ async def test_lease_lost_before_send_skips_telegram_and_markers(monkeypatch) ->
     assert marked == []
 
 
+async def test_pre_send_db_exception_becomes_heartbeat_error(monkeypatch) -> None:
+    bot = FakeBot()
+    marked = []
+    original = RuntimeError("database connection failed")
+    monkeypatch.setattr(worker, "SessionLocal", lambda: FakeSession())
+
+    async def fake_extend(event_id, lock_token, settings):
+        raise original
+
+    async def fake_mark_sent(*args):
+        marked.append(("sent", args))
+
+    async def fake_mark_failed(*args, **kwargs):
+        marked.append(("failed", args, kwargs))
+
+    monkeypatch.setattr(worker, "_extend_lease_once", fake_extend)
+    monkeypatch.setattr(worker, "mark_sent", fake_mark_sent)
+    monkeypatch.setattr(worker, "mark_failed", fake_mark_failed)
+
+    with pytest.raises(worker.OutboxHeartbeatError) as exc_info:
+        await worker.dispatch_event(bot, simple_event(), Settings(telegram_admin_ids=[]))
+
+    assert exc_info.value.__cause__ is original
+    assert bot.sent == []
+    assert marked == []
+
+
+async def test_run_does_not_mark_failed_for_pre_send_heartbeat_error(monkeypatch) -> None:
+    event = simple_event()
+    stop = asyncio.Event()
+    marked_failed = []
+    claims = 0
+    monkeypatch.setattr(worker, "SessionLocal", lambda: FakeSession())
+    monkeypatch.setattr(worker, "health_heartbeat", lambda stop: asyncio.sleep(0))
+
+    class RunBot(FakeBot):
+        def __init__(self, token):
+            super().__init__()
+            self.session = SimpleNamespace(close=self.close)
+
+        async def close(self):
+            return None
+
+    async def fake_claim_next_event(session, settings):
+        nonlocal claims
+        claims += 1
+        if claims == 1:
+            return event
+        stop.set()
+        return None
+
+    async def fake_extend(event_id, lock_token, settings):
+        raise RuntimeError("database heartbeat failure")
+
+    async def fake_mark_failed(*args, **kwargs):
+        marked_failed.append((args, kwargs))
+
+    monkeypatch.setattr(worker, "Bot", RunBot)
+    monkeypatch.setattr(worker, "claim_next_event", fake_claim_next_event)
+    monkeypatch.setattr(worker, "_extend_lease_once", fake_extend)
+    monkeypatch.setattr(worker, "mark_failed", fake_mark_failed)
+
+    await worker.run(
+        stop,
+        Settings(
+            telegram_bot_token="123:abc",
+            telegram_admin_ids=[],
+        ),
+    )
+
+    assert marked_failed == []
+
+
+async def test_pre_send_refresh_timeout_cancels_inner_refresh(monkeypatch) -> None:
+    bot = FakeBot()
+    started = asyncio.Event()
+    cancelled = asyncio.Event()
+
+    async def fake_extend(event_id, lock_token, settings):
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.set()
+
+    monkeypatch.setattr(worker, "_extend_lease_once", fake_extend)
+    monkeypatch.setattr(worker, "_lease_refresh_timeout", lambda settings: 0.01)
+
+    with pytest.raises(worker.OutboxHeartbeatError) as exc_info:
+        await worker._send_with_lease_heartbeat(
+            bot, simple_event(), "hello", None, Settings(telegram_admin_ids=[])
+        )
+
+    assert isinstance(exc_info.value.__cause__, TimeoutError)
+    assert started.is_set()
+    assert cancelled.is_set()
+    assert bot.sent == []
+
+
+async def test_pre_send_lease_lost_is_not_wrapped(monkeypatch) -> None:
+    bot = FakeBot()
+    lease_lost = worker.OutboxLeaseLostError("lost")
+
+    async def fake_extend(event_id, lock_token, settings):
+        raise lease_lost
+
+    monkeypatch.setattr(worker, "_extend_lease_once", fake_extend)
+
+    with pytest.raises(worker.OutboxLeaseLostError) as exc_info:
+        await worker._send_with_lease_heartbeat(
+            bot, simple_event(), "hello", None, Settings(telegram_admin_ids=[])
+        )
+
+    assert exc_info.value is lease_lost
+    assert bot.sent == []
+
+
+async def test_pre_send_external_cancellation_is_not_wrapped(monkeypatch) -> None:
+    bot = FakeBot()
+    started = asyncio.Event()
+    finalized = asyncio.Event()
+
+    async def fake_extend(event_id, lock_token, settings):
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            finalized.set()
+
+    monkeypatch.setattr(worker, "_extend_lease_once", fake_extend)
+    task = asyncio.create_task(
+        worker._send_with_lease_heartbeat(
+            bot, simple_event(), "hello", None, Settings(telegram_admin_ids=[])
+        )
+    )
+    await started.wait()
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert finalized.is_set()
+    assert bot.sent == []
+
+
 async def test_lease_lost_during_slow_send_cancels_send(monkeypatch) -> None:
     bot = SlowBot()
     calls = 0
@@ -668,6 +813,57 @@ async def test_lease_lost_during_slow_send_cancels_send(monkeypatch) -> None:
 
     assert bot.sent == 1
     assert bot.cancelled is True
+
+
+async def test_hung_periodic_refresh_times_out_and_cancels_send(monkeypatch) -> None:
+    bot = SlowBot()
+    calls = 0
+    hung_started = asyncio.Event()
+    hung_cancelled = asyncio.Event()
+    marked_sent = []
+    monkeypatch.setattr(worker, "_lease_heartbeat_interval", lambda settings: 0.01)
+    monkeypatch.setattr(worker, "_lease_refresh_timeout", lambda settings: 0.01)
+
+    async def fake_extend(event_id, lock_token, settings):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return None
+        hung_started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            hung_cancelled.set()
+
+    async def fake_mark_sent(event_id, lock_token, message_id):
+        marked_sent.append((event_id, lock_token, message_id))
+        return True
+
+    monkeypatch.setattr(worker, "_extend_lease_once", fake_extend)
+    monkeypatch.setattr(worker, "mark_sent", fake_mark_sent)
+
+    with pytest.raises(worker.OutboxHeartbeatError):
+        await worker._send_with_lease_heartbeat(
+            bot, simple_event(), "hello", None, Settings(telegram_admin_ids=[])
+        )
+
+    assert hung_started.is_set()
+    assert hung_cancelled.is_set()
+    assert bot.sent == 1
+    assert bot.cancelled is True
+    assert marked_sent == []
+
+
+@pytest.mark.parametrize("lease_seconds", [60, 3, 1, 0.3, 0.03])
+def test_lease_timing_invariants(lease_seconds) -> None:
+    settings = SimpleNamespace(telegram_outbox_lease_seconds=lease_seconds)
+
+    interval = worker._lease_heartbeat_interval(settings)
+    refresh_timeout = worker._lease_refresh_timeout(settings)
+
+    assert 0 < interval < lease_seconds
+    assert 0 < refresh_timeout < lease_seconds
+    assert interval + refresh_timeout < lease_seconds
 
 
 async def test_mark_sent_false_is_lease_lost(monkeypatch) -> None:
