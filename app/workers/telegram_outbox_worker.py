@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import secrets
 import signal
 from contextlib import suppress
@@ -154,6 +155,52 @@ async def mark_failed(
         await session.commit()
 
 
+def _valid_upload_attempt_from_event(event: TelegramOutbox, upload: UploadRequest) -> int | None:
+    payload = event.payload or {}
+    current_attempt = upload.attempt_count or 0
+    if "attempt_count" in payload:
+        attempt = payload["attempt_count"]
+        if not isinstance(attempt, int) or isinstance(attempt, bool):
+            return None
+        if attempt < 0 or attempt != current_attempt:
+            return None
+        return attempt
+
+    status = payload.get("status")
+    if not isinstance(status, str):
+        return None
+    audience_by_type = {
+        "upload_result_admin": "admin",
+        "upload_result_user": "user",
+    }
+    audience = audience_by_type.get(event.event_type)
+    if audience is None:
+        return None
+    pattern = re.compile(
+        r"^upload:(?P<request_id>\d+):attempt:(?P<attempt>\d+):"
+        r"(?P<status>[A-Za-z0-9_.-]+):(?P<audience>admin|user):(?P<recipient>\d+)$"
+    )
+    match = pattern.fullmatch(getattr(event, "dedup_key", "") or "")
+    if not match:
+        return None
+    try:
+        request_id = int(match.group("request_id"))
+        attempt = int(match.group("attempt"))
+        recipient = int(match.group("recipient"))
+    except ValueError:
+        return None
+    if (
+        request_id != upload.id
+        or attempt != current_attempt
+        or match.group("status") != status
+        or upload.status.value != status
+        or match.group("audience") != audience
+        or recipient != event.recipient_telegram_id
+    ):
+        return None
+    return attempt
+
+
 async def _render(session: AsyncSession, event: TelegramOutbox):
     if event.event_type == "admin_user_pending":
         user = await session.get(User, event.user_id or event.payload.get("user_id"))
@@ -175,10 +222,7 @@ async def _render(session: AsyncSession, event: TelegramOutbox):
         if not upload:
             return None
         if event.event_type in {"upload_result_admin", "upload_result_user"}:
-            expected_attempt = event.payload.get("attempt_count")
-            if not isinstance(expected_attempt, int) or isinstance(expected_attempt, bool):
-                return None
-            if expected_attempt < 0 or expected_attempt != (upload.attempt_count or 0):
+            if _valid_upload_attempt_from_event(event, upload) is None:
                 return None
         expected = event.payload.get("status")
         if expected and upload.status.value != expected:

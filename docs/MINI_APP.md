@@ -32,10 +32,17 @@ The frontend never receives Telegram bot tokens, Yandex OAuth tokens, Authorizat
 
 For Docker Compose, run `docker compose up --build`, then open `http://localhost:8000/` for a smoke test. Compose runs Alembic through the one-shot `migrate` service after PostgreSQL becomes healthy; `api` and `bot` start only after `migrate` completes successfully and do not run migrations in parallel.
 
-For non-Docker local runs, execute migrations manually and then start the API:
+For non-Docker local runs, execute migrations manually and keep the bot, upload worker, outbox worker, and API running when testing the Mini App/API. `app.main` accepts Telegram updates and writes state/outbox rows to PostgreSQL, `upload_worker` uploads approved requests to Yandex Disk, `telegram_outbox_worker` delivers durable Telegram notifications, and the API serves the Mini App and HTTP interface.
 
 ```bash
 alembic upgrade head
+# Terminal 1 — Telegram polling and durable event creation
+python -m app.main
+# Terminal 2 — Yandex Disk uploads
+python -m app.workers.upload_worker
+# Terminal 3 — Telegram outbox notification delivery
+python -m app.workers.telegram_outbox_worker
+# Terminal 4 — Mini App/API
 uvicorn app.api.main:app --host 0.0.0.0 --port 8000
 ```
 

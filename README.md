@@ -23,13 +23,15 @@ python -m venv .venv
 source .venv/bin/activate
 pip install -e ".[dev]"
 alembic upgrade head
-# Терминал 1: Telegram polling bot (принимает updates и пишет durable-события в PostgreSQL)
+# Терминал 1: Telegram polling bot (принимает updates и пишет состояние/outbox в PostgreSQL)
 python -m app.main
-# Терминал 2: Telegram outbox delivery (доставляет уведомления администраторам и пользователям)
+# Терминал 2: upload worker (забирает approved-заявки и загружает файлы на Яндекс.Диск)
+python -m app.workers.upload_worker
+# Терминал 3: Telegram outbox delivery (доставляет durable-уведомления администраторам и пользователям)
 python -m app.workers.telegram_outbox_worker
 ```
 
-Оба non-Docker процесса должны оставаться запущенными: `python -m app.main` сам не доставляет durable outbox notifications.
+Все три non-Docker процесса должны оставаться запущенными: `python -m app.main` сам не выполняет загрузки на Яндекс.Диск и не доставляет durable outbox notifications.
 
 Docker:
 
@@ -39,27 +41,33 @@ docker compose up --build
 
 В Docker Compose миграции выполняет отдельный one-shot сервис `migrate`. Он ждёт healthy-состояния PostgreSQL, один раз запускает `alembic upgrade head`, а сервисы `api` и `bot` стартуют только после успешного завершения миграций. `api` и `bot` больше не запускают Alembic параллельно, поэтому при `docker compose up --build` не возникает race condition на создании таблиц.
 
-Для non-Docker local запуска миграции по-прежнему выполняются вручную, затем одновременно запускаются два долгоживущих процесса:
+Для non-Docker local запуска миграции по-прежнему выполняются вручную, затем одновременно запускаются три долгоживущих процесса:
 
 ```bash
 alembic upgrade head
 ```
 
-Терминал 1 — бот принимает Telegram updates и записывает события в PostgreSQL:
+Терминал 1 — `app.main` принимает Telegram updates и пишет состояние/outbox в PostgreSQL:
 
 ```bash
 python -m app.main
 ```
 
-Терминал 2 — отдельный worker доставляет Telegram outbox notifications:
+Терминал 2 — `upload_worker` забирает одобренные заявки и загружает файлы на Яндекс.Диск:
+
+```bash
+python -m app.workers.upload_worker
+```
+
+Терминал 3 — `telegram_outbox_worker` доставляет durable Telegram-уведомления:
 
 ```bash
 python -m app.workers.telegram_outbox_worker
 ```
 
-Если запустить только `python -m app.main`, заявки будут создаваться, но durable outbox notifications (например, moderation card администратору) не будут доставлены.
+Если запустить только `python -m app.main`, заявки будут создаваться, но одобренные/retry-загрузки не дойдут до `uploaded` или `failed`, а durable outbox notifications (например, moderation card администратору) не будут доставлены.
 
-или отдельно API:
+Если тестируется Mini App или HTTP-интерфейс, отдельно запустите четвёртый процесс API:
 
 ```bash
 alembic upgrade head
@@ -149,9 +157,11 @@ ruff format .
 ruff check .
 pytest
 alembic upgrade head
-# Терминал 1
+# Терминал 1 — Telegram polling и создание durable-событий
 python -m app.main
-# Терминал 2
+# Терминал 2 — выполнение загрузок на Яндекс.Диск
+python -m app.workers.upload_worker
+# Терминал 3 — доставка Telegram outbox notifications
 python -m app.workers.telegram_outbox_worker
 ```
 
@@ -165,11 +175,11 @@ python -m app.workers.telegram_outbox_worker
 
 ### Non-Docker local mode
 
-После `alembic upgrade head` держите запущенными два процесса: `python -m app.main` для Telegram polling и `python -m app.workers.telegram_outbox_worker` для доставки durable outbox notifications. Бот только принимает updates и записывает события в PostgreSQL; доставкой занимается worker.
+После `alembic upgrade head` держите запущенными три процесса: `python -m app.main` принимает Telegram updates и пишет состояние/outbox в PostgreSQL, `python -m app.workers.upload_worker` забирает одобренные заявки и загружает файлы на Яндекс.Диск, а `python -m app.workers.telegram_outbox_worker` доставляет durable Telegram-уведомления. API (`uvicorn app.api.main:app --host 0.0.0.0 --port 8000`) нужен отдельно для Mini App и HTTP-интерфейса.
 
 ### Диагностика worker
 
-Для проверки доставки без Docker можно запустить worker отдельно в отдельном терминале:
+Для проверки доставки без Docker запустите outbox worker отдельным третьим процессом:
 
 ```bash
 python -m app.workers.telegram_outbox_worker

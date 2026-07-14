@@ -37,23 +37,29 @@ docker compose up -d api bot outbox-worker worker
 alembic upgrade head
 ```
 
-## 4. Non-Docker local: запуск бота и outbox worker
+## 4. Non-Docker local: запуск бота, upload worker и outbox worker
 
-После миграций одновременно держите запущенными два процесса. Терминал 1 — бот принимает Telegram updates и пишет durable-события в PostgreSQL:
+После миграций одновременно держите запущенными три процесса. Терминал 1 — `app.main` принимает Telegram updates и пишет состояние/outbox в PostgreSQL:
 
 ```bash
 python -m app.main
 ```
 
-Терминал 2 — отдельный worker доставляет Telegram outbox notifications:
+Терминал 2 — `upload_worker` забирает одобренные заявки и загружает файлы на Яндекс.Диск:
+
+```bash
+python -m app.workers.upload_worker
+```
+
+Терминал 3 — `telegram_outbox_worker` доставляет durable Telegram-уведомления:
 
 ```bash
 python -m app.workers.telegram_outbox_worker
 ```
 
-Один только `python -m app.main` не доставляет durable outbox notifications, поэтому администратор не получит moderation card без worker.
+Один только `python -m app.main` не выполняет загрузки на Яндекс.Диск и не доставляет durable outbox notifications: после Approve/Retry заявки останутся в очереди и администратор не получит moderation/result notifications без workers.
 
-или API:
+Если тестируется Mini App или HTTP-интерфейс, отдельно запустите четвёртый процесс API:
 
 ```bash
 uvicorn app.api.main:app --host 0.0.0.0 --port 8000
