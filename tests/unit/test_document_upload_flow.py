@@ -87,8 +87,7 @@ async def test_document_upload_active_user_downloads_and_notifies_admin(
     assert created["sha256"] != "0" * 64
     assert message.answers[0][1] is None
     assert "REQ-000001" in message.answers[0][0]
-    assert bot.messages[0][0] == 1
-    assert bot.messages[0][2] is not None
+    assert bot.messages == []
 
 
 @pytest.mark.anyio

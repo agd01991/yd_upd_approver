@@ -29,6 +29,11 @@ class Settings(BaseSettings):
     upload_worker_poll_seconds: float = 2
     upload_worker_lease_seconds: int = 600
     upload_worker_heartbeat_seconds: int = 30
+    telegram_outbox_poll_seconds: float = 1
+    telegram_outbox_lease_seconds: int = 60
+    telegram_outbox_max_attempts: int = 10
+    telegram_outbox_base_retry_seconds: int = 2
+    telegram_outbox_max_retry_seconds: int = 900
 
     @field_validator("telegram_admin_ids", mode="before")
     @classmethod
@@ -62,6 +67,11 @@ class Settings(BaseSettings):
         "upload_worker_poll_seconds",
         "upload_worker_lease_seconds",
         "upload_worker_heartbeat_seconds",
+        "telegram_outbox_poll_seconds",
+        "telegram_outbox_lease_seconds",
+        "telegram_outbox_max_attempts",
+        "telegram_outbox_base_retry_seconds",
+        "telegram_outbox_max_retry_seconds",
     )
     @classmethod
     def positive_worker_timing(cls, value: float) -> float:
@@ -76,6 +86,12 @@ class Settings(BaseSettings):
             )
         if self.upload_worker_poll_seconds < 0.5:
             raise ValueError("UPLOAD_WORKER_POLL_SECONDS must be at least 0.5 to avoid busy loop")
+        if self.telegram_outbox_poll_seconds < 0.5:
+            raise ValueError("TELEGRAM_OUTBOX_POLL_SECONDS must be at least 0.5 to avoid busy loop")
+        if self.telegram_outbox_max_retry_seconds < self.telegram_outbox_base_retry_seconds:
+            raise ValueError(
+                "TELEGRAM_OUTBOX_MAX_RETRY_SECONDS must be >= TELEGRAM_OUTBOX_BASE_RETRY_SECONDS"
+            )
 
     @property
     def max_file_size_bytes(self) -> int:

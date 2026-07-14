@@ -14,7 +14,7 @@
 docker compose up --build
 ```
 
-Compose запускает PostgreSQL с healthcheck, затем one-shot сервис `migrate` выполняет `alembic upgrade head`, и только после успешного завершения миграций стартуют `api` и `bot`. `api` и `bot` не запускают Alembic самостоятельно.
+Compose запускает PostgreSQL с healthcheck, затем one-shot сервис `migrate` выполняет `alembic upgrade head`, и только после успешного завершения миграций стартуют `api`, `bot`, `outbox-worker`, `worker` и зависимости. `api` и `bot` не запускают Alembic самостоятельно.
 
 Если локальная БД уже была частично обновлена старой версией Compose после race condition, обычно достаточно повторить запуск без удаления PostgreSQL volume:
 
@@ -26,7 +26,7 @@ docker compose up --build
 
 ```bash
 docker compose up -d migrate
-docker compose up -d api bot
+docker compose up -d api bot outbox-worker worker
 ```
 
 Не используйте `docker compose down -v` как основной способ восстановления, потому что он удаляет локальные данные PostgreSQL.
@@ -37,13 +37,29 @@ docker compose up -d api bot
 alembic upgrade head
 ```
 
-## 4. Non-Docker local: запуск бота или API
+## 4. Non-Docker local: запуск бота, upload worker и outbox worker
+
+После миграций одновременно держите запущенными три процесса. Терминал 1 — `app.main` принимает Telegram updates и пишет состояние/outbox в PostgreSQL:
 
 ```bash
 python -m app.main
 ```
 
-или API:
+Терминал 2 — `upload_worker` забирает одобренные заявки и загружает файлы на Яндекс.Диск:
+
+```bash
+python -m app.workers.upload_worker
+```
+
+Терминал 3 — `telegram_outbox_worker` доставляет durable Telegram-уведомления:
+
+```bash
+python -m app.workers.telegram_outbox_worker
+```
+
+Один только `python -m app.main` не выполняет загрузки на Яндекс.Диск и не доставляет durable outbox notifications: после Approve/Retry заявки останутся в очереди и администратор не получит moderation/result notifications без workers.
+
+Если тестируется Mini App или HTTP-интерфейс, отдельно запустите четвёртый процесс API:
 
 ```bash
 uvicorn app.api.main:app --host 0.0.0.0 --port 8000
@@ -197,3 +213,16 @@ uvicorn app.api.main:app --host 0.0.0.0 --port 8000
 13. `user.root_folder` обновляется, если переименована текущая папка пользователя; общая root folder не меняется.
 14. Совпадающие `allowed_folders` и старые `upload_requests.target_folder`/`target_path` обновляются на новый путь.
 15. Поиск пользователей в Mini App показывает выпадающий список, результаты экранируются, по клику пользователь выбирается для переименования без заявки.
+
+## Transactional Telegram outbox manual QA
+
+PostgreSQL is the source of truth for durable Telegram notifications. Redis is not used as a queue. Telegram delivery is at-least-once: if the outbox worker crashes after Telegram accepts a message but before the row is marked `sent`, a rare duplicate notification can be delivered.
+
+1. Stop only the `outbox-worker` service.
+2. Create an upload request from Telegram or the Mini App.
+3. Verify that the upload request is saved and a `telegram_outbox` row exists with `status='pending'`.
+4. Start `outbox-worker` and verify the row moves to `sent` with `sent_at` and `telegram_message_id` populated.
+5. Repeat the same admin action or callback and verify audit/outbox rows are not duplicated.
+6. Temporarily make Telegram unavailable and verify `attempt_count`, `last_error`, and `next_attempt_at` are updated with retry/backoff; permanent forbidden/bad-request errors move to `dead`.
+7. Repeat a Mini App upload with the same `Idempotency-Key` and verify the existing `request_code`/`status` is returned.
+8. Inspect stuck rows safely, for example: `select id,event_type,status,attempt_count,next_attempt_at,last_error from telegram_outbox where status in ('pending','dead') order by id;`.

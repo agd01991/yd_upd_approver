@@ -1,18 +1,19 @@
 from aiogram import Bot, Router
 from aiogram.types import Message
+from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.bot.keyboards import upload_keyboard
 from app.config import Settings
-from app.db.models import UserStatus
+from app.db.models import UploadRequest, UserStatus
 from app.db.repositories import create_upload_request, get_user_by_tg, next_request_code
 from app.services.file_policy import validate_size
 from app.services.naming import join_disk_path, sanitize_filename
 from app.services.storage import TempStorage
 from app.services.telegram_files import download_file
+from app.services.telegram_outbox import enqueue_admin_upload_pending
 from app.services.user_folders import ensure_user_folder_for_current_root
 from app.services.yandex_disk import YandexDiskClient
-from app.utils.formatting import format_upload_card
 
 router = Router()
 
@@ -45,6 +46,20 @@ async def document_upload(
         await message.answer("Файл слишком большой.")
         return
 
+    chat_id = getattr(getattr(message, "chat", None), "id", message.from_user.id)
+    message_id = getattr(message, "message_id", document.file_id)
+    source_event_key = f"telegram-document:{chat_id}:{message_id}"
+    existing = None
+    if hasattr(session, "scalar"):
+        existing = await session.scalar(
+            select(UploadRequest).where(UploadRequest.source_event_key == source_event_key)
+        )
+    if existing:
+        await message.answer(
+            f"Файл уже получен: {existing.request_code} (статус: {existing.status.value})"
+        )
+        return
+
     safe = sanitize_filename(document.file_name or "file")
     request_code = await next_request_code(session)
     storage = TempStorage(settings.temp_storage_dir)
@@ -73,27 +88,39 @@ async def document_upload(
         await client.close()
     target_path = join_disk_path(target_folder, safe)
 
-    upload = await create_upload_request(
-        session,
-        request_code=request_code,
-        user_id=user.id,
-        telegram_file_id=document.file_id,
-        telegram_file_unique_id=document.file_unique_id,
-        original_filename=document.file_name or safe,
-        safe_filename=safe,
-        mime_type=document.mime_type,
-        size_bytes=document.file_size or destination.stat().st_size,
-        sha256=sha256,
-        caption=message.caption,
-        local_path=str(destination),
-        target_folder=target_folder,
-        target_path=target_path,
-    )
-    await session.commit()
+    try:
+        upload = await create_upload_request(
+            session,
+            request_code=request_code,
+            user_id=user.id,
+            telegram_file_id=document.file_id,
+            telegram_file_unique_id=document.file_unique_id,
+            original_filename=document.file_name or safe,
+            safe_filename=safe,
+            mime_type=document.mime_type,
+            size_bytes=document.file_size or destination.stat().st_size,
+            sha256=sha256,
+            caption=message.caption,
+            local_path=str(destination),
+            target_folder=target_folder,
+            target_path=target_path,
+            source_event_key=source_event_key,
+        )
+        await enqueue_admin_upload_pending(session, settings, upload, user)
+        await session.commit()
+    except IntegrityError:
+        await session.rollback()
+        destination.unlink(missing_ok=True)
+        existing = await session.scalar(
+            select(UploadRequest).where(UploadRequest.source_event_key == source_event_key)
+        )
+        if existing:
+            await message.answer(
+                f"Файл уже получен: {existing.request_code} (статус: {existing.status.value})"
+            )
+            return
+        raise
 
     await message.answer(
         f"Файл получен и отправлен администратору на проверку: {upload.request_code}"
     )
-    card = format_upload_card(upload, user)
-    for admin_id in settings.telegram_admin_ids:
-        await bot.send_message(admin_id, card, reply_markup=upload_keyboard(upload.id))

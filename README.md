@@ -23,8 +23,15 @@ python -m venv .venv
 source .venv/bin/activate
 pip install -e ".[dev]"
 alembic upgrade head
+# Терминал 1: Telegram polling bot (принимает updates и пишет состояние/outbox в PostgreSQL)
 python -m app.main
+# Терминал 2: upload worker (забирает approved-заявки и загружает файлы на Яндекс.Диск)
+python -m app.workers.upload_worker
+# Терминал 3: Telegram outbox delivery (доставляет durable-уведомления администраторам и пользователям)
+python -m app.workers.telegram_outbox_worker
 ```
+
+Все три non-Docker процесса должны оставаться запущенными: `python -m app.main` сам не выполняет загрузки на Яндекс.Диск и не доставляет durable outbox notifications.
 
 Docker:
 
@@ -34,14 +41,33 @@ docker compose up --build
 
 В Docker Compose миграции выполняет отдельный one-shot сервис `migrate`. Он ждёт healthy-состояния PostgreSQL, один раз запускает `alembic upgrade head`, а сервисы `api` и `bot` стартуют только после успешного завершения миграций. `api` и `bot` больше не запускают Alembic параллельно, поэтому при `docker compose up --build` не возникает race condition на создании таблиц.
 
-Для non-Docker local запуска миграции по-прежнему выполняются вручную перед стартом нужного процесса:
+Для non-Docker local запуска миграции по-прежнему выполняются вручную, затем одновременно запускаются три долгоживущих процесса:
 
 ```bash
 alembic upgrade head
+```
+
+Терминал 1 — `app.main` принимает Telegram updates и пишет состояние/outbox в PostgreSQL:
+
+```bash
 python -m app.main
 ```
 
-или отдельно API:
+Терминал 2 — `upload_worker` забирает одобренные заявки и загружает файлы на Яндекс.Диск:
+
+```bash
+python -m app.workers.upload_worker
+```
+
+Терминал 3 — `telegram_outbox_worker` доставляет durable Telegram-уведомления:
+
+```bash
+python -m app.workers.telegram_outbox_worker
+```
+
+Если запустить только `python -m app.main`, заявки будут создаваться, но одобренные/retry-загрузки не дойдут до `uploaded` или `failed`, а durable outbox notifications (например, moderation card администратору) не будут доставлены.
+
+Если тестируется Mini App или HTTP-интерфейс, отдельно запустите четвёртый процесс API:
 
 ```bash
 alembic upgrade head
@@ -131,10 +157,34 @@ ruff format .
 ruff check .
 pytest
 alembic upgrade head
+# Терминал 1 — Telegram polling и создание durable-событий
 python -m app.main
+# Терминал 2 — выполнение загрузок на Яндекс.Диск
+python -m app.workers.upload_worker
+# Терминал 3 — доставка Telegram outbox notifications
+python -m app.workers.telegram_outbox_worker
 ```
 
-Для Docker-проверки достаточно `docker compose up --build`: Compose сначала запускает `migrate`, затем `api` и `bot`. После старта API healthcheck можно проверить командой `curl http://localhost:8000/health`.
+Для Docker-проверки достаточно `docker compose up --build`: Compose сначала запускает `migrate`, затем `api`, `bot`, `outbox-worker`, `worker` и необходимые зависимости. После старта API healthcheck можно проверить командой `curl http://localhost:8000/health`.
+
+## Telegram transactional outbox
+
+### Docker Compose
+
+Отдельные команды для outbox не нужны: `docker compose up --build` автоматически запускает `bot`, `outbox-worker`, `worker`, `api` и необходимые зависимости после миграций.
+
+### Non-Docker local mode
+
+После `alembic upgrade head` держите запущенными три процесса: `python -m app.main` принимает Telegram updates и пишет состояние/outbox в PostgreSQL, `python -m app.workers.upload_worker` забирает одобренные заявки и загружает файлы на Яндекс.Диск, а `python -m app.workers.telegram_outbox_worker` доставляет durable Telegram-уведомления. API (`uvicorn app.api.main:app --host 0.0.0.0 --port 8000`) нужен отдельно для Mini App и HTTP-интерфейса.
+
+### Диагностика worker
+
+Для проверки доставки без Docker запустите outbox worker отдельным третьим процессом:
+
+```bash
+python -m app.workers.telegram_outbox_worker
+```
+
 
 ## Runtime root Яндекс.Диска
 
@@ -428,3 +478,17 @@ Worker использует lease/heartbeat. Claim выставляет `worker_
 При падении после принятия файла Яндекс.Диском, но до commit `uploaded`, повторный worker перед загрузкой пытается сверить существующий remote resource через `get_info()`: безопасное завершение возможно только при совпадении размера и SHA-256. Совпадения имени или размера недостаточно; при конфликте `normal`/`copy` job становится `failed`, а `overwrite` может повторить загрузку.
 
 Ручной retry разрешён только из `failed` и сохраняет предыдущий `upload_mode` (или использует `normal`, если режима ещё нет). Диагностировать failed job следует по безопасному `error_message`, audit events `upload_failed`, `upload_recovered`, `upload_started`, `upload_uploaded` и server logs без токенов, upload URL, DSN или содержимого файла.
+
+## Telegram transactional outbox
+
+Durable Telegram notifications are stored in PostgreSQL in `telegram_outbox` in the same transaction as the business state and audit row. API handlers, bot handlers, and the upload worker no longer depend on Telegram availability for saved business events; a separate process sends notifications:
+
+```bash
+python -m app.workers.telegram_outbox_worker
+```
+
+Configure it with `TELEGRAM_OUTBOX_POLL_SECONDS`, `TELEGRAM_OUTBOX_LEASE_SECONDS`, `TELEGRAM_OUTBOX_MAX_ATTEMPTS`, `TELEGRAM_OUTBOX_BASE_RETRY_SECONDS`, and `TELEGRAM_OUTBOX_MAX_RETRY_SECONDS`. Docker Compose includes a dedicated `outbox-worker` service and heartbeat healthcheck. Redis is not used as the outbox queue; PostgreSQL remains the source of truth.
+
+Delivery is durable at-least-once, not exactly-once. Telegram `sendMessage` has no idempotency key, so if the worker crashes after Telegram accepts a message but before the row is marked `sent`, a duplicate can be delivered. Temporary failures are retried with exponential backoff and jitter. Permanent forbidden/bad-request errors and exhausted retries are moved to `dead`. Operators can inspect pending/dead rows in `telegram_outbox` without exposing tokens or local temp paths.
+
+Mini App uploads require an `Idempotency-Key` header. The frontend generates a UUID per file; duplicate retries return the existing upload request while new keys allow intentional duplicate file submissions.

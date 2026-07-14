@@ -349,7 +349,7 @@ def test_existing_0005_database_is_repaired_by_head(migration_db):
     async def check_head(conn: AsyncConnection) -> dict[str, str]:
         assert (
             await conn.execute(text("SELECT version_num FROM alembic_version"))
-        ).scalar_one() == "0007_repair_queued_retries"
+        ).scalar_one() == "0008_telegram_outbox"
         return await _modes(conn)
 
     expected = _with_migration_connection(expected_database, check_head)
@@ -389,7 +389,7 @@ def test_clean_install_path_runs_0005_to_head_to_same_modes(migration_db):
     async def check(conn: AsyncConnection) -> None:
         assert (
             await conn.execute(text("SELECT version_num FROM alembic_version"))
-        ).scalar_one() == "0007_repair_queued_retries"
+        ).scalar_one() == "0008_telegram_outbox"
         assert await _modes(conn) == {
             "copy_retry": "copy",
             "copy_path_approve": "copy",
@@ -408,6 +408,55 @@ def test_clean_install_path_runs_0005_to_head_to_same_modes(migration_db):
         }
 
     _with_migration_connection(expected_database, check)
+
+
+async def _telegram_outbox_schema_state(conn: AsyncConnection) -> dict[str, bool]:
+    row = (
+        await conn.execute(
+            text("""
+                SELECT
+                    to_regtype('telegramoutboxstatus') IS NOT NULL AS enum_exists,
+                    to_regclass('telegram_outbox') IS NOT NULL AS table_exists,
+                    EXISTS (
+                        SELECT 1
+                        FROM information_schema.columns
+                        WHERE table_schema = current_schema()
+                            AND table_name = 'telegram_outbox'
+                            AND column_name = 'status'
+                    ) AS status_column_exists
+                """)
+        )
+    ).one()
+    return dict(row._mapping)
+
+
+def test_telegram_outbox_enum_migration_up_down_up(migration_db):
+    cfg, expected_database = migration_db
+
+    command.upgrade(cfg, "head")
+
+    async def check_created(conn: AsyncConnection) -> None:
+        assert await _revision(conn) == "0008_telegram_outbox"
+        assert await _telegram_outbox_schema_state(conn) == {
+            "enum_exists": True,
+            "table_exists": True,
+            "status_column_exists": True,
+        }
+
+    _with_migration_connection(expected_database, check_created)
+    command.downgrade(cfg, "0007_repair_queued_retries")
+
+    async def check_removed(conn: AsyncConnection) -> None:
+        assert await _revision(conn) == "0007_repair_queued_retries"
+        assert await _telegram_outbox_schema_state(conn) == {
+            "enum_exists": False,
+            "table_exists": False,
+            "status_column_exists": False,
+        }
+
+    _with_migration_connection(expected_database, check_removed)
+    command.upgrade(cfg, "head")
+    _with_migration_connection(expected_database, check_created)
 
 
 def test_alembic_database_url_override_isolates_application_database(migration_db):
@@ -929,7 +978,7 @@ def test_existing_0006_database_repairs_queued_legacy_retries(migration_db):
     command.upgrade(cfg, "head")
 
     async def check(conn: AsyncConnection) -> tuple[dict[str, str], dict[str, tuple]]:
-        assert await _revision(conn) == "0007_repair_queued_retries"
+        assert await _revision(conn) == "0008_telegram_outbox"
         return await _queued_modes(conn), await _queued_stable_columns(conn)
 
     expected, after_stable_columns = _with_migration_connection(expected_database, check)
@@ -965,7 +1014,7 @@ def test_existing_0006_database_repairs_queued_legacy_retries(migration_db):
     command.upgrade(cfg, "head")
 
     async def check_idempotent(conn: AsyncConnection) -> None:
-        assert await _revision(conn) == "0007_repair_queued_retries"
+        assert await _revision(conn) == "0008_telegram_outbox"
         assert await _queued_modes(conn) == expected
 
     _with_migration_connection(expected_database, check_idempotent)

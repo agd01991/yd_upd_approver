@@ -2,10 +2,9 @@ from fastapi import APIRouter, Depends
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.deps import bot_dep, current_user_dep, get_db, settings_dep
+from app.api.deps import current_user_dep, get_db, settings_dep
 from app.api.errors import ApiError
 from app.api.schemas import FolderProfileBody, FolderRenameRequestCreate
-from app.bot.keyboards import user_moderation_keyboard
 from app.config import Settings
 from app.db.models import FolderRenameRequest, FolderRenameRequestStatus, User, UserStatus
 from app.services.naming import (
@@ -13,7 +12,12 @@ from app.services.naming import (
     build_recommended_user_folder_name,
     validate_user_folder_name,
 )
-from app.utils.formatting import format_folder_rename_request, format_user_card
+from app.services.telegram_outbox import (
+    TelegramEventType,
+    enqueue_admin_user_pending,
+    enqueue_telegram_event,
+)
+from app.utils.formatting import format_folder_rename_request
 
 router = APIRouter()
 
@@ -41,25 +45,12 @@ async def me(
     current: tuple[User, bool] = Depends(current_user_dep),
     session: AsyncSession = Depends(get_db),
     settings: Settings = Depends(settings_dep),
-    bot=Depends(bot_dep),
 ) -> dict:
     user, created = current
-    if created and bot and user.folder_name:
-        for admin_id in settings.telegram_admin_ids:
-            await bot.send_message(
-                admin_id, format_user_card(user), reply_markup=user_moderation_keyboard(user.id)
-            )
+    if created and user.folder_name:
+        await enqueue_admin_user_pending(session, settings, user)
     await session.commit()
     return user_json(user, user.telegram_id in settings.telegram_admin_ids)
-
-
-async def _notify_admins(bot, settings: Settings, user: User) -> None:
-    if not bot:
-        return
-    for admin_id in settings.telegram_admin_ids:
-        await bot.send_message(
-            admin_id, format_user_card(user), reply_markup=user_moderation_keyboard(user.id)
-        )
 
 
 @router.post("/me/folder-profile")
@@ -68,7 +59,6 @@ async def save_folder_profile(
     current: tuple[User, bool] = Depends(current_user_dep),
     session: AsyncSession = Depends(get_db),
     settings: Settings = Depends(settings_dep),
-    bot=Depends(bot_dep),
 ) -> dict:
     user, _ = current
     try:
@@ -85,9 +75,9 @@ async def save_folder_profile(
     user.contract_date = body.contract_date.strip()
     user.contract_full_name = body.contract_full_name.strip()
     user.folder_name = folder_name
-    await session.commit()
     if was_missing:
-        await _notify_admins(bot, settings, user)
+        await enqueue_admin_user_pending(session, settings, user)
+    await session.commit()
     return {"status": user.status.value, "folder_name": user.folder_name}
 
 
@@ -97,7 +87,6 @@ async def create_my_folder_rename_request(
     current: tuple[User, bool] = Depends(current_user_dep),
     session: AsyncSession = Depends(get_db),
     settings: Settings = Depends(settings_dep),
-    bot=Depends(bot_dep),
 ) -> dict:
     user, _ = current
     if user.status != UserStatus.active:
@@ -127,14 +116,20 @@ async def create_my_folder_rename_request(
     )
     session.add(req)
     await session.flush()
-    await session.commit()
-    if bot:
-        for admin_id in settings.telegram_admin_ids:
-            await bot.send_message(
-                admin_id,
-                format_folder_rename_request(req, user)
+    for admin_id in settings.telegram_admin_ids:
+        await enqueue_telegram_event(
+            session,
+            event_type=TelegramEventType.admin_folder_rename_pending,
+            recipient_telegram_id=admin_id,
+            dedup_key=f"folder-rename:{req.id}:pending:admin:{admin_id}",
+            payload={
+                "folder_rename_request_id": req.id,
+                "text": format_folder_rename_request(req, user)
                 + "\nОткройте Mini App → Заявки на переименование.",
-            )
+            },
+            user_id=user.id,
+        )
+    await session.commit()
     return {"id": req.id, "status": req.status.value}
 
 

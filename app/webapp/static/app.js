@@ -16,6 +16,9 @@ let adminSearchTimer;
 let selectedRenameUser = null;
 let renameFolderCandidates = [];
 let renameSelectionVersion = 0;
+let selectedUploadEntries = [];
+let uploadInProgress = false;
+let idempotencyFallbackCounter = 0;
 
 const STATUS_LABELS = {
   pending: "ожидает одобрения",
@@ -159,7 +162,9 @@ async function renderUser(me) {
     <div class="card"><h2>Файлы</h2><div id="files"></div></div>`;
   const form = document.querySelector("#up");
   const input = form.querySelector('input[type="file"]');
-  input.onchange = () => renderSelectedFiles(input.files);
+  input.onchange = () => {
+    if (!setSelectedUploadFiles(input.files)) input.value = "";
+  };
   form.onsubmit = async (event) => uploadSelectedFiles(event, form, input);
   document.querySelectorAll("[data-user-filter]").forEach((button) => {
     button.onclick = () => { userStatusFilter = button.dataset.userFilter; renderUserRequests(); };
@@ -167,37 +172,114 @@ async function renderUser(me) {
   await loadUserLists();
 }
 
-function renderSelectedFiles(files) {
+function createIdempotencyKey() {
+  const cryptoApi = globalThis.crypto;
+  if (typeof cryptoApi?.randomUUID === "function") {
+    try {
+      const uuid = cryptoApi.randomUUID();
+      if (/^[A-Za-z0-9._:-]{1,128}$/.test(uuid)) return uuid;
+    } catch {
+      // Fall through to Web Crypto byte generation for older WebViews.
+    }
+  }
+  if (typeof cryptoApi?.getRandomValues === "function") {
+    try {
+      const bytes = new Uint8Array(16);
+      cryptoApi.getRandomValues(bytes);
+      const hex = Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
+      return `webcrypto-${hex}`;
+    } catch {
+      // Fall through to the local non-cryptographic fallback.
+    }
+  }
+
+  idempotencyFallbackCounter += 1;
+  const timestamp = Date.now().toString(36);
+  const counter = idempotencyFallbackCounter.toString(36);
+  const perf = typeof globalThis.performance?.now === "function"
+    ? Math.floor(globalThis.performance.now() * 1000).toString(36)
+    : "0";
+  const random = Array.from({ length: 4 }, () => Math.random().toString(36).slice(2)).join("");
+  const key = `local-${timestamp}-${counter}-${perf}-${random}`.replace(/[^A-Za-z0-9._:-]/g, "").slice(0, 128);
+  return key || `local-${timestamp}-${counter}`.slice(0, 128);
+}
+
+function createUploadEntry(file) {
+  return { file, idempotencyKey: createIdempotencyKey(), status: "pending", error: "" };
+}
+
+function setSelectedUploadFiles(files) {
+  if (uploadInProgress) return false;
+  selectedUploadEntries = Array.from(files || []).map((file) => createUploadEntry(file));
+  renderSelectedFiles();
+  return true;
+}
+
+function clearSelectedUploadFiles(form) {
+  selectedUploadEntries = [];
+  form.reset();
+  renderSelectedFiles();
+}
+
+function renderSelectedFiles() {
   const list = document.querySelector("#selected-files");
-  if (!files || files.length === 0) { list.textContent = "Файлы не выбраны"; return; }
-  list.innerHTML = `<b>Файлы выбраны: ${files.length}</b>` + Array.from(files).map((file, index) =>
-    `<div class="file-row"><span>${index + 1}. ${escapeHtml(file.name)}</span><span>${fmtSize(file.size)}</span></div>`
-  ).join("");
+  const remaining = selectedUploadEntries.filter((entry) => entry.status !== "done");
+  if (remaining.length === 0) { list.textContent = "Файлы не выбраны"; return; }
+  list.innerHTML = `<b>Файлы выбраны: ${remaining.length}</b>` + remaining.map((entry, index) => {
+    const retryText = entry.status === "failed" ? ` <span class="muted">ожидает повторной отправки</span>` : "";
+    return `<div class="file-row"><span>${index + 1}. ${escapeHtml(entry.file.name)}${retryText}</span><span>${fmtSize(entry.file.size)}</span></div>`;
+  }).join("");
 }
 
 async function uploadSelectedFiles(event, form, input) {
   event.preventDefault();
-  const files = Array.from(input.files || []);
   const msg = document.querySelector("#upmsg");
-  if (files.length === 0) { msg.textContent = "Выберите хотя бы один файл."; return; }
+  if (uploadInProgress) { msg.textContent = "Загрузка уже выполняется."; return; }
+  const entriesToUpload = selectedUploadEntries.filter((entry) => entry.status !== "done");
+  const files = entriesToUpload.map((entry) => entry.file);
+  if (entriesToUpload.length === 0) { msg.textContent = "Выберите хотя бы один файл."; return; }
+  uploadInProgress = true;
+  input.disabled = true;
+  const submitButton = form.querySelector('button[type="submit"]');
+  if (submitButton) submitButton.disabled = true;
   const caption = form.querySelector("textarea").value;
   const results = [];
-  for (const [index, file] of files.entries()) {
-    msg.textContent = `Загружается ${index + 1} из ${files.length}: ${file.name}`;
-    const fd = new FormData();
-    fd.append("file", file);
-    fd.append("caption", caption);
-    try {
-      const result = await api("/api/uploads", { method: "POST", body: fd });
-      results.push(`✅ ${file.name}: создана заявка ${result.request_code}`);
-    } catch (err) {
-      results.push(`❌ ${file.name}: ${safeErrorMessage(err)}`);
+  try {
+    for (const [index, entry] of entriesToUpload.entries()) {
+      const file = entry.file;
+      entry.status = "uploading";
+      msg.textContent = `Загружается ${index + 1} из ${files.length}: ${file.name}`;
+      if (!/^[A-Za-z0-9._:-]{1,128}$/.test(entry.idempotencyKey || "")) {
+        entry.status = "failed";
+        entry.error = "Не удалось подготовить безопасный ключ загрузки. Выберите файл заново и повторите попытку.";
+        results.push(`❌ ${file.name}: ${entry.error}`);
+        continue;
+      }
+      const fd = new FormData();
+      fd.append("file", file);
+      fd.append("caption", caption);
+      try {
+        const result = await api("/api/uploads", { method: "POST", headers: { "Idempotency-Key": entry.idempotencyKey }, body: fd });
+        entry.status = "done";
+        entry.error = "";
+        results.push(`✅ ${file.name}: создана заявка ${result.request_code}`);
+      } catch (err) {
+        entry.status = "failed";
+        entry.error = safeErrorMessage(err);
+        results.push(`❌ ${file.name}: ${entry.error}`);
+      }
     }
+    selectedUploadEntries = selectedUploadEntries.filter((entry) => entry.status !== "done");
+    const failedCount = selectedUploadEntries.length;
+    const title = failedCount === 0 ? "Готово" : `Готово. Осталось для повторной отправки: ${failedCount}`;
+    msg.innerHTML = `<b>${escapeHtml(title)}</b>${results.map((item) => `<div>${escapeHtml(item)}</div>`).join("")}`;
+    if (failedCount === 0) clearSelectedUploadFiles(form); else renderSelectedFiles();
+    await loadUserLists();
+  } finally {
+    uploadInProgress = false;
+    input.disabled = false;
+    if (submitButton) submitButton.disabled = false;
   }
-  msg.innerHTML = `<b>Готово</b>${results.map((item) => `<div>${escapeHtml(item)}</div>`).join("")}`;
-  form.reset();
-  renderSelectedFiles([]);
-  await loadUserLists();
 }
 
 async function loadUserLists() {

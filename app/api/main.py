@@ -32,7 +32,7 @@ if origins:
         allow_origins=origins,
         allow_credentials=True,
         allow_methods=["*"],
-        allow_headers=["X-Telegram-Init-Data", "Content-Type", "Authorization"],
+        allow_headers=["X-Telegram-Init-Data", "Content-Type", "Authorization", "Idempotency-Key"],
         expose_headers=["X-Request-ID"],
     )
 

@@ -122,7 +122,7 @@ async def test_upload_callback_reject_notifies_user(monkeypatch) -> None:  # noq
     )
     assert request.status == UploadStatus.rejected
     assert request.reject_reason == "Дубликат"
-    assert any(chat_id == 10 for chat_id, _, _ in bot.messages)
+    assert not bot.messages
 
 
 @pytest.mark.anyio

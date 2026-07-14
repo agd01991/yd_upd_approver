@@ -14,6 +14,7 @@ from app.services.naming import (
     copy_filename,
     join_disk_path,
 )
+from app.services.telegram_outbox import TelegramEventType, enqueue_telegram_event
 
 
 class UploadQueueError(ValueError):
@@ -150,6 +151,10 @@ async def reject_upload_request(
     if user is None:
         raise UploadQueueError("Пользователь заявки не найден.", "request_not_found")
 
+    if request.status == UploadStatus.rejected:
+        if (request.reject_reason or "") == reason[:1000]:
+            return request
+        raise UploadQueueError(REJECT_INVALID_STATE_MESSAGE)
     if request.status not in REJECTABLE_UPLOAD_STATUSES:
         raise UploadQueueError(REJECT_INVALID_STATE_MESSAGE)
 
@@ -167,6 +172,16 @@ async def reject_upload_request(
         old_value={"status": old_status},
         new_value={"status": request.status.value, "reason": safe_reason},
     )
+    if getattr(user, "telegram_id", None):
+        await enqueue_telegram_event(
+            session,
+            event_type=TelegramEventType.upload_rejected,
+            recipient_telegram_id=user.telegram_id,
+            dedup_key=f"upload:{request.id}:rejected:user:{user.telegram_id}",
+            payload={"request_id": request.id, "status": request.status.value},
+            request_id=request.id,
+            user_id=user.id,
+        )
     await session.commit()
     return request
 

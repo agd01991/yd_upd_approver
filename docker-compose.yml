@@ -77,6 +77,24 @@ services:
       retries: 5
       start_period: 10s
 
+  outbox-worker:
+    <<: *app
+    init: true
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    command: python -m app.workers.telegram_outbox_worker
+    restart: unless-stopped
+    stop_grace_period: 2m
+    healthcheck:
+      test: ["CMD", "python", "-c", "import pathlib, time; p=pathlib.Path('/tmp/yd_upd_approver_outbox_heartbeat'); assert p.exists() and time.time() - p.stat().st_mtime < 30"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
   postgres:
     image: postgres:16-alpine
     environment:
