@@ -124,7 +124,34 @@ async def _extend_lease_once(
 
 
 def _lease_heartbeat_interval(settings: Settings) -> float:
-    return max(0.05, settings.telegram_outbox_lease_seconds / 3)
+    return settings.telegram_outbox_lease_seconds / 3
+
+
+def _lease_refresh_timeout(settings: Settings) -> float:
+    return settings.telegram_outbox_lease_seconds / 3
+
+
+async def _refresh_lease_with_timeout(
+    event_id: int,
+    lock_token: str,
+    settings: Settings,
+) -> None:
+    timeout = _lease_refresh_timeout(settings)
+    try:
+        async with asyncio.timeout(timeout):
+            await _extend_lease_once(event_id, lock_token, settings)
+    except OutboxLeaseLostError:
+        raise
+    except asyncio.CancelledError:
+        raise
+    except TimeoutError as exc:
+        raise OutboxHeartbeatError(
+            f"telegram outbox lease refresh timed out for event {event_id}: timeout={timeout:.3f}s"
+        ) from exc
+    except Exception as exc:
+        raise OutboxHeartbeatError(
+            f"telegram outbox lease refresh failed for event {event_id}: {_safe_error(exc)}"
+        ) from exc
 
 
 async def _lease_heartbeat(
@@ -139,16 +166,7 @@ async def _lease_heartbeat(
             await asyncio.wait_for(stop.wait(), timeout=interval)
         if stop.is_set():
             return
-        try:
-            await _extend_lease_once(event_id, lock_token, settings)
-        except OutboxLeaseLostError:
-            raise
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            raise OutboxHeartbeatError(
-                f"telegram outbox heartbeat failed for event {event_id}: {_safe_error(exc)}"
-            ) from exc
+        await _refresh_lease_with_timeout(event_id, lock_token, settings)
 
 
 async def _await_cancelled(task: asyncio.Task) -> None:
@@ -192,7 +210,7 @@ async def _send_with_lease_heartbeat(
     settings: Settings,
 ):
     lock_token = event.lock_token or ""
-    await _extend_lease_once(event.id, lock_token, settings)
+    await _refresh_lease_with_timeout(event.id, lock_token, settings)
 
     stop = asyncio.Event()
     send_task = asyncio.create_task(
