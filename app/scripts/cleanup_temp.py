@@ -12,6 +12,7 @@ from app.config import get_settings
 from app.db.models import TelegramOutbox, TelegramOutboxStatus, UploadRequest, UploadStatus
 from app.db.session import SessionLocal
 from app.services.storage import StoragePathError, TempStorage
+from app.services.telegram_outbox import TelegramEventType
 
 logger = logging.getLogger(__name__)
 HEALTHCHECK_FILE = Path("/tmp/yd_upd_approver_cleanup_heartbeat")  # noqa: S108
@@ -22,6 +23,15 @@ KEEP_STATUSES = {
     UploadStatus.uploading,
     UploadStatus.failed,
 }
+TERMINAL_UPLOAD_NOTIFICATION_EVENT_TYPES = (
+    TelegramEventType.upload_result_admin,
+    TelegramEventType.upload_result_user,
+    TelegramEventType.upload_rejected,
+)
+DELIVERABLE_OUTBOX_STATUSES = (
+    TelegramOutboxStatus.pending,
+    TelegramOutboxStatus.processing,
+)
 
 
 @dataclass(frozen=True)
@@ -34,16 +44,14 @@ def _now() -> datetime:
     return datetime.now(UTC)
 
 
-async def _has_deliverable_upload_result_outbox(session, request_id: int) -> bool:
+async def _has_pending_terminal_upload_notification(session, request_id: int) -> bool:
     return bool(
         await session.scalar(
             select(
                 exists().where(
                     TelegramOutbox.request_id == request_id,
-                    TelegramOutbox.event_type.in_(("upload_result_admin", "upload_result_user")),
-                    TelegramOutbox.status.in_(
-                        (TelegramOutboxStatus.pending, TelegramOutboxStatus.processing)
-                    ),
+                    TelegramOutbox.event_type.in_(TERMINAL_UPLOAD_NOTIFICATION_EVENT_TYPES),
+                    TelegramOutbox.status.in_(DELIVERABLE_OUTBOX_STATUSES),
                 )
             )
         )
@@ -121,7 +129,7 @@ async def cleanup_temp_pass(
                         exc.__class__.__name__,
                     )
                     continue
-                if request_id is None or not await _has_deliverable_upload_result_outbox(
+                if request_id is None or not await _has_pending_terminal_upload_notification(
                     session, request_id
                 ):
                     request.status = UploadStatus.deleted_temp
