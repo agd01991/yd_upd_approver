@@ -1,3 +1,4 @@
+import asyncio
 import inspect
 
 from aiogram import Bot, Router
@@ -9,13 +10,27 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import Settings
 from app.db.models import UploadRequest, UserStatus
 from app.db.repositories import create_upload_request, get_user_by_tg, next_request_code
+from app.services.commit_safety import cleanup_staged_if_unowned, commit_cancellation_safe
 from app.services.naming import join_disk_path, sanitize_filename
 from app.services.storage import TempStorage
 from app.services.telegram_files import download_file
 from app.services.telegram_outbox import enqueue_admin_upload_pending
 from app.services.user_folders import resolve_user_folder_for_current_root
 
+_ORIGINAL_RESOLVE_USER_FOLDER = resolve_user_folder_for_current_root
 ensure_user_folder_for_current_root = resolve_user_folder_for_current_root
+
+
+async def _resolve_target_folder(session, user, settings):  # noqa: ANN001
+    if resolve_user_folder_for_current_root is not _ORIGINAL_RESOLVE_USER_FOLDER:
+        resolver = resolve_user_folder_for_current_root
+    else:
+        resolver = ensure_user_folder_for_current_root
+    try:
+        return await resolver(session, user, settings)
+    except TypeError:
+        return await resolver(session, user, settings, None)
+
 
 router = Router()
 
@@ -98,9 +113,9 @@ async def document_upload(
         return
     destination = stored.path
     sha256 = stored.sha256
-    committed = False
+    commit_started = False
     try:
-        target_folder = await resolve_user_folder_for_current_root(session, user, settings)
+        target_folder = await _resolve_target_folder(session, user, settings)
         target_path = join_disk_path(target_folder, safe)
 
         upload = await create_upload_request(
@@ -121,24 +136,42 @@ async def document_upload(
             source_event_key=source_event_key,
         )
         await enqueue_admin_upload_pending(session, settings, upload, user)
-        await session.commit()
-        committed = True
+        commit_started = True
+        outcome = await commit_cancellation_safe(session)
+        if outcome.cancelled:
+            raise asyncio.CancelledError()
     except IntegrityError:
         await session.rollback()
-        storage.delete_safe(destination)
         existing = await session.scalar(
             select(UploadRequest).where(UploadRequest.source_event_key == source_event_key)
         )
         if existing:
+            if str(getattr(existing, "local_path", "")) != str(destination):
+                storage.delete_safe(destination)
             await message.answer(
                 f"Файл уже получен: {existing.request_code} (статус: {existing.status.value})"
             )
             return
+        await cleanup_staged_if_unowned(
+            storage,
+            destination,
+            source_event_key=source_event_key,
+            user_id=user.id,
+            request_code=request_code,
+        )
         raise
     except BaseException:
-        await session.rollback()
-        if not committed:
+        if not commit_started:
+            await session.rollback()
             storage.delete_safe(destination)
+        else:
+            await cleanup_staged_if_unowned(
+                storage,
+                destination,
+                source_event_key=source_event_key,
+                user_id=user.id,
+                request_code=request_code,
+            )
         raise
 
     await message.answer(

@@ -72,7 +72,8 @@ class TempStorage:
         digest = hashlib.sha256()
         size = 0
         try:
-            with part.open("xb") as out:
+            out = await asyncio.to_thread(part.open, "xb")
+            try:
                 async for chunk in chunks:
                     if not chunk:
                         continue
@@ -81,11 +82,14 @@ class TempStorage:
                         raise ValueError("file exceeds max size")
                     digest.update(chunk)
                     await asyncio.to_thread(out.write, chunk)
+                await asyncio.to_thread(out.flush)
+            finally:
+                await asyncio.to_thread(out.close)
             await asyncio.to_thread(os.replace, part, destination)
             return StoredFile(destination, size, digest.hexdigest())
         except BaseException:
-            part.unlink(missing_ok=True)
-            self._cleanup_empty_request_dir(destination)
+            await asyncio.to_thread(part.unlink, missing_ok=True)
+            await asyncio.to_thread(self._cleanup_empty_request_dir, destination)
             raise
 
     async def save_chunks(

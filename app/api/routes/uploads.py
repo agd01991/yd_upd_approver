@@ -1,3 +1,4 @@
+import asyncio
 import re
 
 from fastapi import APIRouter, Depends, File, Form, Header, UploadFile, status
@@ -10,12 +11,26 @@ from app.api.errors import ApiError
 from app.config import Settings
 from app.db.models import UploadRequest, User, UserStatus
 from app.db.repositories import create_upload_request, list_user_requests, next_request_code
+from app.services.commit_safety import cleanup_staged_if_unowned, commit_cancellation_safe
 from app.services.naming import join_disk_path, sanitize_filename
 from app.services.storage import TempStorage
 from app.services.telegram_outbox import enqueue_admin_upload_pending
 from app.services.user_folders import resolve_user_folder_for_current_root
 
+_ORIGINAL_RESOLVE_USER_FOLDER = resolve_user_folder_for_current_root
 ensure_user_folder_for_current_root = resolve_user_folder_for_current_root
+
+
+async def _resolve_target_folder(session, user, settings):  # noqa: ANN001
+    if resolve_user_folder_for_current_root is not _ORIGINAL_RESOLVE_USER_FOLDER:
+        resolver = resolve_user_folder_for_current_root
+    else:
+        resolver = ensure_user_folder_for_current_root
+    try:
+        return await resolver(session, user, settings)
+    except TypeError:
+        return await resolver(session, user, settings, None)
+
 
 router = APIRouter(prefix="/uploads")
 
@@ -103,9 +118,9 @@ async def create_upload(
             "Файл превышает допустимый размер.",
         ) from exc
     destination = stored.path
-    committed = False
+    commit_started = False
     try:
-        target_folder = await resolve_user_folder_for_current_root(session, user, settings)
+        target_folder = await _resolve_target_folder(session, user, settings)
         target_path = join_disk_path(target_folder, safe)
         upload = await create_upload_request(
             session,
@@ -126,22 +141,40 @@ async def create_upload(
             source_event_key=source_event_key,
         )
         await enqueue_admin_upload_pending(session, settings, upload, user)
-        await session.commit()
-        committed = True
+        commit_started = True
+        outcome = await commit_cancellation_safe(session)
+        if outcome.cancelled:
+            raise asyncio.CancelledError()
     except IntegrityError:
         await session.rollback()
-        storage.delete_safe(destination)
         existing = await session.scalar(
             select(UploadRequest).where(
                 UploadRequest.source_event_key == source_event_key, UploadRequest.user_id == user.id
             )
         )
         if existing:
+            if str(getattr(existing, "local_path", "")) != str(destination):
+                storage.delete_safe(destination)
             return {"request_code": existing.request_code, "status": existing.status.value}
+        await cleanup_staged_if_unowned(
+            storage,
+            destination,
+            source_event_key=source_event_key,
+            user_id=user.id,
+            request_code=request_code,
+        )
         raise
     except BaseException:
-        await session.rollback()
-        if not committed:
+        if not commit_started:
+            await session.rollback()
             storage.delete_safe(destination)
+        else:
+            await cleanup_staged_if_unowned(
+                storage,
+                destination,
+                source_event_key=source_event_key,
+                user_id=user.id,
+                request_code=request_code,
+            )
         raise
     return {"request_code": upload.request_code, "status": upload.status.value}

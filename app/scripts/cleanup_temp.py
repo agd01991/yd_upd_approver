@@ -43,68 +43,90 @@ async def _has_deliverable_upload_result_outbox(session, request_id: int) -> boo
     )
 
 
-async def cleanup_temp() -> int:
+async def cleanup_temp_pass(last_id: int | None = None) -> tuple[int, int | None]:
+    """Run one bounded cleanup pass.
+
+    temp_cleanup_batch_size is the maximum number of database rows inspected by this pass,
+    including rows skipped because their paths are unsafe or deletion failed. The returned
+    cursor should be passed to the next scheduled pass. ``None`` means the scan reached the
+    end and the next pass should wrap to the beginning.
+    """
     settings = get_settings()
     storage = TempStorage(getattr(settings, "temp_storage_dir", Path(".")))
     rejected_cutoff = _now() - timedelta(days=settings.rejected_retention_days)
     deleted = 0
     checked = 0
     batch_size = getattr(settings, "temp_cleanup_batch_size", 100)
-    last_id = 0
+    cursor = last_id or 0
+    next_cursor: int | None = cursor
     async with SessionLocal() as session:
-        while True:
-            rows = (
-                await session.scalars(
-                    select(UploadRequest)
-                    .where(UploadRequest.id > last_id)
-                    .where(UploadRequest.status.in_(CLEANUP_STATUSES))
-                    .where(UploadRequest.local_path.is_not(None))
-                    .where(
-                        (UploadRequest.status == UploadStatus.uploaded)
-                        | (UploadRequest.created_at < rejected_cutoff)
-                    )
-                    .order_by(UploadRequest.id)
-                    .limit(batch_size)
+        rows = (
+            await session.scalars(
+                select(UploadRequest)
+                .where(UploadRequest.id > cursor)
+                .where(UploadRequest.status.in_(CLEANUP_STATUSES))
+                .where(UploadRequest.local_path.is_not(None))
+                .where(
+                    (UploadRequest.status == UploadStatus.uploaded)
+                    | (UploadRequest.created_at < rejected_cutoff)
                 )
-            ).all()
-            if rows and not hasattr(settings, "temp_storage_dir"):
-                storage = TempStorage(Path(rows[0].local_path).parent)
-            if not rows:
-                break
-            for request in rows:
-                checked += 1
-                last_id = max(last_id, getattr(request, "id", last_id))
-                if request.status in KEEP_STATUSES or not request.local_path:
-                    continue
-                try:
-                    storage.delete_safe(request.local_path)
-                    deleted += 1
-                except StoragePathError:
-                    logger.warning(
-                        "Skip unsafe temp path during cleanup: request_id=%s category=outside_temp_storage",
-                        getattr(request, "id", None),
-                    )
-                    continue
-                except Exception as exc:
-                    logger.warning(
-                        "Temp cleanup delete failed: request_id=%s category=%s",
-                        request.id,
-                        exc.__class__.__name__,
-                    )
-                    continue
-                request_id = getattr(request, "id", None)
-                if request_id is None or not await _has_deliverable_upload_result_outbox(
-                    session, request_id
-                ):
-                    request.status = UploadStatus.deleted_temp
-            await session.commit()
-            if len(rows) < batch_size:
-                break
+                .order_by(UploadRequest.id)
+                .limit(batch_size)
+            )
+        ).all()
+        if rows and not hasattr(settings, "temp_storage_dir"):
+            storage = TempStorage(Path(rows[0].local_path).parent)
+        if not rows:
+            next_cursor = None
+        for request in rows:
+            checked += 1
+            next_cursor = max(next_cursor or 0, getattr(request, "id", next_cursor or 0))
+            if request.status in KEEP_STATUSES or not request.local_path:
+                continue
+            try:
+                storage.delete_safe(request.local_path)
+                deleted += 1
+            except StoragePathError:
+                logger.warning(
+                    "Skip unsafe temp path during cleanup: request_id=%s category=outside_temp_storage",
+                    getattr(request, "id", None),
+                )
+                continue
+            except Exception as exc:
+                logger.warning(
+                    "Temp cleanup delete failed: request_id=%s category=%s",
+                    request.id,
+                    exc.__class__.__name__,
+                )
+                continue
+            request_id = getattr(request, "id", None)
+            if request_id is None or not await _has_deliverable_upload_result_outbox(
+                session, request_id
+            ):
+                request.status = UploadStatus.deleted_temp
+        await session.commit()
     deleted += await cleanup_old_parts(
         storage, getattr(settings, "temp_part_retention_seconds", 3600)
     )
-    logger.info("temp cleanup finished: checked=%s deleted=%s", checked, deleted)
-    return deleted
+    logger.info(
+        "temp cleanup pass finished: checked=%s deleted=%s next_cursor=%s",
+        checked,
+        deleted,
+        next_cursor,
+    )
+    if checked < batch_size:
+        next_cursor = None
+    return deleted, next_cursor
+
+
+async def cleanup_temp() -> int:
+    total_deleted = 0
+    cursor = None
+    while True:
+        deleted, cursor = await cleanup_temp_pass(cursor)
+        total_deleted += deleted
+        if cursor is None:
+            return total_deleted
 
 
 async def cleanup_old_parts(storage: TempStorage, retention_seconds: int) -> int:
@@ -134,8 +156,9 @@ async def run(stop: asyncio.Event) -> None:
     settings = get_settings()
     health_task = asyncio.create_task(health_heartbeat(stop))
     try:
+        cursor = None
         while not stop.is_set():
-            await cleanup_temp()
+            _deleted, cursor = await cleanup_temp_pass(cursor)
             with suppress(TimeoutError):
                 await asyncio.wait_for(
                     stop.wait(), timeout=getattr(settings, "temp_cleanup_interval_seconds", 3600)
