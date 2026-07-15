@@ -60,3 +60,121 @@ async def test_cleanup_deletes_only_terminal_status_temp_files(monkeypatch, tmp_
     assert rows[0].status == UploadStatus.deleted_temp
     assert not old_file.exists()
     assert failed_file.exists()
+
+
+@pytest.mark.anyio
+async def test_cleanup_keyset_pagination_does_not_starve_after_unsafe_batch(
+    monkeypatch, tmp_path
+) -> None:  # noqa: ANN001
+    batch_size = 2
+    external = tmp_path / "external"
+    external.mkdir()
+    safe_root = tmp_path / "safe"
+    safe_root.mkdir()
+    safe_file = safe_root / "REQ-SAFE" / "ok.txt"
+    safe_file.parent.mkdir()
+    safe_file.write_text("ok")
+    rows = [
+        SimpleNamespace(
+            id=1,
+            status=UploadStatus.uploaded,
+            local_path=str(external / "1.txt"),
+            created_at=datetime.now(UTC),
+        ),
+        SimpleNamespace(
+            id=2,
+            status=UploadStatus.uploaded,
+            local_path=str(external / "2.txt"),
+            created_at=datetime.now(UTC),
+        ),
+        SimpleNamespace(
+            id=3,
+            status=UploadStatus.uploaded,
+            local_path=str(safe_file),
+            created_at=datetime.now(UTC),
+        ),
+    ]
+
+    class PagingSession(FakeSession):
+        async def scalars(self, statement):  # noqa: ANN001
+            text = str(statement.compile(compile_kwargs={"literal_binds": True}))
+            if "upload_requests.id > 0" in text:
+                return FakeScalars(rows[:batch_size])
+            return FakeScalars(rows[batch_size:])
+
+    monkeypatch.setattr(cleanup_temp, "SessionLocal", lambda: PagingSession(rows))
+    monkeypatch.setattr(
+        cleanup_temp,
+        "get_settings",
+        lambda: SimpleNamespace(
+            rejected_retention_days=7,
+            temp_storage_dir=safe_root,
+            temp_cleanup_batch_size=batch_size,
+            temp_part_retention_seconds=3600,
+        ),
+    )
+
+    async def no_outbox(*_):  # noqa: ANN002
+        return False
+
+    monkeypatch.setattr(cleanup_temp, "_has_deliverable_upload_result_outbox", no_outbox)
+
+    deleted = await cleanup_temp.cleanup_temp()
+
+    assert deleted == 1
+    assert not safe_file.exists()
+    assert rows[2].status == UploadStatus.deleted_temp
+    assert rows[0].status == UploadStatus.uploaded
+    assert rows[1].status == UploadStatus.uploaded
+
+
+@pytest.mark.anyio
+async def test_cleanup_keeps_status_while_upload_result_outbox_pending(
+    monkeypatch, tmp_path
+) -> None:  # noqa: ANN001
+    path = tmp_path / "REQ" / "file.txt"
+    path.parent.mkdir()
+    path.write_text("ok")
+    row = SimpleNamespace(
+        id=10, status=UploadStatus.uploaded, local_path=str(path), created_at=datetime.now(UTC)
+    )
+    monkeypatch.setattr(cleanup_temp, "SessionLocal", lambda: FakeSession([row]))
+    monkeypatch.setattr(
+        cleanup_temp,
+        "get_settings",
+        lambda: SimpleNamespace(
+            rejected_retention_days=7,
+            temp_storage_dir=tmp_path,
+            temp_cleanup_batch_size=100,
+            temp_part_retention_seconds=3600,
+        ),
+    )
+
+    async def pending(*_):  # noqa: ANN002
+        return True
+
+    monkeypatch.setattr(cleanup_temp, "_has_deliverable_upload_result_outbox", pending)
+
+    assert await cleanup_temp.cleanup_temp() == 1
+    assert row.status == UploadStatus.uploaded
+    assert not path.exists()
+
+
+def test_cleanup_main_uses_asyncio_run(monkeypatch) -> None:  # noqa: ANN001
+    called = {}
+    monkeypatch.setattr(cleanup_temp, "get_settings", lambda: SimpleNamespace(log_level="INFO"))
+
+    def fake_run(coro):  # noqa: ANN001
+        called["coro"] = coro
+        coro.close()
+
+    monkeypatch.setattr(cleanup_temp.asyncio, "run", fake_run)
+    monkeypatch.setattr(
+        cleanup_temp.asyncio,
+        "get_event_loop",
+        lambda: (_ for _ in ()).throw(AssertionError("legacy loop")),
+    )
+
+    cleanup_temp.main()
+
+    assert called["coro"].cr_code.co_name == "main_async"

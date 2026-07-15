@@ -103,9 +103,10 @@ async def create_upload(
             "Файл превышает допустимый размер.",
         ) from exc
     destination = stored.path
-    target_folder = await resolve_user_folder_for_current_root(session, user, settings)
-    target_path = join_disk_path(target_folder, safe)
+    committed = False
     try:
+        target_folder = await resolve_user_folder_for_current_root(session, user, settings)
+        target_path = join_disk_path(target_folder, safe)
         upload = await create_upload_request(
             session,
             request_code=request_code,
@@ -126,6 +127,7 @@ async def create_upload(
         )
         await enqueue_admin_upload_pending(session, settings, upload, user)
         await session.commit()
+        committed = True
     except IntegrityError:
         await session.rollback()
         storage.delete_safe(destination)
@@ -136,5 +138,10 @@ async def create_upload(
         )
         if existing:
             return {"request_code": existing.request_code, "status": existing.status.value}
+        raise
+    except BaseException:
+        await session.rollback()
+        if not committed:
+            storage.delete_safe(destination)
         raise
     return {"request_code": upload.request_code, "status": upload.status.value}

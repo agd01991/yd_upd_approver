@@ -5,10 +5,10 @@ from contextlib import suppress
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from sqlalchemy import select
+from sqlalchemy import exists, select
 
 from app.config import get_settings
-from app.db.models import UploadRequest, UploadStatus
+from app.db.models import TelegramOutbox, TelegramOutboxStatus, UploadRequest, UploadStatus
 from app.db.session import SessionLocal
 from app.services.storage import StoragePathError, TempStorage
 
@@ -27,50 +27,79 @@ def _now() -> datetime:
     return datetime.now(UTC)
 
 
+async def _has_deliverable_upload_result_outbox(session, request_id: int) -> bool:
+    return bool(
+        await session.scalar(
+            select(
+                exists().where(
+                    TelegramOutbox.request_id == request_id,
+                    TelegramOutbox.event_type.in_(("upload_result_admin", "upload_result_user")),
+                    TelegramOutbox.status.in_(
+                        (TelegramOutboxStatus.pending, TelegramOutboxStatus.processing)
+                    ),
+                )
+            )
+        )
+    )
+
+
 async def cleanup_temp() -> int:
     settings = get_settings()
     storage = TempStorage(getattr(settings, "temp_storage_dir", Path(".")))
     rejected_cutoff = _now() - timedelta(days=settings.rejected_retention_days)
     deleted = 0
     checked = 0
+    batch_size = getattr(settings, "temp_cleanup_batch_size", 100)
+    last_id = 0
     async with SessionLocal() as session:
-        rows = (
-            await session.scalars(
-                select(UploadRequest)
-                .where(UploadRequest.status.in_(CLEANUP_STATUSES))
-                .where(UploadRequest.local_path.is_not(None))
-                .where(
-                    (UploadRequest.status == UploadStatus.uploaded)
-                    | (UploadRequest.created_at < rejected_cutoff)
+        while True:
+            rows = (
+                await session.scalars(
+                    select(UploadRequest)
+                    .where(UploadRequest.id > last_id)
+                    .where(UploadRequest.status.in_(CLEANUP_STATUSES))
+                    .where(UploadRequest.local_path.is_not(None))
+                    .where(
+                        (UploadRequest.status == UploadStatus.uploaded)
+                        | (UploadRequest.created_at < rejected_cutoff)
+                    )
+                    .order_by(UploadRequest.id)
+                    .limit(batch_size)
                 )
-                .order_by(UploadRequest.id)
-                .limit(getattr(settings, "temp_cleanup_batch_size", 100))
-            )
-        ).all()
-        if rows and not hasattr(settings, "temp_storage_dir"):
-            storage = TempStorage(Path(rows[0].local_path).parent)
-        for request in rows:
-            checked += 1
-            if request.status in KEEP_STATUSES or not request.local_path:
-                continue
-            try:
-                storage.delete_safe(request.local_path)
-                deleted += 1
-            except StoragePathError:
-                logger.warning(
-                    "Skip unsafe temp path during cleanup: request_id=%s",
-                    getattr(request, "id", None),
-                )
-                continue
-            except Exception as exc:
-                logger.warning(
-                    "Temp cleanup delete failed: request_id=%s category=%s",
-                    request.id,
-                    exc.__class__.__name__,
-                )
-                continue
-            request.status = UploadStatus.deleted_temp
-        await session.commit()
+            ).all()
+            if rows and not hasattr(settings, "temp_storage_dir"):
+                storage = TempStorage(Path(rows[0].local_path).parent)
+            if not rows:
+                break
+            for request in rows:
+                checked += 1
+                last_id = max(last_id, getattr(request, "id", last_id))
+                if request.status in KEEP_STATUSES or not request.local_path:
+                    continue
+                try:
+                    storage.delete_safe(request.local_path)
+                    deleted += 1
+                except StoragePathError:
+                    logger.warning(
+                        "Skip unsafe temp path during cleanup: request_id=%s category=outside_temp_storage",
+                        getattr(request, "id", None),
+                    )
+                    continue
+                except Exception as exc:
+                    logger.warning(
+                        "Temp cleanup delete failed: request_id=%s category=%s",
+                        request.id,
+                        exc.__class__.__name__,
+                    )
+                    continue
+                request_id = getattr(request, "id", None)
+                if request_id is None or not await _has_deliverable_upload_result_outbox(
+                    session, request_id
+                ):
+                    request.status = UploadStatus.deleted_temp
+            await session.commit()
+            if len(rows) < batch_size:
+                break
     deleted += await cleanup_old_parts(
         storage, getattr(settings, "temp_part_retention_seconds", 3600)
     )
@@ -116,15 +145,19 @@ async def run(stop: asyncio.Event) -> None:
         await asyncio.gather(health_task, return_exceptions=True)
 
 
-def main() -> None:
+async def main_async() -> None:
     settings = get_settings()
     logging.basicConfig(level=settings.log_level)
     stop = asyncio.Event()
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
-        with suppress(NotImplementedError):
+        with suppress(NotImplementedError, RuntimeError):
             loop.add_signal_handler(sig, stop.set)
-    loop.run_until_complete(run(stop))
+    await run(stop)
+
+
+def main() -> None:
+    asyncio.run(main_async())
 
 
 if __name__ == "__main__":

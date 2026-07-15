@@ -98,10 +98,11 @@ async def document_upload(
         return
     destination = stored.path
     sha256 = stored.sha256
-    target_folder = await resolve_user_folder_for_current_root(session, user, settings)
-    target_path = join_disk_path(target_folder, safe)
-
+    committed = False
     try:
+        target_folder = await resolve_user_folder_for_current_root(session, user, settings)
+        target_path = join_disk_path(target_folder, safe)
+
         upload = await create_upload_request(
             session,
             request_code=request_code,
@@ -121,6 +122,7 @@ async def document_upload(
         )
         await enqueue_admin_upload_pending(session, settings, upload, user)
         await session.commit()
+        committed = True
     except IntegrityError:
         await session.rollback()
         storage.delete_safe(destination)
@@ -132,6 +134,11 @@ async def document_upload(
                 f"Файл уже получен: {existing.request_code} (статус: {existing.status.value})"
             )
             return
+        raise
+    except BaseException:
+        await session.rollback()
+        if not committed:
+            storage.delete_safe(destination)
         raise
 
     await message.answer(

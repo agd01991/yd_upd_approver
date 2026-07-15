@@ -232,3 +232,60 @@ def test_admin_upload_status_parser_rejects_unknown_status() -> None:
 
     assert exc.value.status_code == 400
     assert "Неизвестный статус" in exc.value.detail
+
+
+@pytest.mark.anyio
+async def test_create_upload_cleans_staged_file_when_folder_resolution_fails(
+    monkeypatch, tmp_path
+) -> None:  # noqa: ANN001
+    from app.api.routes import uploads
+    from app.config import Settings
+
+    class UploadSession:
+        def __init__(self) -> None:
+            self.rolled_back = False
+
+        async def scalar(self, stmt):  # noqa: ANN001
+            return None
+
+        async def rollback(self) -> None:
+            self.rolled_back = True
+
+    class FakeUploadFile:
+        filename = "report.txt"
+        content_type = "text/plain"
+
+        def __init__(self) -> None:
+            self._chunks = [b"hello"]
+
+        async def read(self, size):  # noqa: ANN001
+            return self._chunks.pop(0) if self._chunks else b""
+
+        async def close(self) -> None:
+            pass
+
+    async def fake_next_code(session):  # noqa: ANN001
+        return "REQ-CLEAN"
+
+    async def fail_resolve(*args):  # noqa: ANN002
+        raise RuntimeError("folder unavailable")
+
+    monkeypatch.setattr(uploads, "next_request_code", fake_next_code)
+    monkeypatch.setattr(uploads, "resolve_user_folder_for_current_root", fail_resolve)
+    session = UploadSession()
+    user = SimpleNamespace(id=1, status=UserStatus.active, root_folder="disk:/root/")
+
+    with pytest.raises(RuntimeError):
+        await uploads.create_upload(
+            file=FakeUploadFile(),
+            caption=None,
+            current=(user, False),
+            session=session,
+            settings=Settings(temp_storage_dir=tmp_path),
+            idempotency_key="idem-1",
+        )
+
+    assert session.rolled_back
+    assert not (tmp_path / "REQ-CLEAN" / "report.txt").exists()
+    assert not list(tmp_path.glob("**/*.part"))
+    assert not (tmp_path / "REQ-CLEAN").exists()
