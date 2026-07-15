@@ -1,12 +1,16 @@
 import asyncio
 import hashlib
+import logging
 import os
-from collections.abc import AsyncIterable, Iterable
+from collections.abc import AsyncIterable, Callable, Iterable
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TypeVar
 from uuid import uuid4
 
 CHUNK_SIZE = 1024 * 1024
+logger = logging.getLogger(__name__)
+T = TypeVar("T")
 
 
 @dataclass(frozen=True)
@@ -59,6 +63,53 @@ class TempStorage:
         except OSError:
             pass
 
+    async def _run_blocking_file_op(
+        self, operation: Callable[..., T], /, *args: object, cleanup_context: str
+    ) -> T:
+        task = asyncio.create_task(asyncio.to_thread(operation, *args))
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            try:
+                await task
+            except BaseException as exc:
+                logger.warning(
+                    "Cancelled temp file operation finished with error: operation=%s category=%s",
+                    cleanup_context,
+                    exc.__class__.__name__,
+                )
+            raise
+        except BaseException:
+            if not task.done():
+                task.cancel()
+                try:
+                    await task
+                except BaseException as exc:
+                    logger.debug(
+                        "Discarding failed temp file operation after primary error: operation=%s category=%s",
+                        cleanup_context,
+                        exc.__class__.__name__,
+                    )
+            raise
+
+    async def _cleanup_after_save_failure(
+        self, *, part: Path, destination: Path, renamed: bool
+    ) -> None:
+        def cleanup() -> None:
+            target = destination if renamed else part
+            target.unlink(missing_ok=True)
+            self._cleanup_empty_request_dir(destination)
+
+        try:
+            await self._run_blocking_file_op(cleanup, cleanup_context="cleanup")
+        except asyncio.CancelledError:
+            raise
+        except BaseException as exc:
+            logger.warning(
+                "Temp file cleanup failed: operation=save_async_chunks_cleanup category=%s",
+                exc.__class__.__name__,
+            )
+
     async def save_async_chunks(
         self,
         request_code: str,
@@ -71,8 +122,10 @@ class TempStorage:
         part = destination.with_name(f".{destination.name}.{uuid4().hex}.part")
         digest = hashlib.sha256()
         size = 0
+        renamed = False
         try:
-            with part.open("xb") as out:
+            out = await self._run_blocking_file_op(part.open, "xb", cleanup_context="open")
+            try:
                 async for chunk in chunks:
                     if not chunk:
                         continue
@@ -80,12 +133,34 @@ class TempStorage:
                     if max_bytes is not None and size > max_bytes:
                         raise ValueError("file exceeds max size")
                     digest.update(chunk)
-                    await asyncio.to_thread(out.write, chunk)
-            await asyncio.to_thread(os.replace, part, destination)
+                    await self._run_blocking_file_op(out.write, chunk, cleanup_context="write")
+                await self._run_blocking_file_op(out.flush, cleanup_context="flush")
+            finally:
+                await self._run_blocking_file_op(out.close, cleanup_context="close")
+            replace_task = asyncio.create_task(asyncio.to_thread(os.replace, part, destination))
+            try:
+                await asyncio.shield(replace_task)
+                renamed = True
+            except asyncio.CancelledError:
+                try:
+                    await replace_task
+                    renamed = True
+                except BaseException as exc:
+                    logger.warning(
+                        "Cancelled temp file operation finished with error: operation=replace category=%s",
+                        exc.__class__.__name__,
+                    )
+                raise
             return StoredFile(destination, size, digest.hexdigest())
+        except asyncio.CancelledError:
+            await self._cleanup_after_save_failure(
+                part=part, destination=destination, renamed=renamed
+            )
+            raise
         except BaseException:
-            part.unlink(missing_ok=True)
-            self._cleanup_empty_request_dir(destination)
+            await self._cleanup_after_save_failure(
+                part=part, destination=destination, renamed=renamed
+            )
             raise
 
     async def save_chunks(
