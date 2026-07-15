@@ -8,7 +8,7 @@ from aiogram import Bot
 from app.services.storage import CHUNK_SIZE, StoredFile, TempStorage
 
 
-class _BoundedStagingWriter:
+class _ThreadedCompatWriter:
     def __init__(
         self, storage: TempStorage, request_code: str, filename: str, max_bytes: int
     ) -> None:
@@ -44,9 +44,6 @@ class _BoundedStagingWriter:
     def flush(self) -> None:
         self._file.flush()
 
-    def seek(self, offset: int, whence: int = 0) -> int:
-        return self._file.seek(offset, whence)
-
     def close(self) -> None:
         if not self._file.closed:
             self._file.close()
@@ -72,15 +69,37 @@ async def download_file(
     max_bytes: int,
 ) -> StoredFile:
     tg_file = await bot.get_file(file_id)
-    writer = _BoundedStagingWriter(storage, request_code, filename, max_bytes)
-    try:
-        await bot.download_file(
-            tg_file.file_path,
-            destination=writer,
+
+    if not hasattr(bot, "session"):
+        writer = _ThreadedCompatWriter(storage, request_code, filename, max_bytes)
+        try:
+            await bot.download_file(
+                tg_file.file_path, destination=writer, chunk_size=CHUNK_SIZE, seek=False
+            )
+            return await asyncio.to_thread(writer.commit)
+        except BaseException:
+            await asyncio.to_thread(writer.cleanup)
+            raise
+
+    async def chunks():
+        if bot.session.api.is_local:
+            stream = bot._Bot__aiofiles_reader(  # noqa: SLF001
+                bot.session.api.wrap_local_file.to_local(tg_file.file_path),
+                chunk_size=CHUNK_SIZE,
+            )
+            try:
+                async for chunk in stream:
+                    yield chunk
+            finally:
+                await stream.aclose()
+            return
+        url = bot.session.api.file_url(bot.token, tg_file.file_path)
+        async for chunk in bot.session.stream_content(
+            url=url,
+            timeout=30,
             chunk_size=CHUNK_SIZE,
-            seek=False,
-        )
-        return await asyncio.to_thread(writer.commit)
-    except BaseException:
-        await asyncio.to_thread(writer.cleanup)
-        raise
+            raise_for_status=True,
+        ):
+            yield chunk
+
+    return await storage.save_async_chunks(request_code, filename, chunks(), max_bytes=max_bytes)
