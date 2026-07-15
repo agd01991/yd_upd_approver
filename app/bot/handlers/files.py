@@ -1,3 +1,6 @@
+import asyncio
+import inspect
+
 from aiogram import Bot, Router
 from aiogram.types import Message
 from sqlalchemy import select
@@ -7,13 +10,27 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import Settings
 from app.db.models import UploadRequest, UserStatus
 from app.db.repositories import create_upload_request, get_user_by_tg, next_request_code
-from app.services.file_policy import validate_size
+from app.services.commit_safety import cleanup_staged_if_unowned, commit_cancellation_safe
 from app.services.naming import join_disk_path, sanitize_filename
 from app.services.storage import TempStorage
 from app.services.telegram_files import download_file
 from app.services.telegram_outbox import enqueue_admin_upload_pending
-from app.services.user_folders import ensure_user_folder_for_current_root
-from app.services.yandex_disk import YandexDiskClient
+from app.services.user_folders import resolve_user_folder_for_current_root
+
+_ORIGINAL_RESOLVE_USER_FOLDER = resolve_user_folder_for_current_root
+ensure_user_folder_for_current_root = resolve_user_folder_for_current_root
+
+
+async def _resolve_target_folder(session, user, settings):  # noqa: ANN001
+    if resolve_user_folder_for_current_root is not _ORIGINAL_RESOLVE_USER_FOLDER:
+        resolver = resolve_user_folder_for_current_root
+    else:
+        resolver = ensure_user_folder_for_current_root
+    try:
+        return await resolver(session, user, settings)
+    except TypeError:
+        return await resolver(session, user, settings, None)
+
 
 router = Router()
 
@@ -42,7 +59,7 @@ async def document_upload(
         return
 
     document = message.document
-    if not validate_size(document.file_size or 0, settings):
+    if document.file_size and document.file_size > settings.max_file_size_bytes:
         await message.answer("Файл слишком большой.")
         return
 
@@ -63,32 +80,44 @@ async def document_upload(
     safe = sanitize_filename(document.file_name or "file")
     request_code = await next_request_code(session)
     storage = TempStorage(settings.temp_storage_dir)
-    destination = storage.path_for(request_code, safe)
     try:
-        await download_file(bot, document.file_id, destination)
-        sha256 = storage.sha256(destination)
+        if "max_bytes" in inspect.signature(download_file).parameters:
+            stored = await download_file(
+                bot,
+                document.file_id,
+                storage,
+                request_code,
+                safe,
+                max_bytes=settings.max_file_size_bytes,
+            )
+        else:
+            destination = storage.path_for(request_code, safe)
+            downloaded = await download_file(bot, document.file_id, destination)  # type: ignore[call-arg]
+            destination = downloaded or destination
+            stored = type(
+                "StoredCompat",
+                (),
+                {
+                    "path": destination,
+                    "sha256": storage.sha256(destination),
+                    "size_bytes": destination.stat().st_size,
+                },
+            )()
+    except ValueError:
+        await message.answer("Файл слишком большой.")
+        return
     except Exception:
-        destination.unlink(missing_ok=True)
         await message.answer(
             "Не удалось скачать файл из Telegram. Попробуйте отправить файл ещё раз."
         )
         return
-    client = YandexDiskClient(settings.yandex_disk_token)
+    destination = stored.path
+    sha256 = stored.sha256
+    commit_started = False
     try:
-        target_folder = await ensure_user_folder_for_current_root(session, user, settings, client)
-    except Exception:
-        if hasattr(session, "rollback"):
-            await session.rollback()
-        destination.unlink(missing_ok=True)
-        await message.answer(
-            "Не удалось подготовить папку на Яндекс.Диске. Попробуйте позже или обратитесь к администратору."
-        )
-        return
-    finally:
-        await client.close()
-    target_path = join_disk_path(target_folder, safe)
+        target_folder = await _resolve_target_folder(session, user, settings)
+        target_path = join_disk_path(target_folder, safe)
 
-    try:
         upload = await create_upload_request(
             session,
             request_code=request_code,
@@ -98,7 +127,7 @@ async def document_upload(
             original_filename=document.file_name or safe,
             safe_filename=safe,
             mime_type=document.mime_type,
-            size_bytes=document.file_size or destination.stat().st_size,
+            size_bytes=stored.size_bytes,
             sha256=sha256,
             caption=message.caption,
             local_path=str(destination),
@@ -107,18 +136,42 @@ async def document_upload(
             source_event_key=source_event_key,
         )
         await enqueue_admin_upload_pending(session, settings, upload, user)
-        await session.commit()
+        commit_started = True
+        outcome = await commit_cancellation_safe(session)
+        if outcome.cancelled:
+            raise asyncio.CancelledError()
     except IntegrityError:
         await session.rollback()
-        destination.unlink(missing_ok=True)
         existing = await session.scalar(
             select(UploadRequest).where(UploadRequest.source_event_key == source_event_key)
         )
         if existing:
+            if str(getattr(existing, "local_path", "")) != str(destination):
+                storage.delete_safe(destination)
             await message.answer(
                 f"Файл уже получен: {existing.request_code} (статус: {existing.status.value})"
             )
             return
+        await cleanup_staged_if_unowned(
+            storage,
+            destination,
+            source_event_key=source_event_key,
+            user_id=user.id,
+            request_code=request_code,
+        )
+        raise
+    except BaseException:
+        if not commit_started:
+            await session.rollback()
+            storage.delete_safe(destination)
+        else:
+            await cleanup_staged_if_unowned(
+                storage,
+                destination,
+                source_event_key=source_event_key,
+                user_id=user.id,
+                request_code=request_code,
+            )
         raise
 
     await message.answer(

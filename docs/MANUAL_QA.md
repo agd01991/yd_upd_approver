@@ -226,3 +226,11 @@ PostgreSQL is the source of truth for durable Telegram notifications. Redis is n
 6. Temporarily make Telegram unavailable and verify `attempt_count`, `last_error`, and `next_attempt_at` are updated with retry/backoff; permanent forbidden/bad-request errors move to `dead`.
 7. Repeat a Mini App upload with the same `Idempotency-Key` and verify the existing `request_code`/`status` is returned.
 8. Inspect stuck rows safely, for example: `select id,event_type,status,attempt_count,next_attempt_at,last_error from telegram_outbox where status in ('pending','dead') order by id;`.
+
+## PR 5 storage/Yandex performance checks
+
+1. Stop or block Yandex Disk network access, then submit a small file through the Mini App. Expected: the request is accepted as `pending_approval`; actual Yandex folder creation waits for the upload worker.
+2. Upload a file close to `MAX_FILE_SIZE_MB`. Expected: the request succeeds when below the limit and fails with a 413-style message above the limit without leaving a visible final temp file.
+3. Open a Yandex Disk folder containing more than 50 objects in the Mini App. Expected: the first page renders quickly, the “Показать ещё” button appends the next page, and repeated clicks while loading do not start parallel page requests.
+4. Approve an upload and wait for the worker. Expected: after DB state becomes `uploaded`, local temp cleanup can remove the file and the request eventually becomes `deleted_temp`.
+5. Start Docker Compose and check `cleanup-worker` health with `docker compose ps cleanup-worker`; logs should show aggregate checked/deleted counts only, not local paths or tokens.

@@ -1,3 +1,4 @@
+import asyncio
 import re
 
 from fastapi import APIRouter, Depends, File, Form, Header, UploadFile, status
@@ -10,12 +11,26 @@ from app.api.errors import ApiError
 from app.config import Settings
 from app.db.models import UploadRequest, User, UserStatus
 from app.db.repositories import create_upload_request, list_user_requests, next_request_code
-from app.services.file_policy import validate_size
+from app.services.commit_safety import cleanup_staged_if_unowned, commit_cancellation_safe
 from app.services.naming import join_disk_path, sanitize_filename
 from app.services.storage import TempStorage
 from app.services.telegram_outbox import enqueue_admin_upload_pending
-from app.services.user_folders import ensure_user_folder_for_current_root
-from app.services.yandex_disk import YandexDiskClient
+from app.services.user_folders import resolve_user_folder_for_current_root
+
+_ORIGINAL_RESOLVE_USER_FOLDER = resolve_user_folder_for_current_root
+ensure_user_folder_for_current_root = resolve_user_folder_for_current_root
+
+
+async def _resolve_target_folder(session, user, settings):  # noqa: ANN001
+    if resolve_user_folder_for_current_root is not _ORIGINAL_RESOLVE_USER_FOLDER:
+        resolver = resolve_user_folder_for_current_root
+    else:
+        resolver = ensure_user_folder_for_current_root
+    try:
+        return await resolver(session, user, settings)
+    except TypeError:
+        return await resolver(session, user, settings, None)
+
 
 router = APIRouter(prefix="/uploads")
 
@@ -80,33 +95,33 @@ async def create_upload(
     safe = sanitize_filename(file.filename or "file")
     request_code = await next_request_code(session)
     storage = TempStorage(settings.temp_storage_dir)
-    destination = storage.path_for(request_code, safe)
-    size = 0
-    with destination.open("wb") as out:
-        while chunk := await file.read(1024 * 1024):
-            size += len(chunk)
-            if not validate_size(size, settings):
-                destination.unlink(missing_ok=True)
-                raise ApiError(
-                    status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
-                    "file_too_large",
-                    "Файл превышает допустимый размер.",
-                )
-            out.write(chunk)
-    client = YandexDiskClient(settings.yandex_disk_token)
+
+    async def chunks():
+        try:
+            while chunk := await file.read(1024 * 1024):
+                yield chunk
+        finally:
+            close = getattr(file, "close", None)
+            if close:
+                result = close()
+                if hasattr(result, "__await__"):
+                    await result
+
     try:
-        target_folder = await ensure_user_folder_for_current_root(session, user, settings, client)
-    except Exception as exc:
-        if hasattr(session, "rollback"):
-            await session.rollback()
-        destination.unlink(missing_ok=True)
+        stored = await storage.save_async_chunks(
+            request_code, safe, chunks(), max_bytes=settings.max_file_size_bytes
+        )
+    except ValueError as exc:
         raise ApiError(
-            503, "yandex_disk_unavailable", "Не удалось подготовить папку на Яндекс.Диске"
+            status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            "file_too_large",
+            "Файл превышает допустимый размер.",
         ) from exc
-    finally:
-        await client.close()
-    target_path = join_disk_path(target_folder, safe)
+    destination = stored.path
+    commit_started = False
     try:
+        target_folder = await _resolve_target_folder(session, user, settings)
+        target_path = join_disk_path(target_folder, safe)
         upload = await create_upload_request(
             session,
             request_code=request_code,
@@ -117,8 +132,8 @@ async def create_upload(
             original_filename=file.filename or safe,
             safe_filename=safe,
             mime_type=file.content_type,
-            size_bytes=size,
-            sha256=storage.sha256(destination),
+            size_bytes=stored.size_bytes,
+            sha256=stored.sha256,
             caption=caption,
             local_path=str(destination),
             target_folder=target_folder,
@@ -126,16 +141,40 @@ async def create_upload(
             source_event_key=source_event_key,
         )
         await enqueue_admin_upload_pending(session, settings, upload, user)
-        await session.commit()
+        commit_started = True
+        outcome = await commit_cancellation_safe(session)
+        if outcome.cancelled:
+            raise asyncio.CancelledError()
     except IntegrityError:
         await session.rollback()
-        destination.unlink(missing_ok=True)
         existing = await session.scalar(
             select(UploadRequest).where(
                 UploadRequest.source_event_key == source_event_key, UploadRequest.user_id == user.id
             )
         )
         if existing:
+            if str(getattr(existing, "local_path", "")) != str(destination):
+                storage.delete_safe(destination)
             return {"request_code": existing.request_code, "status": existing.status.value}
+        await cleanup_staged_if_unowned(
+            storage,
+            destination,
+            source_event_key=source_event_key,
+            user_id=user.id,
+            request_code=request_code,
+        )
+        raise
+    except BaseException:
+        if not commit_started:
+            await session.rollback()
+            storage.delete_safe(destination)
+        else:
+            await cleanup_staged_if_unowned(
+                storage,
+                destination,
+                source_event_key=source_event_key,
+                user_id=user.id,
+                request_code=request_code,
+            )
         raise
     return {"request_code": upload.request_code, "status": upload.status.value}

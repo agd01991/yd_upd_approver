@@ -41,6 +41,27 @@ def stable_user_folder_for_root(root: str, user: User) -> str:
     return _folder_with_trailing_slash(root, basename)
 
 
+async def resolve_user_folder_for_current_root(
+    session: AsyncSession, user: User, settings: Settings
+) -> str:
+    root = (
+        await get_yandex_disk_root(session, settings)
+        if hasattr(session, "scalar")
+        else validate_yandex_disk_root(settings.yandex_disk_root)
+    )
+    expected = (
+        user.root_folder
+        if _is_folder_inside_root(user.root_folder, root)
+        else stable_user_folder_for_root(root, user)
+    )
+    if user.root_folder != expected:
+        user.root_folder = expected
+        user.allowed_folders = [expected]
+        if hasattr(session, "flush"):
+            await session.flush()
+    return expected
+
+
 async def ensure_user_folder_for_current_root(
     session: AsyncSession,
     user: User,
@@ -61,7 +82,8 @@ async def ensure_user_folder_for_current_root(
     if user.root_folder != expected:
         user.root_folder = expected
         user.allowed_folders = [expected]
-        await session.flush()
+        if hasattr(session, "flush"):
+            await session.flush()
     return expected
 
 
@@ -99,5 +121,6 @@ async def change_yandex_disk_root_for_active_users(
         old_value={"yandex_disk_root": old_root},
         new_value={"yandex_disk_root": new_root},
     )
-    await session.flush()
+    if hasattr(session, "flush"):
+        await session.flush()
     return new_root

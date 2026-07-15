@@ -19,6 +19,7 @@ let renameSelectionVersion = 0;
 let selectedUploadEntries = [];
 let uploadInProgress = false;
 let idempotencyFallbackCounter = 0;
+let filesPage = { items: [], loading: false, nextOffset: 0, hasMore: false, error: "" };
 
 const STATUS_LABELS = {
   pending: "ожидает одобрения",
@@ -285,10 +286,45 @@ async function uploadSelectedFiles(event, form, input) {
 async function loadUserLists() {
   userUploads = await api("/api/uploads");
   renderUserRequests();
-  const files = await api("/api/files");
-  document.querySelector("#files").innerHTML = (files.items || []).map((f) =>
+  await refreshFiles();
+}
+
+function renderFiles(message = "Файлов пока нет") {
+  const rows = filesPage.items.map((f) =>
     `<div class="file-row"><span>${f.type === "dir" ? "📁" : "📄"} ${escapeHtml(f.name)}</span><span>${fmtSize(f.size)}</span></div>`
-  ).join("") || `<div class="empty">${escapeHtml(files.message || "Файлов пока нет")}</div>`;
+  ).join("") || `<div class="empty">${escapeHtml(message)}</div>`;
+  const error = filesPage.error ? `<div class="error">${escapeHtml(filesPage.error)}</div>` : "";
+  const more = filesPage.hasMore ? `<button id="load-more-files" ${filesPage.loading ? "disabled" : ""}>${filesPage.loading ? "Загрузка…" : "Показать ещё"}</button>` : "";
+  document.querySelector("#files").innerHTML = rows + error + more;
+  const button = document.querySelector("#load-more-files");
+  if (button) button.onclick = () => loadMoreFiles();
+}
+
+async function refreshFiles() {
+  filesPage = { items: [], loading: false, nextOffset: 0, hasMore: false, error: "" };
+  await loadMoreFiles(true);
+}
+
+async function loadMoreFiles(reset = false) {
+  if (filesPage.loading) return;
+  filesPage.loading = true;
+  filesPage.error = "";
+  renderFiles();
+  const offset = reset ? 0 : (filesPage.nextOffset || 0);
+  try {
+    const files = await api(`/api/files?limit=50&offset=${offset}`);
+    const safeItems = (files.items || []).map((f) => ({ name: f.name, type: f.type, size: f.size, modified: f.modified }));
+    filesPage.items = reset ? safeItems : filesPage.items.concat(safeItems);
+    filesPage.hasMore = Boolean(files.has_more);
+    filesPage.nextOffset = files.next_offset ?? (offset + safeItems.length);
+    renderFiles(files.message || "Файлов пока нет");
+  } catch (err) {
+    filesPage.error = safeErrorMessage(err);
+    renderFiles();
+  } finally {
+    filesPage.loading = false;
+    renderFiles();
+  }
 }
 
 function renderUserRequests() {

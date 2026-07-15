@@ -492,3 +492,25 @@ Configure it with `TELEGRAM_OUTBOX_POLL_SECONDS`, `TELEGRAM_OUTBOX_LEASE_SECONDS
 Delivery is durable at-least-once, not exactly-once. Telegram `sendMessage` has no idempotency key, so if the worker crashes after Telegram accepts a message but before the row is marked `sent`, a duplicate can be delivered. Temporary failures are retried with exponential backoff and jitter. Permanent forbidden/bad-request errors and exhausted retries are moved to `dead`. Operators can inspect pending/dead rows in `telegram_outbox` without exposing tokens or local temp paths.
 
 Mini App uploads require an `Idempotency-Key` header. The frontend generates a UUID per file; duplicate retries return the existing upload request while new keys allow intentional duplicate file submissions.
+
+### Storage, Yandex Disk and cleanup performance
+
+Uploads from the Mini App and Telegram are now staged into `TEMP_STORAGE_DIR` as bounded chunks. The server computes file size and SHA-256 during the same write pass, stores data under a temporary `.part` name, and atomically moves the finished file into the request directory only after a successful write. Intake records the server-side allowed target folder from PostgreSQL/runtime root only; Yandex Disk folder creation is performed later by the upload worker, so temporary Yandex Disk outages do not block creation of a `pending_approval` request.
+
+The upload worker keeps one managed Yandex Disk HTTP client for its lifetime and streams local files with bounded chunks. Folder listing endpoints are page-oriented (`limit` 1–100 and non-negative `offset`) and return only safe item fields plus pagination metadata. The Mini App loads the first page quickly and uses “Показать ещё” for subsequent pages.
+
+Run the scheduled temp cleanup process outside Docker with:
+
+```bash
+python -m app.scripts.cleanup_temp
+```
+
+Cleanup marks successfully cleaned `uploaded` and retention-expired `rejected` rows as `deleted_temp`, treats missing files as already cleaned, removes old orphan `.part` files after a grace period, and never deletes retryable `pending_approval`, `approved`, `uploading`, or `failed` files.
+
+New settings:
+
+- `TEMP_CLEANUP_INTERVAL_SECONDS` — interval between cleanup runs, minimum 60 seconds.
+- `TEMP_PART_RETENTION_SECONDS` — grace period before orphan `.part` removal, minimum 60 seconds.
+- `TEMP_CLEANUP_BATCH_SIZE` — maximum database rows scanned per cleanup pass.
+
+With Docker Compose, `cleanup-worker` starts after `migrate` and exposes a heartbeat healthcheck. Check it with `docker compose ps cleanup-worker` or inspect the container health status.

@@ -1,4 +1,5 @@
 import asyncio
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
 import pytest
@@ -1085,3 +1086,40 @@ async def test_send_with_heartbeat_cancellation_awaits_heartbeat(monkeypatch) ->
     assert bot.cancelled is True
     assert heartbeat_cancelled.is_set()
     assert heartbeat_finally.is_set()
+
+
+async def test_pending_rejection_cleanup_preserves_renderer_status(monkeypatch, tmp_path) -> None:  # noqa: ANN001
+    from app.scripts import cleanup_temp
+    from tests.unit.test_cleanup_temp import OutboxAwareSession
+
+    path = tmp_path / "REQ-000042" / "file.txt"
+    path.parent.mkdir()
+    path.write_text("content")
+    upload = make_upload(status=UploadStatus.rejected, attempt_count=2)
+    upload.local_path = str(path)
+    upload.created_at = datetime.now(UTC) - timedelta(days=10)
+    event = upload_event(
+        {"request_id": 42, "status": "rejected"},
+        event_type="upload_rejected",
+        dedup_key="upload:42:rejected:user:99",
+    )
+    event.status = "pending"
+
+    monkeypatch.setattr(cleanup_temp, "SessionLocal", lambda: OutboxAwareSession([upload], [event]))
+    monkeypatch.setattr(
+        cleanup_temp,
+        "get_settings",
+        lambda: SimpleNamespace(
+            rejected_retention_days=7,
+            temp_storage_dir=tmp_path,
+            temp_cleanup_batch_size=100,
+            temp_part_retention_seconds=3600,
+        ),
+    )
+
+    assert await cleanup_temp.cleanup_temp() == 1
+    assert upload.status == UploadStatus.rejected
+
+    rendered = await worker._render(FakeUploadSession(upload=upload), event)  # noqa: SLF001
+    assert rendered is not None
+    assert "REQ-000042" in rendered[0]
