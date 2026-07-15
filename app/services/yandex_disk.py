@@ -1,3 +1,4 @@
+import asyncio
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
@@ -11,9 +12,12 @@ CHUNK_SIZE = 1024 * 1024
 
 
 async def _iter_file(path: Path) -> AsyncIterator[bytes]:
-    with path.open("rb") as file:
-        while chunk := file.read(CHUNK_SIZE):
+    file = path.open("rb")
+    try:
+        while chunk := await asyncio.to_thread(file.read, CHUNK_SIZE):
             yield chunk
+    finally:
+        await asyncio.to_thread(file.close)
 
 
 class YandexDiskError(RuntimeError):
@@ -39,7 +43,9 @@ class YandexNetworkError(YandexDiskError):
 class YandexDiskClient:
     def __init__(self, token: str, client: httpx.AsyncClient | None = None) -> None:
         self._own = client is None
-        self.client = client or httpx.AsyncClient(timeout=60)
+        timeout = httpx.Timeout(connect=10, read=60, write=60, pool=10)
+        limits = httpx.Limits(max_connections=10, max_keepalive_connections=5, keepalive_expiry=30)
+        self.client = client or httpx.AsyncClient(timeout=timeout, limits=limits)
         self.headers = {"Authorization": f"OAuth {token}"}
 
     async def close(self) -> None:
@@ -107,10 +113,30 @@ class YandexDiskClient:
         )
         self._raise_for_status(response, to_path)
 
-    async def list_files(self, path: str, limit: int = 50) -> list[dict[str, Any]]:
-        response = await self._request("GET", API, params={"path": path, "limit": limit})
+    async def list_files_page(self, path: str, limit: int = 50, offset: int = 0) -> dict[str, Any]:
+        limit = max(1, min(int(limit), 100))
+        offset = max(0, int(offset))
+        fields = "_embedded.items.name,_embedded.items.type,_embedded.items.size,_embedded.items.modified,_embedded.total,_embedded.limit,_embedded.offset"
+        response = await self._request(
+            "GET", API, params={"path": path, "limit": limit, "offset": offset, "fields": fields}
+        )
         self._raise_for_status(response, path)
-        return response.json().get("_embedded", {}).get("items", [])
+        embedded = response.json().get("_embedded", {})
+        total = int(embedded.get("total") or 0)
+        page_limit = int(embedded.get("limit") or limit)
+        page_offset = int(embedded.get("offset") or offset)
+        next_offset = page_offset + page_limit
+        return {
+            "items": embedded.get("items", []),
+            "total": total,
+            "limit": page_limit,
+            "offset": page_offset,
+            "has_more": next_offset < total,
+            "next_offset": next_offset if next_offset < total else None,
+        }
+
+    async def list_files(self, path: str, limit: int = 50) -> list[dict[str, Any]]:
+        return (await self.list_files_page(path, limit=limit, offset=0))["items"]
 
     async def get_upload_url(self, path: str, overwrite: bool = False) -> str:
         response = await self._request(
@@ -121,16 +147,15 @@ class YandexDiskClient:
         self._raise_for_status(response, path)
         return response.json()["href"]
 
-    @staticmethod
-    async def _file_chunks(local_path: str, chunk_size: int = 1024 * 1024) -> AsyncIterator[bytes]:
-        with Path(local_path).open("rb") as file:
-            while chunk := file.read(chunk_size):
-                yield chunk
-
     async def upload_file(self, local_path: str, target_path: str, overwrite: bool = False) -> None:
         upload_url = await self.get_upload_url(target_path, overwrite=overwrite)
         try:
-            response = await self.client.put(upload_url, content=_iter_file(Path(local_path)))
+            size = Path(local_path).stat().st_size
+            response = await self.client.put(
+                upload_url,
+                content=_iter_file(Path(local_path)),
+                headers={"Content-Length": str(size)},
+            )
         except httpx.TimeoutException as exc:
             raise YandexNetworkError("Yandex Disk upload timed out") from exc
         except httpx.NetworkError as exc:

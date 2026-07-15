@@ -1,3 +1,5 @@
+import inspect
+
 from aiogram import Bot, Router
 from aiogram.types import Message
 from sqlalchemy import select
@@ -7,13 +9,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import Settings
 from app.db.models import UploadRequest, UserStatus
 from app.db.repositories import create_upload_request, get_user_by_tg, next_request_code
-from app.services.file_policy import validate_size
 from app.services.naming import join_disk_path, sanitize_filename
 from app.services.storage import TempStorage
 from app.services.telegram_files import download_file
 from app.services.telegram_outbox import enqueue_admin_upload_pending
-from app.services.user_folders import ensure_user_folder_for_current_root
-from app.services.yandex_disk import YandexDiskClient
+from app.services.user_folders import resolve_user_folder_for_current_root
+
+ensure_user_folder_for_current_root = resolve_user_folder_for_current_root
 
 router = Router()
 
@@ -42,7 +44,7 @@ async def document_upload(
         return
 
     document = message.document
-    if not validate_size(document.file_size or 0, settings):
+    if document.file_size and document.file_size > settings.max_file_size_bytes:
         await message.answer("Файл слишком большой.")
         return
 
@@ -63,29 +65,40 @@ async def document_upload(
     safe = sanitize_filename(document.file_name or "file")
     request_code = await next_request_code(session)
     storage = TempStorage(settings.temp_storage_dir)
-    destination = storage.path_for(request_code, safe)
     try:
-        await download_file(bot, document.file_id, destination)
-        sha256 = storage.sha256(destination)
+        if "max_bytes" in inspect.signature(download_file).parameters:
+            stored = await download_file(
+                bot,
+                document.file_id,
+                storage,
+                request_code,
+                safe,
+                max_bytes=settings.max_file_size_bytes,
+            )
+        else:
+            destination = storage.path_for(request_code, safe)
+            downloaded = await download_file(bot, document.file_id, destination)  # type: ignore[call-arg]
+            destination = downloaded or destination
+            stored = type(
+                "StoredCompat",
+                (),
+                {
+                    "path": destination,
+                    "sha256": storage.sha256(destination),
+                    "size_bytes": destination.stat().st_size,
+                },
+            )()
+    except ValueError:
+        await message.answer("Файл слишком большой.")
+        return
     except Exception:
-        destination.unlink(missing_ok=True)
         await message.answer(
             "Не удалось скачать файл из Telegram. Попробуйте отправить файл ещё раз."
         )
         return
-    client = YandexDiskClient(settings.yandex_disk_token)
-    try:
-        target_folder = await ensure_user_folder_for_current_root(session, user, settings, client)
-    except Exception:
-        if hasattr(session, "rollback"):
-            await session.rollback()
-        destination.unlink(missing_ok=True)
-        await message.answer(
-            "Не удалось подготовить папку на Яндекс.Диске. Попробуйте позже или обратитесь к администратору."
-        )
-        return
-    finally:
-        await client.close()
+    destination = stored.path
+    sha256 = stored.sha256
+    target_folder = await resolve_user_folder_for_current_root(session, user, settings)
     target_path = join_disk_path(target_folder, safe)
 
     try:
@@ -98,7 +111,7 @@ async def document_upload(
             original_filename=document.file_name or safe,
             safe_filename=safe,
             mime_type=document.mime_type,
-            size_bytes=document.file_size or destination.stat().st_size,
+            size_bytes=stored.size_bytes,
             sha256=sha256,
             caption=message.caption,
             local_path=str(destination),
@@ -110,7 +123,7 @@ async def document_upload(
         await session.commit()
     except IntegrityError:
         await session.rollback()
-        destination.unlink(missing_ok=True)
+        storage.delete_safe(destination)
         existing = await session.scalar(
             select(UploadRequest).where(UploadRequest.source_event_key == source_event_key)
         )

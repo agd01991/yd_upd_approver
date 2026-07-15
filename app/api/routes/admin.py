@@ -1,7 +1,7 @@
 from datetime import UTC, datetime
 from pathlib import Path
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Query
 from fastapi.responses import FileResponse
 from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -382,21 +382,32 @@ async def folder_items(
     request_id: int,
     session: AsyncSession = Depends(get_db),
     settings: Settings = Depends(settings_dep),
+    limit: int = Query(default=50, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
 ) -> dict:
     r = await session.get(UploadRequest, request_id)
     if not r:
         raise ApiError(404, "request_not_found", "Заявка не найдена.")
     client = YandexDiskClient(settings.yandex_disk_token)
     try:
-        items = await client.list_files(r.target_folder)
+        page = await client.list_files_page(r.target_folder, limit=limit, offset=offset)
     except FileNotFoundError:
-        items = []
+        page = {
+            "items": [],
+            "total": 0,
+            "limit": limit,
+            "offset": offset,
+            "has_more": False,
+            "next_offset": None,
+        }
     finally:
         await client.close()
     return {
+        **page,
         "items": [
-            {"name": i.get("name"), "type": i.get("type"), "size": i.get("size")} for i in items
-        ]
+            {"name": i.get("name"), "type": i.get("type"), "size": i.get("size")}
+            for i in page["items"]
+        ],
     }
 
 

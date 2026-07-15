@@ -34,6 +34,9 @@ class Settings(BaseSettings):
     telegram_outbox_max_attempts: int = 10
     telegram_outbox_base_retry_seconds: int = 2
     telegram_outbox_max_retry_seconds: int = 900
+    temp_cleanup_interval_seconds: int = 3600
+    temp_part_retention_seconds: int = 3600
+    temp_cleanup_batch_size: int = 100
 
     @field_validator("telegram_admin_ids", mode="before")
     @classmethod
@@ -72,6 +75,9 @@ class Settings(BaseSettings):
         "telegram_outbox_max_attempts",
         "telegram_outbox_base_retry_seconds",
         "telegram_outbox_max_retry_seconds",
+        "temp_cleanup_interval_seconds",
+        "temp_part_retention_seconds",
+        "temp_cleanup_batch_size",
     )
     @classmethod
     def positive_worker_timing(cls, value: float) -> float:
@@ -86,6 +92,12 @@ class Settings(BaseSettings):
             )
         if self.upload_worker_poll_seconds < 0.5:
             raise ValueError("UPLOAD_WORKER_POLL_SECONDS must be at least 0.5 to avoid busy loop")
+        if self.temp_cleanup_batch_size < 1:
+            raise ValueError("TEMP_CLEANUP_BATCH_SIZE must be positive")
+        if self.temp_part_retention_seconds < 60:
+            raise ValueError("TEMP_PART_RETENTION_SECONDS must be at least 60")
+        if self.temp_cleanup_interval_seconds < 60:
+            raise ValueError("TEMP_CLEANUP_INTERVAL_SECONDS must be at least 60")
         if self.telegram_outbox_poll_seconds < 0.5:
             raise ValueError("TELEGRAM_OUTBOX_POLL_SECONDS must be at least 0.5 to avoid busy loop")
         if self.telegram_outbox_max_retry_seconds < self.telegram_outbox_base_retry_seconds:

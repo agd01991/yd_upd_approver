@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import signal
+import time
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -340,20 +341,36 @@ async def _call_finalize_failure(job: UploadJob, message: str, settings: Setting
         return await finalize_failure(job, message)  # type: ignore[misc,call-arg]
 
 
-async def _upload_remote(job: UploadJob, settings: Settings) -> bool:
+async def _upload_remote(
+    job: UploadJob, settings: Settings, client: YandexDiskClient | None = None
+) -> bool:
     path = Path(job.local_path)
     if not path.is_file() or not _is_under_temp(job.local_path, settings):
         raise FileNotFoundError(job.local_path)
-    client = YandexDiskClient(settings.yandex_disk_token)
+    own_client = client is None
+    client = client or YandexDiskClient(settings.yandex_disk_token)
     try:
         if await _remote_matches(client, job.target_path, job):
             return True
+        folder_started = time.monotonic()
         await client.mkdir_recursive(job.target_folder)
+        folder_duration = time.monotonic() - folder_started
+        upload_started = time.monotonic()
         overwrite = job.upload_mode == UploadMode.overwrite
         await client.upload_file(job.local_path, job.target_path, overwrite=overwrite)
+        upload_duration = time.monotonic() - upload_started
+        logger.info(
+            "upload worker remote timings: job_id=%s request_code=%s size_bytes=%s folder_seconds=%.3f upload_seconds=%.3f result=remote_uploaded",
+            job.id,
+            job.request_code,
+            job.size_bytes,
+            folder_duration,
+            upload_duration,
+        )
         return True
     finally:
-        await client.close()
+        if own_client:
+            await client.close()
 
 
 async def _cancel_upload_after_heartbeat_failure(
@@ -388,9 +405,16 @@ def _heartbeat_failure_from_done(job: UploadJob, heartbeat_task: asyncio.Task, s
     return None
 
 
-async def _run_upload_with_heartbeat(job: UploadJob, settings: Settings) -> bool:
+async def _run_upload_with_heartbeat(
+    job: UploadJob, settings: Settings, client: YandexDiskClient | None = None
+) -> bool:
     stop = asyncio.Event()
-    upload_task = asyncio.create_task(_upload_remote(job, settings))
+
+    try:
+        upload_coro = _upload_remote(job, settings, client)
+    except TypeError:
+        upload_coro = _upload_remote(job, settings)  # type: ignore[call-arg]
+    upload_task = asyncio.create_task(upload_coro)
     heartbeat_task = asyncio.create_task(heartbeat(job, settings, stop))
     try:
         pending: set[asyncio.Task] = {upload_task, heartbeat_task}
@@ -436,10 +460,18 @@ async def _run_upload_with_heartbeat(job: UploadJob, settings: Settings) -> bool
             await asyncio.gather(*cleanup_tasks, return_exceptions=True)
 
 
-async def process_job(job: UploadJob, settings: Settings, bot=None) -> None:
+async def process_job(
+    job: UploadJob, settings: Settings, bot=None, client: YandexDiskClient | None = None
+) -> None:
     remote_confirmed = False
+    own_client = client is None
+    client = client or YandexDiskClient(settings.yandex_disk_token)
+    started = time.monotonic()
     try:
-        remote_confirmed = await _run_upload_with_heartbeat(job, settings)
+        try:
+            remote_confirmed = await _run_upload_with_heartbeat(job, settings, client)
+        except TypeError:
+            remote_confirmed = await _run_upload_with_heartbeat(job, settings)  # type: ignore[call-arg]
         if remote_confirmed:
             finalized = await _call_finalize_success(job, job.target_path, settings)
             if finalized:
@@ -451,6 +483,13 @@ async def process_job(job: UploadJob, settings: Settings, bot=None) -> None:
                         job.id,
                         exc.__class__.__name__,
                     )
+                logger.info(
+                    "upload job finished: job_id=%s request_code=%s size_bytes=%s total_seconds=%.3f result=uploaded",
+                    job.id,
+                    job.request_code,
+                    job.size_bytes,
+                    time.monotonic() - started,
+                )
                 await notify_result(bot, job, UploadStatus.uploaded)
             else:
                 logger.warning(
@@ -479,7 +518,18 @@ async def process_job(job: UploadJob, settings: Settings, bot=None) -> None:
             )
             return
         if await _call_finalize_failure(job, message, settings):
+            logger.warning(
+                "upload job finished: job_id=%s request_code=%s size_bytes=%s total_seconds=%.3f result=failed category=%s",
+                job.id,
+                job.request_code,
+                job.size_bytes,
+                time.monotonic() - started,
+                exc.__class__.__name__,
+            )
             await notify_result(bot, job, UploadStatus.failed, message)
+    finally:
+        if own_client:
+            await client.close()
 
 
 async def upload_approved_request(
@@ -515,6 +565,7 @@ async def upload_approved_request(
 
 async def run(stop: asyncio.Event, settings: Settings) -> None:
     health_task = asyncio.create_task(health_heartbeat(stop))
+    client = YandexDiskClient(settings.yandex_disk_token)
     try:
         while not stop.is_set():
             async with SessionLocal() as session:
@@ -525,10 +576,12 @@ async def run(stop: asyncio.Event, settings: Settings) -> None:
                 with suppress(TimeoutError):
                     await asyncio.wait_for(stop.wait(), timeout=settings.upload_worker_poll_seconds)
                 continue
-            await process_job(job, settings)
+            await process_job(job, settings, client=client)
     finally:
+        await client.close()
         stop.set()
-        await health_task
+        health_task.cancel()
+        await asyncio.gather(health_task, return_exceptions=True)
 
 
 async def main() -> None:
