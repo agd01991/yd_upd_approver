@@ -3,7 +3,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from app.db.models import UploadStatus
+from app.db.models import TelegramOutboxStatus, UploadStatus
 from app.scripts import cleanup_temp
 
 
@@ -127,7 +127,7 @@ async def test_cleanup_keyset_pagination_does_not_starve_after_unsafe_batch(
     async def no_outbox(*_):  # noqa: ANN002
         return False
 
-    monkeypatch.setattr(cleanup_temp, "_has_deliverable_upload_result_outbox", no_outbox)
+    monkeypatch.setattr(cleanup_temp, "_has_pending_terminal_upload_notification", no_outbox)
 
     deleted = await cleanup_temp.cleanup_temp()
 
@@ -163,7 +163,7 @@ async def test_cleanup_keeps_status_while_upload_result_outbox_pending(
     async def pending(*_):  # noqa: ANN002
         return True
 
-    monkeypatch.setattr(cleanup_temp, "_has_deliverable_upload_result_outbox", pending)
+    monkeypatch.setattr(cleanup_temp, "_has_pending_terminal_upload_notification", pending)
 
     assert await cleanup_temp.cleanup_temp() == 1
     assert row.status == UploadStatus.uploaded
@@ -236,7 +236,7 @@ async def test_cleanup_scan_cycle_high_water_prevents_sustained_load_starvation(
     async def no_outbox(*_):  # noqa: ANN002
         return False
 
-    monkeypatch.setattr(cleanup_temp, "_has_deliverable_upload_result_outbox", no_outbox)
+    monkeypatch.setattr(cleanup_temp, "_has_pending_terminal_upload_notification", no_outbox)
 
     deleted, state = await cleanup_temp.cleanup_temp_pass(None)
     assert deleted == 2
@@ -277,3 +277,150 @@ def test_cleanup_main_uses_asyncio_run(monkeypatch) -> None:  # noqa: ANN001
     cleanup_temp.main()
 
     assert called["coro"].cr_code.co_name == "main_async"
+
+
+@pytest.mark.anyio
+async def test_pending_terminal_upload_notification_guard_sql_includes_rejection_events() -> None:
+    statement_holder = {}
+
+    class CaptureSession(FakeSession):
+        async def scalar(self, statement):  # noqa: ANN001
+            statement_holder["sql"] = str(statement.compile(compile_kwargs={"literal_binds": True}))
+            return False
+
+    await cleanup_temp._has_pending_terminal_upload_notification(CaptureSession([]), 42)  # noqa: SLF001
+
+    sql = statement_holder["sql"]
+    assert "upload_result_admin" in sql
+    assert "upload_result_user" in sql
+    assert "upload_rejected" in sql
+    assert "pending" in sql
+    assert "processing" in sql
+
+
+class OutboxAwareSession(FakeSession):
+    def __init__(self, rows, outbox_events) -> None:  # noqa: ANN001
+        super().__init__(rows)
+        self.outbox_events = outbox_events
+
+    async def scalar(self, statement):  # noqa: ANN001
+        text = str(statement.compile(compile_kwargs={"literal_binds": True}))
+        if "max" in text.lower():
+            return await super().scalar(statement)
+        terminal_events = {
+            event.value if hasattr(event, "value") else event
+            for event in cleanup_temp.TERMINAL_UPLOAD_NOTIFICATION_EVENT_TYPES
+        }
+        deliverable_statuses = {
+            status.value if hasattr(status, "value") else status
+            for status in cleanup_temp.DELIVERABLE_OUTBOX_STATUSES
+        }
+        return any(
+            event.event_type in terminal_events and event.status in deliverable_statuses
+            for event in self.outbox_events
+        )
+
+
+def _rejected_upload_row(path):  # noqa: ANN001, ANN202
+    return SimpleNamespace(
+        id=20,
+        request_code="REQ-000020",
+        status=UploadStatus.rejected,
+        local_path=str(path),
+        created_at=datetime.now(UTC) - timedelta(days=10),
+        reject_reason="bad file",
+    )
+
+
+async def _run_cleanup_with_outbox(monkeypatch, tmp_path, event_status):  # noqa: ANN001, ANN202
+    path = tmp_path / "REQ-000020" / "file.txt"
+    path.parent.mkdir()
+    path.write_text("content")
+    row = _rejected_upload_row(path)
+    event = SimpleNamespace(
+        request_id=20,
+        event_type="upload_rejected",
+        status=event_status.value if hasattr(event_status, "value") else event_status,
+        payload={"request_id": 20, "status": "rejected"},
+    )
+    monkeypatch.setattr(cleanup_temp, "SessionLocal", lambda: OutboxAwareSession([row], [event]))
+    monkeypatch.setattr(
+        cleanup_temp,
+        "get_settings",
+        lambda: SimpleNamespace(
+            rejected_retention_days=7,
+            temp_storage_dir=tmp_path,
+            temp_cleanup_batch_size=100,
+            temp_part_retention_seconds=3600,
+        ),
+    )
+    deleted = await cleanup_temp.cleanup_temp()
+    return deleted, row, event, path
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "event_status",
+    [TelegramOutboxStatus.pending, TelegramOutboxStatus.processing],
+)
+async def test_cleanup_keeps_rejected_status_while_rejection_outbox_deliverable(
+    monkeypatch, tmp_path, event_status
+) -> None:  # noqa: ANN001
+    deleted, row, event, path = await _run_cleanup_with_outbox(monkeypatch, tmp_path, event_status)
+
+    assert deleted == 1
+    assert row.status == UploadStatus.rejected
+    assert event.status == event_status.value
+    assert not path.exists()
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "event_status",
+    [TelegramOutboxStatus.sent, TelegramOutboxStatus.discarded, TelegramOutboxStatus.dead],
+)
+async def test_cleanup_marks_deleted_after_rejection_outbox_terminal(
+    monkeypatch, tmp_path, event_status
+) -> None:  # noqa: ANN001
+    deleted, row, _event, path = await _run_cleanup_with_outbox(monkeypatch, tmp_path, event_status)
+
+    assert deleted == 1
+    assert row.status == UploadStatus.deleted_temp
+    assert not path.exists()
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("event_type", ["upload_result_admin", "upload_result_user"])
+async def test_cleanup_still_keeps_status_while_upload_result_outbox_pending(
+    monkeypatch, tmp_path, event_type
+) -> None:  # noqa: ANN001
+    path = tmp_path / "REQ-RESULT" / "file.txt"
+    path.parent.mkdir()
+    path.write_text("content")
+    row = SimpleNamespace(
+        id=20,
+        status=UploadStatus.uploaded,
+        local_path=str(path),
+        created_at=datetime.now(UTC),
+    )
+    event = SimpleNamespace(
+        request_id=20,
+        event_type=event_type,
+        status=TelegramOutboxStatus.pending.value,
+        payload={"request_id": 20, "status": "uploaded"},
+    )
+    monkeypatch.setattr(cleanup_temp, "SessionLocal", lambda: OutboxAwareSession([row], [event]))
+    monkeypatch.setattr(
+        cleanup_temp,
+        "get_settings",
+        lambda: SimpleNamespace(
+            rejected_retention_days=7,
+            temp_storage_dir=tmp_path,
+            temp_cleanup_batch_size=100,
+            temp_part_retention_seconds=3600,
+        ),
+    )
+
+    assert await cleanup_temp.cleanup_temp() == 1
+    assert row.status == UploadStatus.uploaded
+    assert not path.exists()
