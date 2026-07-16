@@ -243,7 +243,17 @@ PostgreSQL is the source of truth for durable Telegram notifications. Redis is n
 4. Navigate forward and backward across pages with rows sharing identical `created_at` values; confirm there are no duplicates or missing rows.
 5. Approve/reject/block users, uploads, and folder rename requests from a non-first page; confirm the current page refreshes instead of always resetting to the first page.
 6. In two browser sessions, try to create two pending folder rename requests for the same user and assign/rename two users to the same canonical folder. One operation should succeed and the other should return a safe validation/conflict response, not a 500.
-7. Before production migration, create a database backup. Run `alembic upgrade head`, verify the new head is `0009_db_integrity`, then verify workers still claim upload and Telegram outbox jobs.
+7. Before production migration, create a database backup. Run `alembic upgrade head`, verify the new head is `0010_upload_created_index`, then verify the upload ordering index exists exactly once with columns `(created_at, id)`:
+
+```sql
+SELECT indexname, indexdef
+FROM pg_indexes
+WHERE schemaname = current_schema()
+  AND tablename = 'upload_requests'
+  AND indexname = 'ix_upload_requests_created_id';
+```
+
+Then verify workers still claim upload and Telegram outbox jobs.
 8. With Docker, validate configuration and service health:
 
 ```bash

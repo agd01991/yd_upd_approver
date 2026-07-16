@@ -413,7 +413,10 @@ def test_clean_install_path_runs_0005_to_head_to_same_modes(migration_db):
     _with_migration_connection(expected_database, check)
 
 
-def test_existing_0009_database_receives_upload_ordering_index(migration_db):
+@pytest.mark.parametrize("preexisting_index", [False, True], ids=["ordinary", "intermediate"])
+def test_existing_0009_database_receives_upload_ordering_index(
+    migration_db, preexisting_index: bool
+):
     cfg, expected_database = migration_db
     command.upgrade(cfg, "0009_db_integrity")
 
@@ -437,13 +440,50 @@ def test_existing_0009_database_receives_upload_ordering_index(migration_db):
         } <= indexes
 
     _with_migration_connection(expected_database, indexes_at_0009)
+
+    if preexisting_index:
+
+        async def create_intermediate_index(conn: AsyncConnection) -> None:
+            await conn.execute(
+                text(
+                    "CREATE INDEX ix_upload_requests_created_id ON upload_requests (created_at, id)"
+                )
+            )
+            assert await _revision(conn) == "0009_db_integrity"
+
+        _with_migration_connection(expected_database, create_intermediate_index)
+
     command.upgrade(cfg, "head")
 
     async def index_at_head(conn: AsyncConnection) -> None:
         assert await _revision(conn) == CURRENT_HEAD_REVISION
+        index_columns = (
+            await conn.execute(
+                text(
+                    "SELECT array_agg(attribute.attname ORDER BY key.ordinality) "
+                    "FROM pg_class AS index_class "
+                    "JOIN pg_index AS index_definition "
+                    "ON index_definition.indexrelid = index_class.oid "
+                    "CROSS JOIN LATERAL unnest(index_definition.indkey) "
+                    "WITH ORDINALITY AS key(attnum, ordinality) "
+                    "JOIN pg_attribute AS attribute "
+                    "ON attribute.attrelid = index_definition.indrelid "
+                    "AND attribute.attnum = key.attnum "
+                    "WHERE index_class.relname = 'ix_upload_requests_created_id'"
+                )
+            )
+        ).scalar_one()
+        assert index_columns == ["created_at", "id"]
         assert (
-            await conn.execute(text("SELECT to_regclass('ix_upload_requests_created_id')"))
-        ).scalar_one() == "ix_upload_requests_created_id"
+            await conn.execute(
+                text(
+                    "SELECT count(*) FROM pg_indexes "
+                    "WHERE schemaname = current_schema() "
+                    "AND tablename = 'upload_requests' "
+                    "AND indexname = 'ix_upload_requests_created_id'"
+                )
+            )
+        ).scalar_one() == 1
 
     _with_migration_connection(expected_database, index_at_head)
     command.downgrade(cfg, "0009_db_integrity")

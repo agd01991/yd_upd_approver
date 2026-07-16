@@ -9,14 +9,14 @@ from app.db.models import UploadRequest
 
 class RecordingOperations:
     def __init__(self) -> None:
-        self.created_indexes: list[tuple[str, str, list[str]]] = []
+        self.created_indexes: list[tuple[str, str, list[str], dict[str, Any]]] = []
         self.dropped_indexes: list[tuple[str, str | None]] = []
 
     def __getattr__(self, _name: str) -> Callable[..., None]:
         return lambda *_args, **_kwargs: None
 
-    def create_index(self, name: str, table_name: str, columns: list[str], **_kwargs: Any) -> None:
-        self.created_indexes.append((name, table_name, columns))
+    def create_index(self, name: str, table_name: str, columns: list[str], **kwargs: Any) -> None:
+        self.created_indexes.append((name, table_name, columns, kwargs))
 
     def drop_index(self, name: str, *, table_name: str | None = None) -> None:
         self.dropped_indexes.append((name, table_name))
@@ -52,6 +52,7 @@ def test_upload_ordering_index_migration_creates_and_drops_global_ordering_index
         "ix_upload_requests_created_id",
         "upload_requests",
         ["created_at", "id"],
+        {"if_not_exists": True},
     ) in operations.created_indexes
     assert (
         "ix_upload_requests_created_id",
