@@ -36,8 +36,25 @@ async def find_user_folder_conflict(
                 return other
         return None
     await lock_user_folder_path(session, normalized)
-    stmt = select(User).where(
-        (User.root_folder == normalized) | (User.allowed_folders.contains([normalized]))
+    canonical = normalized.rstrip("/")
+    stmt = (
+        select(User)
+        .where(
+            text(
+                """
+            (
+                regexp_replace(coalesce(root_folder, ''), '/+$', '') = :canonical
+                OR EXISTS (
+                    SELECT 1
+                    FROM jsonb_array_elements_text(coalesce(allowed_folders, '[]'::jsonb))
+                        AS folder(value)
+                    WHERE regexp_replace(folder.value, '/+$', '') = :canonical
+                )
+            )
+            """
+            )
+        )
+        .params(canonical=canonical)
     )
     if exclude_user_id is not None:
         stmt = stmt.where(User.id != exclude_user_id)

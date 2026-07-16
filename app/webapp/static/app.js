@@ -279,11 +279,13 @@ async function uploadSelectedFiles(event, form, input) {
         results.push(`❌ ${file.name}: ${entry.error}`);
       }
     }
+    const successCount = selectedUploadEntries.filter((entry) => entry.status === "done").length;
     selectedUploadEntries = selectedUploadEntries.filter((entry) => entry.status !== "done");
     const failedCount = selectedUploadEntries.length;
     const title = failedCount === 0 ? "Готово" : `Готово. Осталось для повторной отправки: ${failedCount}`;
     msg.innerHTML = `<b>${escapeHtml(title)}</b>${results.map((item) => `<div>${escapeHtml(item)}</div>`).join("")}`;
     if (failedCount === 0) clearSelectedUploadFiles(form); else renderSelectedFiles();
+    if (successCount > 0) resetPager("userUploads");
     await loadUserLists();
   } finally {
     uploadInProgress = false;
