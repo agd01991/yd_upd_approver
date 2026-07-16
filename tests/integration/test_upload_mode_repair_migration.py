@@ -523,6 +523,66 @@ def test_existing_0009_database_receives_upload_ordering_index(
     _with_migration_connection(expected_database, index_at_head)
 
 
+@pytest.mark.parametrize(
+    ("index_sql", "table_name", "columns"),
+    [
+        (
+            "CREATE INDEX ix_upload_requests_created_id ON upload_requests (status, id)",
+            "upload_requests",
+            ["status", "id"],
+        ),
+        (
+            "CREATE INDEX ix_upload_requests_created_id ON users (telegram_id)",
+            "users",
+            ["telegram_id"],
+        ),
+    ],
+    ids=["wrong-columns", "wrong-table"],
+)
+def test_0010_rejects_conflicting_preexisting_upload_ordering_index(
+    migration_db, index_sql: str, table_name: str, columns: list[str]
+):
+    cfg, expected_database = migration_db
+    command.upgrade(cfg, "0009_db_integrity")
+
+    async def create_conflicting_index(conn: AsyncConnection) -> None:
+        await conn.execute(text(index_sql))
+        assert await _revision(conn) == "0009_db_integrity"
+
+    _with_migration_connection(expected_database, create_conflicting_index)
+
+    with pytest.raises(RuntimeError, match="ix_upload_requests_created_id"):
+        command.upgrade(cfg, "head")
+
+    async def conflict_is_unchanged(conn: AsyncConnection) -> None:
+        assert await _revision(conn) == "0009_db_integrity"
+        row = (
+            await conn.execute(
+                text(
+                    """
+                    SELECT table_class.relname, array_agg(attribute.attname ORDER BY key.ordinality)
+                    FROM pg_class AS index_class
+                    JOIN pg_index AS index_definition
+                        ON index_definition.indexrelid = index_class.oid
+                    JOIN pg_class AS table_class ON table_class.oid = index_definition.indrelid
+                    CROSS JOIN LATERAL unnest(index_definition.indkey)
+                        WITH ORDINALITY AS key(attnum, ordinality)
+                    JOIN pg_attribute AS attribute
+                        ON attribute.attrelid = index_definition.indrelid
+                        AND attribute.attnum = key.attnum
+                    WHERE index_class.relnamespace = current_schema()::regnamespace
+                        AND index_class.relname = 'ix_upload_requests_created_id'
+                    GROUP BY table_class.relname
+                    """
+                )
+            )
+        ).one()
+        assert row[0] == table_name
+        assert row[1] == columns
+
+    _with_migration_connection(expected_database, conflict_is_unchanged)
+
+
 async def _telegram_outbox_schema_state(conn: AsyncConnection) -> dict[str, bool]:
     row = (
         await conn.execute(

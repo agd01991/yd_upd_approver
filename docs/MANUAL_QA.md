@@ -254,6 +254,11 @@ WHERE schemaname = current_schema()
 ```
 
 Then verify workers still claim upload and Telegram outbox jobs.
+
+If `0010_upload_created_index` reports an incompatible index named
+`ix_upload_requests_created_id`, inspect its table and key columns first. Do not remove an
+index blindly: take a backup, analyze the conflicting object, and only then rename or remove it
+before retrying the migration.
 8. With Docker, validate configuration and service health:
 
 ```bash
