@@ -81,6 +81,7 @@ def upgrade() -> None:
     op.create_index(
         "ix_upload_requests_status_created_id", "upload_requests", ["status", "created_at", "id"]
     )
+    op.create_index("ix_upload_requests_created_id", "upload_requests", ["created_at", "id"])
     op.create_index("ix_audit_log_created_id", "audit_log", ["created_at", "id"])
     op.create_index(
         "ix_folder_rename_status_created_id",
@@ -123,6 +124,7 @@ def downgrade() -> None:
     op.drop_index("uq_folder_rename_pending_user", table_name="folder_rename_requests")
     op.drop_index("ix_folder_rename_status_created_id", table_name="folder_rename_requests")
     op.drop_index("ix_audit_log_created_id", table_name="audit_log")
+    op.drop_index("ix_upload_requests_created_id", table_name="upload_requests")
     op.drop_index("ix_upload_requests_status_created_id", table_name="upload_requests")
     op.drop_index("ix_upload_requests_user_created_id", table_name="upload_requests")
     op.drop_index("ix_users_status_created_id", table_name="users")
