@@ -16,7 +16,7 @@ from app.services.commit_safety import cleanup_staged_if_unowned, commit_cancell
 from app.services.naming import join_disk_path, sanitize_filename
 from app.services.storage import TempStorage
 from app.services.telegram_outbox import enqueue_admin_upload_pending
-from app.services.user_folders import resolve_user_folder_for_current_root
+from app.services.user_folders import UserFolderConflictError, resolve_user_folder_for_current_root
 
 _ORIGINAL_RESOLVE_USER_FOLDER = resolve_user_folder_for_current_root
 ensure_user_folder_for_current_root = resolve_user_folder_for_current_root
@@ -160,6 +160,14 @@ async def create_upload(
         outcome = await commit_cancellation_safe(session)
         if outcome.cancelled:
             raise asyncio.CancelledError()
+    except UserFolderConflictError as exc:
+        await session.rollback()
+        storage.delete_safe(destination)
+        raise ApiError(
+            status.HTTP_409_CONFLICT,
+            "folder_conflict",
+            "Папка уже назначена другому пользователю. Обратитесь к администратору.",
+        ) from exc
     except IntegrityError:
         await session.rollback()
         existing = await session.scalar(

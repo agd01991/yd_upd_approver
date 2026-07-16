@@ -11,6 +11,10 @@ from app.services.naming import user_folder_for_user
 from app.services.yandex_disk import YandexDiskClient
 
 
+class UserFolderConflictError(ValueError):
+    """Raised when a user folder is already assigned to another user."""
+
+
 def _folder_with_trailing_slash(root: str, basename: str) -> str:
     return f"{root.rstrip('/')}/{basename}/"
 
@@ -58,7 +62,7 @@ async def resolve_user_folder_for_current_root(
     if user.root_folder != expected:
         conflict = await find_user_folder_conflict(session, expected, exclude_user_id=user.id)
         if conflict:
-            raise ValueError("Папка уже назначена другому пользователю")
+            raise UserFolderConflictError("Папка уже назначена другому пользователю")
         user.root_folder = expected
         user.allowed_folders = [expected]
         if hasattr(session, "flush"):
@@ -86,7 +90,7 @@ async def ensure_user_folder_for_current_root(
     if user.root_folder != expected:
         conflict = await find_user_folder_conflict(session, expected, exclude_user_id=user.id)
         if conflict:
-            raise ValueError("Папка уже назначена другому пользователю")
+            raise UserFolderConflictError("Папка уже назначена другому пользователю")
         user.root_folder = expected
         user.allowed_folders = [expected]
         if hasattr(session, "flush"):
@@ -120,7 +124,7 @@ async def change_yandex_disk_root_for_active_users(
     for user, folder in updates:
         conflict = await find_user_folder_conflict(session, folder, exclude_user_id=user.id)
         if conflict:
-            raise ValueError("Папка уже назначена другому пользователю")
+            raise UserFolderConflictError("Папка уже назначена другому пользователю")
         user.root_folder = folder
         user.allowed_folders = [folder]
     new_root = await set_yandex_disk_root(session, normalized, actor_telegram_id)

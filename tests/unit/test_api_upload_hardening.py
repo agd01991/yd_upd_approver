@@ -289,3 +289,124 @@ async def test_create_upload_cleans_staged_file_when_folder_resolution_fails(
     assert not (tmp_path / "REQ-CLEAN" / "report.txt").exists()
     assert not list(tmp_path.glob("**/*.part"))
     assert not (tmp_path / "REQ-CLEAN").exists()
+
+
+@pytest.mark.anyio
+async def test_create_upload_maps_folder_conflict_to_api_error_and_cleans_staging(
+    monkeypatch, tmp_path
+) -> None:  # noqa: ANN001
+    from app.api.errors import ApiError
+    from app.api.routes import uploads
+    from app.config import Settings
+    from app.services.user_folders import UserFolderConflictError
+
+    calls = {"create": 0, "outbox": 0}
+
+    class UploadSession:
+        def __init__(self) -> None:
+            self.rolled_back = False
+
+        async def scalar(self, stmt):  # noqa: ANN001
+            return None
+
+        async def rollback(self) -> None:
+            self.rolled_back = True
+
+    class FakeUploadFile:
+        filename = "conflict.txt"
+        content_type = "text/plain"
+
+        def __init__(self) -> None:
+            self._chunks = [b"hello"]
+
+        async def read(self, size):  # noqa: ANN001
+            return self._chunks.pop(0) if self._chunks else b""
+
+        async def close(self) -> None:
+            pass
+
+    async def fake_next_code(session):  # noqa: ANN001
+        return "REQ-CONFLICT"
+
+    async def fail_resolve(*args):  # noqa: ANN002
+        raise UserFolderConflictError("legacy details disk:/Root/Alice")
+
+    async def fail_if_create_called(*args, **kwargs):  # noqa: ANN002, ANN003
+        calls["create"] += 1
+        raise AssertionError("UploadRequest must not be created after folder conflict")
+
+    async def fake_outbox(*args, **kwargs):  # noqa: ANN002, ANN003
+        calls["outbox"] += 1
+
+    monkeypatch.setattr(uploads, "next_request_code", fake_next_code)
+    monkeypatch.setattr(uploads, "resolve_user_folder_for_current_root", fail_resolve)
+    monkeypatch.setattr(uploads, "create_upload_request", fail_if_create_called)
+    monkeypatch.setattr(uploads, "enqueue_admin_upload_pending", fake_outbox)
+    session = UploadSession()
+    user = SimpleNamespace(id=1, status=UserStatus.active, root_folder="disk:/root/")
+
+    with pytest.raises(ApiError) as exc:
+        await uploads.create_upload(
+            file=FakeUploadFile(),
+            caption=None,
+            current=(user, False),
+            session=session,
+            settings=Settings(temp_storage_dir=tmp_path),
+            idempotency_key="idem-conflict",
+        )
+
+    assert exc.value.status_code == 409
+    assert exc.value.code == "folder_conflict"
+    assert isinstance(exc.value.__cause__, UserFolderConflictError)
+    assert "disk:/" not in exc.value.message
+    assert session.rolled_back
+    assert calls == {"create": 0, "outbox": 0}
+    assert not (tmp_path / "REQ-CONFLICT" / "conflict.txt").exists()
+    assert not list(tmp_path.glob("**/*.part"))
+    assert not (tmp_path / "REQ-CONFLICT").exists()
+
+
+@pytest.mark.anyio
+async def test_create_upload_does_not_mask_unexpected_folder_errors(monkeypatch, tmp_path) -> None:  # noqa: ANN001
+    from app.api.routes import uploads
+    from app.config import Settings
+
+    class UploadSession:
+        async def scalar(self, stmt):  # noqa: ANN001
+            return None
+
+        async def rollback(self) -> None:
+            pass
+
+    class FakeUploadFile:
+        filename = "boom.txt"
+        content_type = "text/plain"
+
+        def __init__(self) -> None:
+            self._chunks = [b"hello"]
+
+        async def read(self, size):  # noqa: ANN001
+            return self._chunks.pop(0) if self._chunks else b""
+
+        async def close(self) -> None:
+            pass
+
+    async def fake_next_code(session):  # noqa: ANN001
+        return "REQ-BOOM"
+
+    async def fail_resolve(*args):  # noqa: ANN002
+        raise ValueError("programmer error")
+
+    monkeypatch.setattr(uploads, "next_request_code", fake_next_code)
+    monkeypatch.setattr(uploads, "resolve_user_folder_for_current_root", fail_resolve)
+    user = SimpleNamespace(id=1, status=UserStatus.active, root_folder="disk:/root/")
+
+    with pytest.raises(ValueError, match="programmer error"):
+        await uploads.create_upload(
+            file=FakeUploadFile(),
+            caption=None,
+            current=(user, False),
+            session=UploadSession(),
+            settings=Settings(temp_storage_dir=tmp_path),
+            idempotency_key="idem-boom",
+        )
