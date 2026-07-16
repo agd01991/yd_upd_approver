@@ -13,10 +13,12 @@ depends_on = None
 
 
 def upgrade() -> None:
+    # Support databases that applied the intermediate PR #76 version of 0009, which created it.
     op.create_index(
         "ix_upload_requests_created_id",
         "upload_requests",
         ["created_at", "id"],
+        if_not_exists=True,
     )
 
 
