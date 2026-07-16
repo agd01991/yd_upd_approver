@@ -18,7 +18,7 @@ from sqlalchemy.pool import NullPool
 
 from alembic import command
 
-CURRENT_HEAD_REVISION = "0009_db_integrity"
+CURRENT_HEAD_REVISION = "0010_upload_created_index"
 TELEGRAM_OUTBOX_REVISION = "0008_telegram_outbox"
 
 MIGRATION_DATABASE_URL = os.getenv("MIGRATION_DATABASE_URL")
@@ -411,6 +411,76 @@ def test_clean_install_path_runs_0005_to_head_to_same_modes(migration_db):
         }
 
     _with_migration_connection(expected_database, check)
+
+
+def test_existing_0009_database_receives_upload_ordering_index(migration_db):
+    cfg, expected_database = migration_db
+    command.upgrade(cfg, "0009_db_integrity")
+
+    async def indexes_at_0009(conn: AsyncConnection) -> None:
+        assert await _revision(conn) == "0009_db_integrity"
+        indexes = set(
+            (
+                await conn.execute(
+                    text(
+                        "SELECT indexname FROM pg_indexes "
+                        "WHERE schemaname = current_schema() "
+                        "AND tablename = 'upload_requests'"
+                    )
+                )
+            ).scalars()
+        )
+        assert "ix_upload_requests_created_id" not in indexes
+        assert {
+            "ix_upload_requests_user_created_id",
+            "ix_upload_requests_status_created_id",
+        } <= indexes
+
+    _with_migration_connection(expected_database, indexes_at_0009)
+    command.upgrade(cfg, "head")
+
+    async def index_at_head(conn: AsyncConnection) -> None:
+        assert await _revision(conn) == CURRENT_HEAD_REVISION
+        assert (
+            await conn.execute(text("SELECT to_regclass('ix_upload_requests_created_id')"))
+        ).scalar_one() == "ix_upload_requests_created_id"
+
+    _with_migration_connection(expected_database, index_at_head)
+    command.downgrade(cfg, "0009_db_integrity")
+
+    async def index_removed_at_0009(conn: AsyncConnection) -> None:
+        assert await _revision(conn) == "0009_db_integrity"
+        assert (
+            await conn.execute(text("SELECT to_regclass('ix_upload_requests_created_id')"))
+        ).scalar_one() is None
+        indexes = set(
+            (
+                await conn.execute(
+                    text(
+                        "SELECT indexname FROM pg_indexes "
+                        "WHERE schemaname = current_schema() "
+                        "AND tablename = 'upload_requests'"
+                    )
+                )
+            ).scalars()
+        )
+        assert {
+            "ix_upload_requests_user_created_id",
+            "ix_upload_requests_status_created_id",
+        } <= indexes
+        assert (
+            await conn.execute(
+                text(
+                    "SELECT count(*) FROM pg_constraint "
+                    "WHERE conrelid = 'upload_requests'::regclass "
+                    "AND conname = 'ck_upload_requests_attempt_count_non_negative'"
+                )
+            )
+        ).scalar_one() == 1
+
+    _with_migration_connection(expected_database, index_removed_at_0009)
+    command.upgrade(cfg, "head")
+    _with_migration_connection(expected_database, index_at_head)
 
 
 async def _telegram_outbox_schema_state(conn: AsyncConnection) -> dict[str, bool]:

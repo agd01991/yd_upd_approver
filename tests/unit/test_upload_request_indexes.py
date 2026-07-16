@@ -33,13 +33,17 @@ def test_upload_request_metadata_has_global_ordering_index() -> None:
     assert indexes["ix_upload_requests_status_created_id"] == ["status", "created_at", "id"]
 
 
-def test_db_integrity_migration_creates_and_drops_global_ordering_index(monkeypatch) -> None:  # noqa: ANN001
+def test_upload_ordering_index_migration_creates_and_drops_global_ordering_index(
+    monkeypatch,
+) -> None:  # noqa: ANN001
     migration = (
-        ScriptDirectory.from_config(Config("alembic.ini")).get_revision("0009_db_integrity").module
+        ScriptDirectory.from_config(Config("alembic.ini"))
+        .get_revision("0010_upload_created_index")
+        .module
     )
+    assert migration.down_revision == "0009_db_integrity"
     operations = RecordingOperations()
     monkeypatch.setattr(migration, "op", operations)
-    monkeypatch.setattr(migration, "_ensure_no_legacy_conflicts", lambda: None)
 
     migration.upgrade()
     migration.downgrade()
