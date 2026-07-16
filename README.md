@@ -514,3 +514,26 @@ New settings:
 - `TEMP_CLEANUP_BATCH_SIZE` — maximum database rows scanned per cleanup pass.
 
 With Docker Compose, `cleanup-worker` starts after `migrate` and exposes a heartbeat healthcheck. Check it with `docker compose ps cleanup-worker` or inspect the container health status.
+
+### Server-side pagination and database integrity
+
+List endpoints backed by PostgreSQL use keyset pagination instead of `OFFSET`:
+
+```json
+{ "items": [], "limit": 25, "has_more": false, "next_cursor": null }
+```
+
+Supported query parameters are `limit` (default 25, min 1, max 100) and opaque `cursor`. The cursor encodes the stable `(created_at, id)` position and must be reused only with the same endpoint and filters. Responses intentionally do not include a global `total`, so large tables are not counted on each request. `GET /api/uploads` also accepts `status` (`all` or an upload status). Admin upload lists accept `status=needs_action`; the backend applies that business filter before pagination.
+
+Before production rollout of `0009_db_integrity`, take a PostgreSQL backup and run the migration during a maintenance window. The migration backfills safe defaults, adds CHECK constraints, explicit FK delete policies, a partial unique index for pending folder rename requests, and pagination indexes. It refuses ambiguous legacy duplicate pending rename requests instead of choosing a winner automatically.
+
+Local checks:
+
+```bash
+ruff format .
+ruff check .
+pytest
+node --check app/webapp/static/app.js
+alembic heads
+alembic history
+```

@@ -18,6 +18,9 @@ from sqlalchemy.pool import NullPool
 
 from alembic import command
 
+CURRENT_HEAD_REVISION = "0009_db_integrity"
+TELEGRAM_OUTBOX_REVISION = "0008_telegram_outbox"
+
 MIGRATION_DATABASE_URL = os.getenv("MIGRATION_DATABASE_URL")
 APPLICATION_DATABASE_URL = os.getenv("DATABASE_URL")
 
@@ -349,7 +352,7 @@ def test_existing_0005_database_is_repaired_by_head(migration_db):
     async def check_head(conn: AsyncConnection) -> dict[str, str]:
         assert (
             await conn.execute(text("SELECT version_num FROM alembic_version"))
-        ).scalar_one() == "0008_telegram_outbox"
+        ).scalar_one() == CURRENT_HEAD_REVISION
         return await _modes(conn)
 
     expected = _with_migration_connection(expected_database, check_head)
@@ -389,7 +392,7 @@ def test_clean_install_path_runs_0005_to_head_to_same_modes(migration_db):
     async def check(conn: AsyncConnection) -> None:
         assert (
             await conn.execute(text("SELECT version_num FROM alembic_version"))
-        ).scalar_one() == "0008_telegram_outbox"
+        ).scalar_one() == CURRENT_HEAD_REVISION
         assert await _modes(conn) == {
             "copy_retry": "copy",
             "copy_path_approve": "copy",
@@ -433,10 +436,10 @@ async def _telegram_outbox_schema_state(conn: AsyncConnection) -> dict[str, bool
 def test_telegram_outbox_enum_migration_up_down_up(migration_db):
     cfg, expected_database = migration_db
 
-    command.upgrade(cfg, "head")
+    command.upgrade(cfg, TELEGRAM_OUTBOX_REVISION)
 
     async def check_created(conn: AsyncConnection) -> None:
-        assert await _revision(conn) == "0008_telegram_outbox"
+        assert await _revision(conn) == TELEGRAM_OUTBOX_REVISION
         assert await _telegram_outbox_schema_state(conn) == {
             "enum_exists": True,
             "table_exists": True,
@@ -455,7 +458,7 @@ def test_telegram_outbox_enum_migration_up_down_up(migration_db):
         }
 
     _with_migration_connection(expected_database, check_removed)
-    command.upgrade(cfg, "head")
+    command.upgrade(cfg, TELEGRAM_OUTBOX_REVISION)
     _with_migration_connection(expected_database, check_created)
 
 
@@ -978,7 +981,7 @@ def test_existing_0006_database_repairs_queued_legacy_retries(migration_db):
     command.upgrade(cfg, "head")
 
     async def check(conn: AsyncConnection) -> tuple[dict[str, str], dict[str, tuple]]:
-        assert await _revision(conn) == "0008_telegram_outbox"
+        assert await _revision(conn) == CURRENT_HEAD_REVISION
         return await _queued_modes(conn), await _queued_stable_columns(conn)
 
     expected, after_stable_columns = _with_migration_connection(expected_database, check)
@@ -1014,7 +1017,7 @@ def test_existing_0006_database_repairs_queued_legacy_retries(migration_db):
     command.upgrade(cfg, "head")
 
     async def check_idempotent(conn: AsyncConnection) -> None:
-        assert await _revision(conn) == "0008_telegram_outbox"
+        assert await _revision(conn) == CURRENT_HEAD_REVISION
         assert await _queued_modes(conn) == expected
 
     _with_migration_connection(expected_database, check_idempotent)
