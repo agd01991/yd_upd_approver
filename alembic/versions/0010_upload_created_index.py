@@ -19,6 +19,7 @@ depends_on = None
 @dataclass(frozen=True)
 class _IndexSignature:
     schema: str
+    table_oid: int
     table_schema: str
     table_name: str
     key_columns: tuple[str | None, ...]
@@ -32,8 +33,49 @@ class _IndexSignature:
     is_ready: bool
 
 
-def _find_existing_index() -> _IndexSignature | None:
-    """Return the named index in the current schema without parsing index SQL."""
+@dataclass(frozen=True)
+class _TargetTable:
+    oid: int
+    schema_oid: int
+    schema: str
+    name: str
+
+
+def _resolve_target_table() -> _TargetTable:
+    """Resolve upload_requests exactly as PostgreSQL resolves an unqualified relation."""
+    row = (
+        op.get_bind()
+        .execute(
+            text(
+                """
+                SELECT
+                    table_class.oid AS oid,
+                    table_namespace.oid AS schema_oid,
+                    table_namespace.nspname AS schema,
+                    table_class.relname AS name
+                FROM pg_class AS table_class
+                JOIN pg_namespace AS table_namespace
+                    ON table_namespace.oid = table_class.relnamespace
+                WHERE table_class.oid = to_regclass('upload_requests')
+                    AND table_class.relkind IN ('r', 'p')
+                """
+            )
+        )
+        .mappings()
+        .one_or_none()
+    )
+    if row is None:
+        raise RuntimeError(
+            "Cannot apply 0010_upload_created_index: upload_requests does not resolve "
+            "to an ordinary or partitioned table."
+        )
+    return _TargetTable(
+        oid=row["oid"], schema_oid=row["schema_oid"], schema=row["schema"], name=row["name"]
+    )
+
+
+def _find_existing_index(target: _TargetTable) -> _IndexSignature | None:
+    """Return the named index in the resolved table's schema without parsing index SQL."""
     row = (
         op.get_bind()
         .execute(
@@ -41,6 +83,7 @@ def _find_existing_index() -> _IndexSignature | None:
                 """
                 SELECT
                     index_namespace.nspname AS schema,
+                    index_definition.indrelid AS table_oid,
                     table_namespace.nspname AS table_schema,
                     table_class.relname AS table_name,
                     array_agg(attribute.attname ORDER BY key_attribute.ordinality)
@@ -71,15 +114,17 @@ def _find_existing_index() -> _IndexSignature | None:
                 LEFT JOIN pg_attribute AS attribute
                     ON attribute.attrelid = index_definition.indrelid
                     AND attribute.attnum = key_attribute.attnum
-                WHERE index_namespace.nspname = current_schema()
+                WHERE index_namespace.oid = :schema_oid
                     AND index_class.relname = 'ix_upload_requests_created_id'
                 GROUP BY
                     index_namespace.nspname,
+                    index_definition.indrelid,
                     table_namespace.nspname,
                     table_class.relname,
                     access_method.amname
                 """
-            )
+            ),
+            {"schema_oid": target.schema_oid},
         )
         .mappings()
         .one_or_none()
@@ -89,6 +134,7 @@ def _find_existing_index() -> _IndexSignature | None:
 
     return _IndexSignature(
         schema=row["schema"],
+        table_oid=row["table_oid"],
         table_schema=row["table_schema"],
         table_name=row["table_name"],
         key_columns=tuple(row["key_columns"] or ()),
@@ -103,10 +149,12 @@ def _find_existing_index() -> _IndexSignature | None:
     )
 
 
-def _matches_expected_index(index: _IndexSignature) -> bool:
+def _matches_expected_index(index: _IndexSignature, target: _TargetTable) -> bool:
     return (
-        index.schema == index.table_schema
-        and index.table_name == "upload_requests"
+        index.schema == target.schema
+        and index.table_oid == target.oid
+        and index.table_schema == target.schema
+        and index.table_name == target.name
         and index.key_columns == ("created_at", "id")
         and index.key_column_count == 2
         and index.total_column_count == 2
@@ -121,16 +169,18 @@ def _matches_expected_index(index: _IndexSignature) -> bool:
 
 def upgrade() -> None:
     # Support databases that applied the intermediate PR #76 version of 0009, which created it.
-    existing = _find_existing_index()
+    target = _resolve_target_table()
+    existing = _find_existing_index(target)
     if existing is None:
         op.create_index(
             "ix_upload_requests_created_id",
-            "upload_requests",
+            target.name,
             ["created_at", "id"],
+            schema=target.schema,
         )
         return
 
-    if _matches_expected_index(existing):
+    if _matches_expected_index(existing, target):
         return
 
     raise RuntimeError(
@@ -144,7 +194,9 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
+    target = _resolve_target_table()
     op.drop_index(
         "ix_upload_requests_created_id",
-        table_name="upload_requests",
+        table_name=target.name,
+        schema=target.schema,
     )
