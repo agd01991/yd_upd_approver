@@ -234,3 +234,20 @@ PostgreSQL is the source of truth for durable Telegram notifications. Redis is n
 3. Open a Yandex Disk folder containing more than 50 objects in the Mini App. Expected: the first page renders quickly, the “Показать ещё” button appends the next page, and repeated clicks while loading do not start parallel page requests.
 4. Approve an upload and wait for the worker. Expected: after DB state becomes `uploaded`, local temp cleanup can remove the file and the request eventually becomes `deleted_temp`.
 5. Start Docker Compose and check `cleanup-worker` health with `docker compose ps cleanup-worker`; logs should show aggregate checked/deleted counts only, not local paths or tokens.
+
+## PR 6: pagination and DB integrity QA
+
+1. Prepare a dataset with more than 25 uploads, users, audit entries, and folder rename requests.
+2. Open the Mini App and verify every paginated list shows the contract-backed controls: previous page, next page, current page number, disabled buttons while loading, and no visible total count.
+3. Change each status chip/search field and confirm the list returns to page 1 and fetches filtered data from the server. In particular, `needs_action` must be sent as `status=needs_action` and not derived from the first page in the browser.
+4. Navigate forward and backward across pages with rows sharing identical `created_at` values; confirm there are no duplicates or missing rows.
+5. Approve/reject/block users, uploads, and folder rename requests from a non-first page; confirm the current page refreshes instead of always resetting to the first page.
+6. In two browser sessions, try to create two pending folder rename requests for the same user and assign/rename two users to the same canonical folder. One operation should succeed and the other should return a safe validation/conflict response, not a 500.
+7. Before production migration, create a database backup. Run `alembic upgrade head`, verify the new head is `0009_db_integrity`, then verify workers still claim upload and Telegram outbox jobs.
+8. With Docker, validate configuration and service health:
+
+```bash
+docker compose -f docker-compose.yml config --quiet
+docker compose -f docker-compose.yml -f docker-compose.dev.yml config --quiet
+docker compose up --build
+```

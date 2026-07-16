@@ -2,7 +2,19 @@ from datetime import datetime
 from enum import StrEnum
 from typing import Any
 
-from sqlalchemy import BigInteger, DateTime, Enum, ForeignKey, Integer, String, Text, func
+from sqlalchemy import (
+    BigInteger,
+    CheckConstraint,
+    DateTime,
+    Enum,
+    ForeignKey,
+    Index,
+    Integer,
+    String,
+    Text,
+    func,
+    text,
+)
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -57,6 +69,14 @@ class TelegramOutboxStatus(StrEnum):
 
 class User(Base):
     __tablename__ = "users"
+    __table_args__ = (
+        CheckConstraint("quota_mb IS NULL OR quota_mb >= 0", name="ck_users_quota_mb_non_negative"),
+        CheckConstraint(
+            "jsonb_typeof(allowed_folders) = 'array'", name="ck_users_allowed_folders_array"
+        ),
+        Index("ix_users_created_id", "created_at", "id"),
+        Index("ix_users_status_created_id", "status", "created_at", "id"),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True)
     telegram_id: Mapped[int] = mapped_column(BigInteger, unique=True, index=True)
@@ -70,7 +90,9 @@ class User(Base):
     contract_number: Mapped[str | None] = mapped_column(String(128))
     contract_date: Mapped[str | None] = mapped_column(String(64))
     contract_full_name: Mapped[str | None] = mapped_column(String(512))
-    allowed_folders: Mapped[list[str]] = mapped_column(JSONB, default=list)
+    allowed_folders: Mapped[list[str]] = mapped_column(
+        JSONB, default=list, server_default=text("'[]'::jsonb"), nullable=False
+    )
     quota_mb: Mapped[int | None] = mapped_column(Integer)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     approved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -84,9 +106,18 @@ class User(Base):
 
 class FolderRenameRequest(Base):
     __tablename__ = "folder_rename_requests"
+    __table_args__ = (
+        Index("ix_folder_rename_status_created_id", "status", "created_at", "id"),
+        Index(
+            "uq_folder_rename_pending_user",
+            "user_id",
+            unique=True,
+            postgresql_where=text("status = 'pending'"),
+        ),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True)
-    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="RESTRICT"), index=True)
     requested_folder_name: Mapped[str] = mapped_column(String(512))
     contract_number: Mapped[str | None] = mapped_column(String(128))
     contract_date: Mapped[str | None] = mapped_column(String(64))
@@ -106,10 +137,16 @@ class FolderRenameRequest(Base):
 
 class UploadRequest(Base):
     __tablename__ = "upload_requests"
+    __table_args__ = (
+        CheckConstraint("size_bytes >= 0", name="ck_upload_requests_size_bytes_non_negative"),
+        CheckConstraint("attempt_count >= 0", name="ck_upload_requests_attempt_count_non_negative"),
+        Index("ix_upload_requests_user_created_id", "user_id", "created_at", "id"),
+        Index("ix_upload_requests_status_created_id", "status", "created_at", "id"),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True)
     request_code: Mapped[str] = mapped_column(String(32), unique=True, index=True)
-    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="RESTRICT"), index=True)
     source: Mapped[UploadSource] = mapped_column(
         Enum(UploadSource), default=UploadSource.telegram, index=True
     )
@@ -140,7 +177,9 @@ class UploadRequest(Base):
         Enum(UploadMode), default=UploadMode.normal, index=True
     )
     queued_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
-    attempt_count: Mapped[int] = mapped_column(Integer, default=0)
+    attempt_count: Mapped[int] = mapped_column(
+        Integer, default=0, server_default="0", nullable=False
+    )
     worker_token: Mapped[str | None] = mapped_column(String(64), index=True)
     lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
     last_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -150,11 +189,19 @@ class UploadRequest(Base):
 
 class TelegramOutbox(Base):
     __tablename__ = "telegram_outbox"
+    __table_args__ = (
+        CheckConstraint("attempt_count >= 0", name="ck_telegram_outbox_attempt_count_non_negative"),
+        CheckConstraint(
+            "jsonb_typeof(payload) = 'object'", name="ck_telegram_outbox_payload_object"
+        ),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True)
     event_type: Mapped[str] = mapped_column(String(64), index=True)
     recipient_telegram_id: Mapped[int] = mapped_column(BigInteger, index=True)
-    payload: Mapped[dict[str, Any]] = mapped_column(JSONB, default=dict)
+    payload: Mapped[dict[str, Any]] = mapped_column(
+        JSONB, default=dict, server_default=text("'{}'::jsonb"), nullable=False
+    )
     dedup_key: Mapped[str] = mapped_column(String(512), unique=True, nullable=False)
     status: Mapped[TelegramOutboxStatus] = mapped_column(
         Enum(TelegramOutboxStatus), default=TelegramOutboxStatus.pending, index=True
@@ -169,8 +216,12 @@ class TelegramOutbox(Base):
     sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     telegram_message_id: Mapped[int | None] = mapped_column(Integer)
     last_error: Mapped[str | None] = mapped_column(Text)
-    request_id: Mapped[int | None] = mapped_column(ForeignKey("upload_requests.id"), index=True)
-    user_id: Mapped[int | None] = mapped_column(ForeignKey("users.id"), index=True)
+    request_id: Mapped[int | None] = mapped_column(
+        ForeignKey("upload_requests.id", ondelete="SET NULL"), index=True
+    )
+    user_id: Mapped[int | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), index=True
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
@@ -196,12 +247,15 @@ class AppSetting(Base):
 
 class AuditLog(Base):
     __tablename__ = "audit_log"
+    __table_args__ = (Index("ix_audit_log_created_id", "created_at", "id"),)
 
     id: Mapped[int] = mapped_column(primary_key=True)
     actor_telegram_id: Mapped[int] = mapped_column(BigInteger, index=True)
     action: Mapped[str] = mapped_column(String(128), index=True)
-    request_id: Mapped[int | None] = mapped_column(ForeignKey("upload_requests.id"))
-    user_id: Mapped[int | None] = mapped_column(ForeignKey("users.id"))
+    request_id: Mapped[int | None] = mapped_column(
+        ForeignKey("upload_requests.id", ondelete="SET NULL")
+    )
+    user_id: Mapped[int | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"))
     old_value: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
     new_value: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

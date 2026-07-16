@@ -1,7 +1,7 @@
 from datetime import UTC, datetime
 from secrets import token_hex
 
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.models import UploadRequest, UploadStatus, User, UserStatus
@@ -12,20 +12,36 @@ def _norm_folder(path: str) -> str:
     return path.rstrip("/") + "/"
 
 
+async def lock_user_folder_path(session: AsyncSession, folder: str) -> None:
+    if hasattr(session, "execute"):
+        await session.execute(
+            text("SELECT pg_advisory_xact_lock(hashtext(:folder))"),
+            {"folder": _norm_folder(folder)},
+        )
+
+
 async def find_user_folder_conflict(
     session: AsyncSession, folder: str, *, exclude_user_id: int | None = None
 ) -> User | None:
     normalized = _norm_folder(folder)
-    if not hasattr(session, "scalars"):
+    if not hasattr(session, "scalar") or not hasattr(session, "execute"):
+        if not hasattr(session, "scalars"):
+            return None
+        users = (await session.scalars(select(User))).all()
+        for other in users:
+            if exclude_user_id is not None and other.id == exclude_user_id:
+                continue
+            folders = [other.root_folder, *(other.allowed_folders or [])]
+            if any(existing and _norm_folder(existing) == normalized for existing in folders):
+                return other
         return None
-    users = (await session.scalars(select(User))).all()
-    for other in users:
-        if exclude_user_id is not None and other.id == exclude_user_id:
-            continue
-        folders = [other.root_folder, *(other.allowed_folders or [])]
-        if any(existing and _norm_folder(existing) == normalized for existing in folders):
-            return other
-    return None
+    await lock_user_folder_path(session, normalized)
+    stmt = select(User).where(
+        (User.root_folder == normalized) | (User.allowed_folders.contains([normalized]))
+    )
+    if exclude_user_id is not None:
+        stmt = stmt.where(User.id != exclude_user_id)
+    return await session.scalar(stmt.limit(1))
 
 
 async def get_or_create_user(
@@ -66,6 +82,7 @@ async def approve_user(session: AsyncSession, user: User, admin_id: int, disk_ro
     if conflict:
         raise ValueError("Папка уже назначена другому пользователю")
     user.status = UserStatus.active
+    folder = _norm_folder(folder)
     user.root_folder = folder
     user.allowed_folders = [folder]
     user.approved_at = datetime.now(UTC)

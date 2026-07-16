@@ -3,6 +3,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import Settings
 from app.db.models import User, UserStatus
+from app.db.repositories import find_user_folder_conflict
 from app.services.app_settings import get_yandex_disk_root, set_yandex_disk_root
 from app.services.audit import write_audit
 from app.services.disk_paths import validate_yandex_disk_root
@@ -55,6 +56,9 @@ async def resolve_user_folder_for_current_root(
         else stable_user_folder_for_root(root, user)
     )
     if user.root_folder != expected:
+        conflict = await find_user_folder_conflict(session, expected, exclude_user_id=user.id)
+        if conflict:
+            raise ValueError("Папка уже назначена другому пользователю")
         user.root_folder = expected
         user.allowed_folders = [expected]
         if hasattr(session, "flush"):
@@ -80,6 +84,9 @@ async def ensure_user_folder_for_current_root(
     )
     await client.mkdir_recursive(expected)
     if user.root_folder != expected:
+        conflict = await find_user_folder_conflict(session, expected, exclude_user_id=user.id)
+        if conflict:
+            raise ValueError("Папка уже назначена другому пользователю")
         user.root_folder = expected
         user.allowed_folders = [expected]
         if hasattr(session, "flush"):
@@ -111,6 +118,9 @@ async def change_yandex_disk_root_for_active_users(
         await client.mkdir_recursive(folder)
         updates.append((user, folder))
     for user, folder in updates:
+        conflict = await find_user_folder_conflict(session, folder, exclude_user_id=user.id)
+        if conflict:
+            raise ValueError("Папка уже назначена другому пользователю")
         user.root_folder = folder
         user.allowed_folders = [folder]
     new_root = await set_yandex_disk_root(session, normalized, actor_telegram_id)

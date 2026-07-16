@@ -9,6 +9,8 @@ const adminEl = document.querySelector("#admin");
 const adminContent = document.querySelector("#admin-content");
 
 let userUploads = [];
+const pagers = { userUploads: {}, adminUploads: {}, adminUsers: {}, audit: {}, renames: {} };
+let requestVersion = 0;
 let userStatusFilter = "all";
 let adminStatusFilter = "all";
 let adminUserQuery = "";
@@ -54,7 +56,6 @@ const ADMIN_FILTERS = [
   ["rejected", "Отклонены"],
   ["needs_action", "Ожидают действия"],
 ];
-const NEEDS_ACTION_STATUSES = new Set(["pending_approval", "failed"]);
 const QUEUED_STATUSES = new Set(["approved", "uploading"]);
 
 function escapeHtml(value) {
@@ -139,6 +140,14 @@ function showAdminError(message) {
   if (error) error.textContent = message; else alert(message);
 }
 
+function resetPager(name) { pagers[name] = { cursor: null, previous: [], page: 1, nextCursor: null, hasMore: false, loading: false }; }
+function pager(name) { if (!pagers[name].page) resetPager(name); return pagers[name]; }
+function pageParams(name, extra = {}) { const p = pager(name); const params = new URLSearchParams({ limit: "25" }); if (p.cursor) params.set("cursor", p.cursor); Object.entries(extra).forEach(([k, v]) => { if (v !== undefined && v !== null && v !== "") params.set(k, v); }); return params; }
+function pagerHtml(name) { const p = pager(name); return `<div class="pager"><button data-page-prev="${name}" ${p.loading || p.page <= 1 ? "disabled" : ""}>Назад</button><span>Страница ${p.page}</span><button data-page-next="${name}" ${p.loading || !p.hasMore ? "disabled" : ""}>${p.loading ? "Загрузка…" : "Далее"}</button></div>`; }
+function bindPager(name, renderFn) { const prev = document.querySelector(`[data-page-prev="${name}"]`); const next = document.querySelector(`[data-page-next="${name}"]`); if (prev) prev.onclick = () => { const p = pager(name); if (p.loading || p.page <= 1) return; p.cursor = p.previous.pop() || null; p.page = Math.max(1, p.page - 1); renderFn(); }; if (next) next.onclick = () => { const p = pager(name); if (p.loading || !p.hasMore) return; p.previous.push(p.cursor); p.cursor = p.nextCursor; p.page += 1; renderFn(); }; }
+function applyPage(name, page) { const p = pager(name); p.hasMore = Boolean(page.has_more); p.nextCursor = page.next_cursor || null; return page.items || []; }
+async function guardedPage(name, url) { const p = pager(name); if (p.loading) return null; const version = ++requestVersion; p.loading = true; try { const page = await api(url); if (version !== requestVersion) return null; return applyPage(name, page); } finally { p.loading = false; } }
+
 async function renderUser(me) {
   if (me.status === "pending") {
     userEl.innerHTML = '<div class="card empty">Доступ ожидает одобрения администратора.</div>';
@@ -168,7 +177,7 @@ async function renderUser(me) {
   };
   form.onsubmit = async (event) => uploadSelectedFiles(event, form, input);
   document.querySelectorAll("[data-user-filter]").forEach((button) => {
-    button.onclick = () => { userStatusFilter = button.dataset.userFilter; renderUserRequests(); };
+    button.onclick = () => { userStatusFilter = button.dataset.userFilter; resetPager("userUploads"); loadUserLists(); };
   });
   await loadUserLists();
 }
@@ -284,9 +293,17 @@ async function uploadSelectedFiles(event, form, input) {
 }
 
 async function loadUserLists() {
-  userUploads = await api("/api/uploads");
-  renderUserRequests();
+  await loadUserRequests();
   await refreshFiles();
+}
+
+async function loadUserRequests() {
+  const extra = {};
+  if (userStatusFilter !== "all") extra.status = userStatusFilter;
+  const rows = await guardedPage("userUploads", `/api/uploads?${pageParams("userUploads", extra)}`);
+  if (rows === null) return;
+  userUploads = rows;
+  renderUserRequests();
 }
 
 function renderFiles(message = "Файлов пока нет") {
@@ -328,7 +345,7 @@ async function loadMoreFiles(reset = false) {
 }
 
 function renderUserRequests() {
-  const visible = userStatusFilter === "all" ? userUploads : userUploads.filter((r) => r.status === userStatusFilter);
+  const visible = userUploads;
   document.querySelectorAll("[data-user-filter]").forEach((b) => b.classList.toggle("active", b.dataset.userFilter === userStatusFilter));
   document.querySelector("#reqs").innerHTML = visible.map((r) => `
     <div class="request-card">
@@ -336,6 +353,8 @@ function renderUserRequests() {
       <div class="filename">${escapeHtml(r.safe_filename)}</div>
       <div class="muted">${escapeHtml(r.reject_reason || r.error_message || "")}</div>
     </div>`).join("") || '<div class="empty">Заявок с таким статусом пока нет.</div>';
+  document.querySelector("#reqs").innerHTML += pagerHtml("userUploads");
+  bindPager("userUploads", loadUserRequests);
 }
 
 async function loadAdmin(tab) {
@@ -351,15 +370,16 @@ async function loadAdmin(tab) {
 
 async function renderAdminUploads() {
   const params = new URLSearchParams();
-  if (adminStatusFilter !== "all" && adminStatusFilter !== "needs_action") params.set("status", adminStatusFilter);
+  if (adminStatusFilter !== "all") params.set("status", adminStatusFilter);
   if (adminUserQuery.trim()) params.set("user_query", adminUserQuery.trim());
-  let rows = await api(`/api/admin/uploads${params.toString() ? `?${params}` : ""}`);
-  if (adminStatusFilter === "needs_action") rows = rows.filter((r) => NEEDS_ACTION_STATUSES.has(r.status));
+  const pageUrl = `/api/admin/uploads?${pageParams("adminUploads", Object.fromEntries(params))}`;
+  const rows = await guardedPage("adminUploads", pageUrl);
+  if (rows === null) return;
   adminContent.innerHTML = `
     <div id="admin-error" class="muted"></div>
     <div class="admin-tools">${chipHtml(ADMIN_FILTERS, adminStatusFilter, "admin")}
       <div class="search-row"><input id="admin-search" value="${escapeHtml(adminUserQuery)}" placeholder="Поиск по Telegram ID, username или имени"><button id="clear-search" class="secondary">Очистить</button></div>
-    </div>` + (rows.map(adminUploadCard).join("") || '<div class="card empty">Заявки не найдены.</div>');
+    </div>` + (rows.map(adminUploadCard).join("") || '<div class="card empty">Заявки не найдены.</div>') + pagerHtml("adminUploads");
   bindAdminUploadControls();
 }
 
@@ -390,24 +410,27 @@ function adminUploadActions(r) {
 
 function bindAdminUploadControls() {
   document.querySelectorAll("[data-admin-filter]").forEach((button) => {
-    button.onclick = () => { adminStatusFilter = button.dataset.adminFilter; renderAdminUploads(); };
+    button.onclick = () => { adminStatusFilter = button.dataset.adminFilter; resetPager("adminUploads"); renderAdminUploads(); };
   });
   document.querySelectorAll("[data-download-id]").forEach((button) => {
     button.onclick = () => downloadTemp(Number.parseInt(button.dataset.downloadId, 10), button.dataset.downloadName || "file");
   });
   const search = document.querySelector("#admin-search");
-  search.oninput = () => { clearTimeout(adminSearchTimer); adminSearchTimer = setTimeout(() => { adminUserQuery = search.value; renderAdminUploads(); }, 300); };
-  document.querySelector("#clear-search").onclick = () => { adminUserQuery = ""; renderAdminUploads(); };
+  search.oninput = () => { clearTimeout(adminSearchTimer); adminSearchTimer = setTimeout(() => { adminUserQuery = search.value; resetPager("adminUploads"); renderAdminUploads(); }, 300); };
+  document.querySelector("#clear-search").onclick = () => { adminUserQuery = ""; resetPager("adminUploads"); renderAdminUploads(); }; bindPager("adminUploads", renderAdminUploads);
 }
 
 async function renderAdminUsers() {
-  const rows = await api("/api/admin/users");
+  const rows = await guardedPage("adminUsers", `/api/admin/users?${pageParams("adminUsers")}`);
+  if (rows === null) return;
   adminContent.innerHTML = '<div id="admin-error" class="muted"></div>' + rows.map((u) => `
     <div class="card user-card"><div class="card-head"><b>${escapeHtml(u.full_name || "—")}</b><span class="badge">${escapeHtml(statusLabel(u.status))}</span></div>
       <div class="meta">@${escapeHtml(u.username || "—")} · ID Telegram: ${escapeHtml(u.telegram_id)}</div>
       <div class="meta">Папка на Яндекс.Диске: ${escapeHtml(userFolderLabel(u))}</div>
       <div class="row">${u.status === "pending" ? ["approve", "reject", "block"].map((a) => `<button onclick="moderateUser(${u.id}, '${a}')">${userActionLabel(a)}</button>`).join("") : ""}</div>
     </div>`).join("") || '<div class="card empty">Пользователей пока нет.</div>';
+  adminContent.innerHTML += pagerHtml("adminUsers");
+  bindPager("adminUsers", renderAdminUsers);
 }
 
 
@@ -440,7 +463,9 @@ async function renderDiskRootSettings() {
 }
 
 async function renderRenameRequests() {
-  const requests = await api("/api/admin/folder-rename-requests?status=pending");
+  const renameRows = await guardedPage("renames", `/api/admin/folder-rename-requests?${pageParams("renames", { status: "pending" })}`);
+  if (renameRows === null) return;
+  const requests = { items: renameRows };
   adminContent.innerHTML = `<div id="admin-error" class="muted"></div>
     <div class="card"><h3>Переименовать папку</h3>
       <div class="search-box"><input id="rename-user-search" placeholder="Поиск пользователя по Telegram ID, username, ФИО, договору или папке"><div id="rename-user-results" class="dropdown"></div></div>
@@ -454,6 +479,8 @@ async function renderRenameRequests() {
   bindRenameUserSearch();
   document.querySelector("#rename-user-button").onclick = renameSelectedUserFolder;
   document.querySelector("#rename-requests").innerHTML = (requests.items || []).map((r) => `<div class="request-card"><b>${escapeHtml(r.requested_folder_name)}</b><div class="meta">${escapeHtml(r.user?.telegram_id || "—")} · ${escapeHtml(r.contract_full_name || "—")}</div><button onclick="approveRenameRequest(${r.id}, ${r.user_id})">Одобрить</button><button class="danger" onclick="rejectRenameRequest(${r.id})">Отклонить</button></div>`).join("") || '<div class="empty">Нет pending-заявок.</div>';
+  document.querySelector("#rename-requests").innerHTML += pagerHtml("renames");
+  bindPager("renames", renderRenameRequests);
 }
 function bindRenameUserSearch() {
   const input = document.querySelector("#rename-user-search");
@@ -530,12 +557,15 @@ async function approveRenameRequest(id, userId) { try { const selected = await s
 async function rejectRenameRequest(id) { try { const reason = prompt("Причина", "Отклонено администратором") || "Отклонено администратором"; await api(`/api/admin/folder-rename-requests/${id}/reject`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ reason }) }); await renderRenameRequests(); } catch (err) { showAdminError(safeErrorMessage(err)); } }
 
 async function renderAudit() {
-  const rows = await api("/api/admin/audit");
+  const rows = await guardedPage("audit", `/api/admin/audit?${pageParams("audit")}`);
+  if (rows === null) return;
   adminContent.innerHTML = '<div id="admin-error" class="muted"></div>' + rows.map((a) => `
     <div class="card audit-card"><b>${escapeHtml(auditLabel(a.action))}</b><br>
       <span class="meta">Администратор: ${escapeHtml(a.actor_telegram_id)}; заявка: ${escapeHtml(a.request_id || "—")}</span>
       <pre>${escapeHtml(JSON.stringify(a.new_value, null, 2))}</pre>
     </div>`).join("") || '<div class="card empty">Аудит пока пуст.</div>';
+  adminContent.innerHTML += pagerHtml("audit");
+  bindPager("audit", renderAudit);
 }
 
 async function downloadTemp(id, filename) {
@@ -550,11 +580,11 @@ async function downloadTemp(id, filename) {
 }
 
 async function moderateUser(id, action) { try { await api(`/api/admin/users/${id}/${action}`, { method: "POST" }); await loadAdmin("users"); } catch (err) { showAdminError(safeErrorMessage(err)); } }
-async function uploadAction(id, action) { try { await api(`/api/admin/uploads/${id}/${action}`, { method: "POST" }); showAdminError("Заявка поставлена в очередь"); await loadAdmin("uploads"); } catch (err) { showAdminError(safeErrorMessage(err)); } }
-async function rejectUpload(id) { try { const reason = prompt("Причина", "Отклонено администратором"); if (reason) await api(`/api/admin/uploads/${id}/reject`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ reason }) }); await loadAdmin("uploads"); } catch (err) { showAdminError(safeErrorMessage(err)); } }
-async function changeStem(id) { try { const filenameStem = prompt("Введите новое имя файла без расширения. Текущее расширение будет сохранено."); if (!filenameStem) return; await api(`/api/admin/uploads/${id}`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ filename_stem: filenameStem }) }); await loadAdmin("uploads"); } catch (err) { showAdminError(safeErrorMessage(err)); } }
-async function changeExtension(id) { try { const filenameExtension = prompt("Введите новое расширение файла, например: pdf или .pdf"); if (!filenameExtension) return; await api(`/api/admin/uploads/${id}`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ filename_extension: filenameExtension }) }); await loadAdmin("uploads"); } catch (err) { showAdminError(safeErrorMessage(err)); } }
-async function changeFolder(id) { try { const folders = await api(`/api/admin/uploads/${id}/allowed-folders`); const choices = folders.items.map((f, index) => `${index + 1}. ${f.label}`).join("\n"); const selected = prompt(`Выберите новую папку только для этой заявки:\n${choices}\n\nОбщая корневая папка меняется во вкладке «Корневая папка».`); if (!selected) return; const index = Number.parseInt(selected, 10) - 1; if (!folders.items[index]) throw new Error("Выберите номер папки из списка"); await api(`/api/admin/uploads/${id}`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ target_folder: folders.items[index].path }) }); await loadAdmin("uploads"); } catch (err) { showAdminError(safeErrorMessage(err)); } }
+async function uploadAction(id, action) { try { await api(`/api/admin/uploads/${id}/${action}`, { method: "POST" }); showAdminError("Заявка поставлена в очередь"); await renderAdminUploads(); } catch (err) { showAdminError(safeErrorMessage(err)); } }
+async function rejectUpload(id) { try { const reason = prompt("Причина", "Отклонено администратором"); if (reason) await api(`/api/admin/uploads/${id}/reject`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ reason }) }); await renderAdminUploads(); } catch (err) { showAdminError(safeErrorMessage(err)); } }
+async function changeStem(id) { try { const filenameStem = prompt("Введите новое имя файла без расширения. Текущее расширение будет сохранено."); if (!filenameStem) return; await api(`/api/admin/uploads/${id}`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ filename_stem: filenameStem }) }); await renderAdminUploads(); } catch (err) { showAdminError(safeErrorMessage(err)); } }
+async function changeExtension(id) { try { const filenameExtension = prompt("Введите новое расширение файла, например: pdf или .pdf"); if (!filenameExtension) return; await api(`/api/admin/uploads/${id}`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ filename_extension: filenameExtension }) }); await renderAdminUploads(); } catch (err) { showAdminError(safeErrorMessage(err)); } }
+async function changeFolder(id) { try { const folders = await api(`/api/admin/uploads/${id}/allowed-folders`); const choices = folders.items.map((f, index) => `${index + 1}. ${f.label}`).join("\n"); const selected = prompt(`Выберите новую папку только для этой заявки:\n${choices}\n\nОбщая корневая папка меняется во вкладке «Корневая папка».`); if (!selected) return; const index = Number.parseInt(selected, 10) - 1; if (!folders.items[index]) throw new Error("Выберите номер папки из списка"); await api(`/api/admin/uploads/${id}`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ target_folder: folders.items[index].path }) }); await renderAdminUploads(); } catch (err) { showAdminError(safeErrorMessage(err)); } }
 
 async function load() {
   try {
@@ -562,7 +592,7 @@ async function load() {
     const title = escapeHtml(me.full_name || me.username || me.telegram_id);
     auth.innerHTML = `<div class="card-head"><b>${title}</b><span class="badge">${escapeHtml(statusLabel(me.status))}</span></div><div class="muted">Папка на Яндекс.Диске: ${escapeHtml(userFolderLabel(me))}</div>`;
     await renderUser(me);
-    if (me.is_admin) { adminEl.classList.remove("hidden"); await loadAdmin("uploads"); }
+    if (me.is_admin) { adminEl.classList.remove("hidden"); await renderAdminUploads(); }
   } catch (err) { auth.textContent = safeErrorMessage(err); }
 }
 
