@@ -427,7 +427,9 @@ def test_existing_0009_database_receives_upload_ordering_index(
                 await conn.execute(
                     text(
                         "SELECT indexname FROM pg_indexes "
-                        "WHERE schemaname = current_schema() "
+                        "WHERE schemaname = (SELECT namespace.nspname FROM pg_class AS table_class "
+                        "JOIN pg_namespace AS namespace ON namespace.oid = table_class.relnamespace "
+                        "WHERE table_class.oid = to_regclass('upload_requests')) "
                         "AND tablename = 'upload_requests'"
                     )
                 )
@@ -478,7 +480,9 @@ def test_existing_0009_database_receives_upload_ordering_index(
             await conn.execute(
                 text(
                     "SELECT count(*) FROM pg_indexes "
-                    "WHERE schemaname = current_schema() "
+                    "WHERE schemaname = (SELECT namespace.nspname FROM pg_class AS table_class "
+                    "JOIN pg_namespace AS namespace ON namespace.oid = table_class.relnamespace "
+                    "WHERE table_class.oid = to_regclass('upload_requests')) "
                     "AND tablename = 'upload_requests' "
                     "AND indexname = 'ix_upload_requests_created_id'"
                 )
@@ -498,7 +502,9 @@ def test_existing_0009_database_receives_upload_ordering_index(
                 await conn.execute(
                     text(
                         "SELECT indexname FROM pg_indexes "
-                        "WHERE schemaname = current_schema() "
+                        "WHERE schemaname = (SELECT namespace.nspname FROM pg_class AS table_class "
+                        "JOIN pg_namespace AS namespace ON namespace.oid = table_class.relnamespace "
+                        "WHERE table_class.oid = to_regclass('upload_requests')) "
                         "AND tablename = 'upload_requests'"
                     )
                 )
@@ -570,7 +576,11 @@ def test_0010_rejects_conflicting_preexisting_upload_ordering_index(
                     JOIN pg_attribute AS attribute
                         ON attribute.attrelid = index_definition.indrelid
                         AND attribute.attnum = key.attnum
-                    WHERE index_class.relnamespace = current_schema()::regnamespace
+                    WHERE index_class.relnamespace = (
+                        SELECT table_class.relnamespace
+                        FROM pg_class AS table_class
+                        WHERE table_class.oid = to_regclass('upload_requests')
+                    )
                         AND index_class.relname = 'ix_upload_requests_created_id'
                     GROUP BY table_class.relname
                     """
@@ -581,6 +591,150 @@ def test_0010_rejects_conflicting_preexisting_upload_ordering_index(
         assert row[1] == columns
 
     _with_migration_connection(expected_database, conflict_is_unchanged)
+
+
+@pytest.mark.parametrize("scenario", ["existing", "shadow", "conflict"])
+def test_0010_resolves_upload_index_schema_from_target_relation(migration_db, scenario: str):
+    """A shadow first search_path entry must not change 0010's target schema."""
+    cfg, expected_database = migration_db
+    command.upgrade(cfg, "0009_db_integrity")
+    quoted_database = expected_database.replace('"', '""')
+
+    async def prepare(conn: AsyncConnection) -> None:
+        await conn.execute(text("CREATE SCHEMA role_shadow"))
+        if scenario == "existing":
+            await conn.execute(
+                text(
+                    "CREATE INDEX ix_upload_requests_created_id ON upload_requests (created_at, id)"
+                )
+            )
+        elif scenario == "shadow":
+            await conn.execute(
+                text(
+                    "CREATE TABLE role_shadow.shadow_upload_requests ("
+                    "id bigint NOT NULL, created_at timestamptz NOT NULL)"
+                )
+            )
+            await conn.execute(
+                text(
+                    "CREATE INDEX ix_upload_requests_created_id "
+                    "ON role_shadow.shadow_upload_requests (created_at, id)"
+                )
+            )
+        else:
+            await conn.execute(
+                text("CREATE INDEX ix_upload_requests_created_id ON users (telegram_id)")
+            )
+        await conn.execute(
+            text(f'ALTER DATABASE "{quoted_database}" SET search_path TO role_shadow, public')
+        )
+
+    try:
+        _with_migration_connection(expected_database, prepare)
+
+        async def check_resolution(conn: AsyncConnection) -> None:
+            assert (
+                await conn.execute(text("SELECT current_schema()"))
+            ).scalar_one() == "role_shadow"
+            target_oid = (
+                await conn.execute(text("SELECT to_regclass('upload_requests')::oid"))
+            ).scalar_one()
+            public_target_oid = (
+                await conn.execute(text("SELECT 'public.upload_requests'::regclass::oid"))
+            ).scalar_one()
+            assert target_oid == public_target_oid
+            if scenario == "shadow":
+                rows = (
+                    await conn.execute(
+                        text(
+                            """
+                            SELECT index_namespace.nspname, table_namespace.nspname,
+                                   table_class.relname, index_definition.indrelid
+                            FROM pg_class AS index_class
+                            JOIN pg_namespace AS index_namespace
+                                ON index_namespace.oid = index_class.relnamespace
+                            JOIN pg_index AS index_definition
+                                ON index_definition.indexrelid = index_class.oid
+                            JOIN pg_class AS table_class
+                                ON table_class.oid = index_definition.indrelid
+                            JOIN pg_namespace AS table_namespace
+                                ON table_namespace.oid = table_class.relnamespace
+                            WHERE index_class.relname = 'ix_upload_requests_created_id'
+                            ORDER BY index_namespace.nspname
+                            """
+                        )
+                    )
+                ).all()
+                shadow_target_oid = (
+                    await conn.execute(
+                        text("SELECT 'role_shadow.shadow_upload_requests'::regclass::oid")
+                    )
+                ).scalar_one()
+                assert rows == [
+                    ("role_shadow", "role_shadow", "shadow_upload_requests", shadow_target_oid)
+                ]
+                assert public_target_oid not in [row[3] for row in rows]
+
+        _with_migration_connection(expected_database, check_resolution)
+        if scenario == "conflict":
+            with pytest.raises(RuntimeError, match="ix_upload_requests_created_id"):
+                command.upgrade(cfg, "head")
+        else:
+            command.upgrade(cfg, "head")
+
+        async def check_result(conn: AsyncConnection) -> None:
+            expected_revision = (
+                "0009_db_integrity" if scenario == "conflict" else CURRENT_HEAD_REVISION
+            )
+            assert await _revision(conn) == expected_revision
+            rows = (
+                await conn.execute(
+                    text(
+                        """
+                        SELECT index_namespace.nspname, table_namespace.nspname,
+                               table_class.relname, index_definition.indrelid
+                        FROM pg_class AS index_class
+                        JOIN pg_namespace AS index_namespace
+                            ON index_namespace.oid = index_class.relnamespace
+                        JOIN pg_index AS index_definition ON index_definition.indexrelid = index_class.oid
+                        JOIN pg_class AS table_class ON table_class.oid = index_definition.indrelid
+                        JOIN pg_namespace AS table_namespace
+                            ON table_namespace.oid = table_class.relnamespace
+                        WHERE index_class.relname = 'ix_upload_requests_created_id'
+                        ORDER BY index_namespace.nspname
+                        """
+                    )
+                )
+            ).all()
+            public_target_oid = (
+                await conn.execute(text("SELECT 'public.upload_requests'::regclass::oid"))
+            ).scalar_one()
+            if scenario == "conflict":
+                users_oid = (
+                    await conn.execute(text("SELECT 'public.users'::regclass::oid"))
+                ).scalar_one()
+                assert rows == [("public", "public", "users", users_oid)]
+            elif scenario == "shadow":
+                shadow_target_oid = (
+                    await conn.execute(
+                        text("SELECT 'role_shadow.shadow_upload_requests'::regclass::oid")
+                    )
+                ).scalar_one()
+                assert rows == [
+                    ("public", "public", "upload_requests", public_target_oid),
+                    ("role_shadow", "role_shadow", "shadow_upload_requests", shadow_target_oid),
+                ]
+            else:
+                assert rows == [("public", "public", "upload_requests", public_target_oid)]
+
+        _with_migration_connection(expected_database, check_result)
+    finally:
+
+        async def cleanup(conn: AsyncConnection) -> None:
+            await conn.execute(text(f'ALTER DATABASE "{quoted_database}" RESET search_path'))
+            await conn.execute(text("DROP SCHEMA IF EXISTS role_shadow CASCADE"))
+
+        _with_migration_connection(expected_database, cleanup)
 
 
 async def _telegram_outbox_schema_state(conn: AsyncConnection) -> dict[str, bool]:
