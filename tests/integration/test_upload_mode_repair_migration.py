@@ -611,8 +611,14 @@ def test_0010_resolves_upload_index_schema_from_target_relation(migration_db, sc
         elif scenario == "shadow":
             await conn.execute(
                 text(
-                    "CREATE INDEX role_shadow.ix_upload_requests_created_id "
-                    "ON upload_requests (created_at, id)"
+                    "CREATE TABLE role_shadow.shadow_upload_requests ("
+                    "id bigint NOT NULL, created_at timestamptz NOT NULL)"
+                )
+            )
+            await conn.execute(
+                text(
+                    "CREATE INDEX ix_upload_requests_created_id "
+                    "ON role_shadow.shadow_upload_requests (created_at, id)"
                 )
             )
         else:
@@ -630,15 +636,44 @@ def test_0010_resolves_upload_index_schema_from_target_relation(migration_db, sc
             assert (
                 await conn.execute(text("SELECT current_schema()"))
             ).scalar_one() == "role_shadow"
-            assert (
-                await conn.execute(
-                    text(
-                        "SELECT namespace.nspname FROM pg_class AS table_class "
-                        "JOIN pg_namespace AS namespace ON namespace.oid = table_class.relnamespace "
-                        "WHERE table_class.oid = to_regclass('upload_requests')"
+            target_oid = (
+                await conn.execute(text("SELECT to_regclass('upload_requests')::oid"))
+            ).scalar_one()
+            public_target_oid = (
+                await conn.execute(text("SELECT 'public.upload_requests'::regclass::oid"))
+            ).scalar_one()
+            assert target_oid == public_target_oid
+            if scenario == "shadow":
+                rows = (
+                    await conn.execute(
+                        text(
+                            """
+                            SELECT index_namespace.nspname, table_namespace.nspname,
+                                   table_class.relname, index_definition.indrelid
+                            FROM pg_class AS index_class
+                            JOIN pg_namespace AS index_namespace
+                                ON index_namespace.oid = index_class.relnamespace
+                            JOIN pg_index AS index_definition
+                                ON index_definition.indexrelid = index_class.oid
+                            JOIN pg_class AS table_class
+                                ON table_class.oid = index_definition.indrelid
+                            JOIN pg_namespace AS table_namespace
+                                ON table_namespace.oid = table_class.relnamespace
+                            WHERE index_class.relname = 'ix_upload_requests_created_id'
+                            ORDER BY index_namespace.nspname
+                            """
+                        )
                     )
-                )
-            ).scalar_one() == "public"
+                ).all()
+                shadow_target_oid = (
+                    await conn.execute(
+                        text("SELECT 'role_shadow.shadow_upload_requests'::regclass::oid")
+                    )
+                ).scalar_one()
+                assert rows == [
+                    ("role_shadow", "role_shadow", "shadow_upload_requests", shadow_target_oid)
+                ]
+                assert public_target_oid not in [row[3] for row in rows]
 
         _with_migration_connection(expected_database, check_resolution)
         if scenario == "conflict":
@@ -656,29 +691,41 @@ def test_0010_resolves_upload_index_schema_from_target_relation(migration_db, sc
                 await conn.execute(
                     text(
                         """
-                        SELECT index_namespace.nspname, index_definition.indrelid
+                        SELECT index_namespace.nspname, table_namespace.nspname,
+                               table_class.relname, index_definition.indrelid
                         FROM pg_class AS index_class
                         JOIN pg_namespace AS index_namespace
                             ON index_namespace.oid = index_class.relnamespace
                         JOIN pg_index AS index_definition ON index_definition.indexrelid = index_class.oid
+                        JOIN pg_class AS table_class ON table_class.oid = index_definition.indrelid
+                        JOIN pg_namespace AS table_namespace
+                            ON table_namespace.oid = table_class.relnamespace
                         WHERE index_class.relname = 'ix_upload_requests_created_id'
                         ORDER BY index_namespace.nspname
                         """
                     )
                 )
             ).all()
-            target_oid = (
-                await conn.execute(text("SELECT to_regclass('upload_requests')::oid"))
+            public_target_oid = (
+                await conn.execute(text("SELECT 'public.upload_requests'::regclass::oid"))
             ).scalar_one()
             if scenario == "conflict":
-                assert rows == [
-                    (
-                        "public",
-                        (await conn.execute(text("SELECT 'users'::regclass::oid"))).scalar_one(),
+                users_oid = (
+                    await conn.execute(text("SELECT 'public.users'::regclass::oid"))
+                ).scalar_one()
+                assert rows == [("public", "public", "users", users_oid)]
+            elif scenario == "shadow":
+                shadow_target_oid = (
+                    await conn.execute(
+                        text("SELECT 'role_shadow.shadow_upload_requests'::regclass::oid")
                     )
+                ).scalar_one()
+                assert rows == [
+                    ("public", "public", "upload_requests", public_target_oid),
+                    ("role_shadow", "role_shadow", "shadow_upload_requests", shadow_target_oid),
                 ]
             else:
-                assert ("public", target_oid) in rows
+                assert rows == [("public", "public", "upload_requests", public_target_oid)]
 
         _with_migration_connection(expected_database, check_result)
     finally:
