@@ -167,30 +167,42 @@ def _matches_expected_index(index: _IndexSignature, target: _TargetTable) -> boo
     )
 
 
-def upgrade() -> None:
-    # Support databases that applied the intermediate PR #76 version of 0009, which created it.
-    target = _resolve_target_table()
-    existing = _find_existing_index(target)
-    if existing is None:
-        op.create_index(
-            "ix_upload_requests_created_id",
-            target.name,
-            ["created_at", "id"],
-            schema=target.schema,
+def _validate_existing_index(index: _IndexSignature | None, target: _TargetTable) -> None:
+    if index is None:
+        raise RuntimeError(
+            "Cannot apply 0010_upload_created_index: index "
+            "ix_upload_requests_created_id was not found after creation."
         )
-        return
 
-    if _matches_expected_index(existing, target):
+    if _matches_expected_index(index, target):
         return
 
     raise RuntimeError(
         "Cannot apply 0010_upload_created_index: index "
         "ix_upload_requests_created_id exists with an unexpected definition. "
         "Expected table upload_requests with key columns (created_at, id); "
-        f"found table {existing.table_schema}.{existing.table_name} with key columns "
-        f"{list(existing.key_columns)!r}. Check the conflicting index and rename it or "
+        f"found table {index.table_schema}.{index.table_name} with key columns "
+        f"{list(index.key_columns)!r}. Check the conflicting index and rename it or "
         "otherwise resolve it after taking a backup before retrying the migration."
     )
+
+
+def upgrade() -> None:
+    # Support databases that applied the intermediate PR #76 version of 0009, which created it.
+    target = _resolve_target_table()
+    existing = _find_existing_index(target)
+    if existing is not None:
+        _validate_existing_index(existing, target)
+        return
+
+    op.create_index(
+        "ix_upload_requests_created_id",
+        target.name,
+        ["created_at", "id"],
+        schema=target.schema,
+        if_not_exists=True,
+    )
+    _validate_existing_index(_find_existing_index(target), target)
 
 
 def downgrade() -> None:

@@ -34,35 +34,88 @@ def test_upload_request_metadata_has_global_ordering_index() -> None:
     assert indexes["ix_upload_requests_status_created_id"] == ["status", "created_at", "id"]
 
 
-def test_upload_ordering_index_migration_creates_and_drops_global_ordering_index(
+def test_upload_ordering_index_migration_creates_and_validates_global_ordering_index(
     monkeypatch,
 ) -> None:  # noqa: ANN001
-    migration = (
-        ScriptDirectory.from_config(Config("alembic.ini"))
-        .get_revision("0010_upload_created_index")
-        .module
-    )
-    assert migration.down_revision == "0009_db_integrity"
+    migration = _migration_module()
     operations = RecordingOperations()
     monkeypatch.setattr(migration, "op", operations)
     target = _target(migration)
+    lookups = iter((None, _expected_index(migration)))
     monkeypatch.setattr(migration, "_resolve_target_table", lambda: target)
-    monkeypatch.setattr(migration, "_find_existing_index", lambda actual_target: None)
+    monkeypatch.setattr(migration, "_find_existing_index", lambda actual_target: next(lookups))
 
     migration.upgrade()
     migration.downgrade()
 
-    assert (
-        "ix_upload_requests_created_id",
-        "upload_requests",
-        ["created_at", "id"],
-        {"schema": "public"},
-    ) in operations.created_indexes
-    assert (
-        "ix_upload_requests_created_id",
-        "upload_requests",
-        {"schema": "public"},
-    ) in operations.dropped_indexes
+    assert operations.created_indexes == [
+        (
+            "ix_upload_requests_created_id",
+            "upload_requests",
+            ["created_at", "id"],
+            {"schema": "public", "if_not_exists": True},
+        )
+    ]
+    assert operations.dropped_indexes == [
+        (
+            "ix_upload_requests_created_id",
+            "upload_requests",
+            {"schema": "public"},
+        )
+    ]
+
+
+def test_upload_ordering_index_migration_accepts_concurrently_created_index(monkeypatch) -> None:  # noqa: ANN001
+    migration = _migration_module()
+    operations = RecordingOperations()
+    monkeypatch.setattr(migration, "op", operations)
+    target = _target(migration)
+    lookups = iter((None, _expected_index(migration)))
+    monkeypatch.setattr(migration, "_resolve_target_table", lambda: target)
+    monkeypatch.setattr(migration, "_find_existing_index", lambda actual_target: next(lookups))
+
+    migration.upgrade()
+
+    assert len(operations.created_indexes) == 1
+    assert operations.created_indexes[0][3] == {"schema": target.schema, "if_not_exists": True}
+    assert operations.dropped_indexes == []
+
+
+def test_upload_ordering_index_migration_rejects_conflict_created_during_race(
+    monkeypatch,
+) -> None:  # noqa: ANN001
+    migration = _migration_module()
+    operations = RecordingOperations()
+    monkeypatch.setattr(migration, "op", operations)
+    target = _target(migration)
+    lookups = iter((None, _expected_index(migration, table_oid=99)))
+    monkeypatch.setattr(migration, "_resolve_target_table", lambda: target)
+    monkeypatch.setattr(migration, "_find_existing_index", lambda actual_target: next(lookups))
+
+    with pytest.raises(RuntimeError, match="unexpected definition"):
+        migration.upgrade()
+
+    assert len(operations.created_indexes) == 1
+    assert operations.created_indexes[0][3]["if_not_exists"] is True
+    assert operations.dropped_indexes == []
+
+
+def test_upload_ordering_index_migration_rejects_missing_index_after_creation(
+    monkeypatch,
+) -> None:  # noqa: ANN001
+    migration = _migration_module()
+    operations = RecordingOperations()
+    monkeypatch.setattr(migration, "op", operations)
+    target = _target(migration)
+    lookups = iter((None, None))
+    monkeypatch.setattr(migration, "_resolve_target_table", lambda: target)
+    monkeypatch.setattr(migration, "_find_existing_index", lambda actual_target: next(lookups))
+
+    with pytest.raises(RuntimeError, match="was not found after creation"):
+        migration.upgrade()
+
+    assert len(operations.created_indexes) == 1
+    assert operations.dropped_indexes == []
 
 
 def _expected_index(migration, **changes: Any):  # noqa: ANN001
@@ -211,11 +264,12 @@ def test_upload_ordering_index_migration_ignores_shadow_schema_index(monkeypatch
     monkeypatch.setattr(migration, "op", operations)
     target = _target(migration)
     monkeypatch.setattr(migration, "_resolve_target_table", lambda: target)
-    monkeypatch.setattr(migration, "_find_existing_index", lambda actual_target: None)
+    lookups = iter((None, _expected_index(migration)))
+    monkeypatch.setattr(migration, "_find_existing_index", lambda actual_target: next(lookups))
 
     migration.upgrade()
 
-    assert operations.created_indexes[0][3] == {"schema": "public"}
+    assert operations.created_indexes[0][3] == {"schema": "public", "if_not_exists": True}
 
 
 def test_upload_ordering_index_migration_rejects_matching_columns_on_other_oid(monkeypatch) -> None:  # noqa: ANN001
