@@ -1,3 +1,5 @@
+import subprocess
+import sys
 from collections.abc import Callable
 from typing import Any
 
@@ -6,6 +8,12 @@ from alembic.config import Config
 from alembic.script import ScriptDirectory
 
 from app.db.models import UploadRequest
+
+
+@pytest.fixture(autouse=True)
+def _use_online_migration_mode(monkeypatch) -> None:  # noqa: ANN001
+    """Unit tests exercise the online branch without an Alembic EnvironmentContext."""
+    monkeypatch.setattr(_migration_module().context, "is_offline_mode", lambda: False)
 
 
 class RecordingOperations:
@@ -44,6 +52,7 @@ def test_upload_ordering_index_migration_creates_and_validates_global_ordering_i
     lookups = iter((None, _expected_index(migration)))
     monkeypatch.setattr(migration, "_resolve_target_table", lambda: target)
     monkeypatch.setattr(migration, "_find_existing_index", lambda actual_target: next(lookups))
+    monkeypatch.setattr(migration, "_downgrade_candidates", lambda: [_expected_index(migration)])
 
     migration.upgrade()
     migration.downgrade()
@@ -63,6 +72,64 @@ def test_upload_ordering_index_migration_creates_and_validates_global_ordering_i
             {"schema": "public"},
         )
     ]
+
+
+@pytest.mark.parametrize(
+    ("command", "required"),
+    [
+        (
+            ["upgrade", "0009_db_integrity:0010_upload_created_index", "--sql"],
+            ["DO $$", "CREATE INDEX IF NOT EXISTS", "ix_upload_requests_created_id", "created_at"],
+        ),
+        (
+            ["downgrade", "0010_upload_created_index:0009_db_integrity", "--sql"],
+            ["DO $$", "DROP INDEX", "ix_upload_requests_created_id", "candidate_count"],
+        ),
+    ],
+)
+def test_0010_generates_safe_offline_sql_without_database(
+    command: list[str], required: list[str]
+) -> None:
+    result = subprocess.run(  # noqa: S603 -- fixed local Alembic command under test
+        [sys.executable, "-m", "alembic", *command],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip()
+    assert "Traceback" not in result.stdout + result.stderr
+    for value in required:
+        assert value in result.stdout
+
+
+def test_upload_ordering_index_downgrade_refuses_ambiguous_candidates(monkeypatch) -> None:  # noqa: ANN001
+    migration = _migration_module()
+    operations = RecordingOperations()
+    monkeypatch.setattr(migration, "op", operations)
+    monkeypatch.setattr(
+        migration,
+        "_downgrade_candidates",
+        lambda: [_expected_index(migration), _expected_index(migration, schema="other")],
+    )
+
+    with pytest.raises(RuntimeError, match="ambiguous compatible indexes"):
+        migration.downgrade()
+
+    assert operations.dropped_indexes == []
+
+
+def test_upload_ordering_index_downgrade_rejects_missing_candidate(monkeypatch) -> None:  # noqa: ANN001
+    migration = _migration_module()
+    operations = RecordingOperations()
+    monkeypatch.setattr(migration, "op", operations)
+    monkeypatch.setattr(migration, "_downgrade_candidates", lambda: [])
+
+    with pytest.raises(RuntimeError, match="no compatible managed index"):
+        migration.downgrade()
+
+    assert operations.dropped_indexes == []
 
 
 def test_upload_ordering_index_migration_accepts_concurrently_created_index(monkeypatch) -> None:  # noqa: ANN001

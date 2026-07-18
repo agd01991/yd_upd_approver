@@ -737,6 +737,99 @@ def test_0010_resolves_upload_index_schema_from_target_relation(migration_db, sc
         _with_migration_connection(expected_database, cleanup)
 
 
+@pytest.mark.parametrize(
+    "scenario", ["shadow-conflict", "ambiguous", "missing"], ids=["shadow", "ambiguous", "missing"]
+)
+def test_0010_downgrade_finds_only_the_managed_index_across_schemas(migration_db, scenario: str):
+    """Downgrade must not resolve upload_requests again through the changed search_path."""
+    cfg, expected_database = migration_db
+    command.upgrade(cfg, "0010_upload_created_index")
+    quoted_database = expected_database.replace('"', '""')
+
+    async def prepare(conn: AsyncConnection) -> None:
+        await conn.execute(text("CREATE SCHEMA role_shadow"))
+        await conn.execute(
+            text(
+                "CREATE TABLE role_shadow.upload_requests "
+                "(id bigint NOT NULL, created_at timestamptz NOT NULL, status text NOT NULL DEFAULT '')"
+            )
+        )
+        if scenario == "shadow-conflict":
+            await conn.execute(
+                text(
+                    "CREATE INDEX ix_upload_requests_created_id "
+                    "ON role_shadow.upload_requests (status, id)"
+                )
+            )
+        elif scenario == "ambiguous":
+            await conn.execute(
+                text(
+                    "CREATE INDEX ix_upload_requests_created_id "
+                    "ON role_shadow.upload_requests (created_at, id)"
+                )
+            )
+        else:
+            await conn.execute(text("DROP INDEX public.ix_upload_requests_created_id"))
+            await conn.execute(
+                text(
+                    "CREATE INDEX ix_upload_requests_created_id "
+                    "ON role_shadow.upload_requests (status, id)"
+                )
+            )
+        await conn.execute(
+            text(f'ALTER DATABASE "{quoted_database}" SET search_path TO role_shadow, public')
+        )
+
+    try:
+        _with_migration_connection(expected_database, prepare)
+
+        async def shadow_is_resolved(conn: AsyncConnection) -> None:
+            assert (
+                await conn.execute(text("SELECT to_regclass('upload_requests')::oid"))
+            ).scalar_one() == (
+                await conn.execute(text("SELECT 'role_shadow.upload_requests'::regclass::oid"))
+            ).scalar_one()
+
+        _with_migration_connection(expected_database, shadow_is_resolved)
+        if scenario == "ambiguous":
+            with pytest.raises(RuntimeError, match="ambiguous compatible indexes"):
+                command.downgrade(cfg, "0009_db_integrity")
+        elif scenario == "missing":
+            with pytest.raises(RuntimeError, match="no compatible managed index"):
+                command.downgrade(cfg, "0009_db_integrity")
+        else:
+            command.downgrade(cfg, "0009_db_integrity")
+
+        async def check(conn: AsyncConnection) -> None:
+            shadow_index = (
+                await conn.execute(
+                    text("SELECT to_regclass('role_shadow.ix_upload_requests_created_id')")
+                )
+            ).scalar_one()
+            public_index = (
+                await conn.execute(
+                    text("SELECT to_regclass('public.ix_upload_requests_created_id')")
+                )
+            ).scalar_one()
+            if scenario == "shadow-conflict":
+                assert await _revision(conn) == "0009_db_integrity"
+                assert public_index is None
+                assert shadow_index is not None
+            else:
+                assert await _revision(conn) == CURRENT_HEAD_REVISION
+                assert shadow_index is not None
+                assert public_index is None if scenario == "missing" else public_index is not None
+
+        _with_migration_connection(expected_database, check)
+    finally:
+
+        async def cleanup(conn: AsyncConnection) -> None:
+            await conn.execute(text(f'ALTER DATABASE "{quoted_database}" RESET search_path'))
+            await conn.execute(text("DROP SCHEMA IF EXISTS role_shadow CASCADE"))
+
+        _with_migration_connection(expected_database, cleanup)
+
+
 async def _telegram_outbox_schema_state(conn: AsyncConnection) -> dict[str, bool]:
     row = (
         await conn.execute(
