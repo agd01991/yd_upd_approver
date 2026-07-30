@@ -20,6 +20,7 @@ class RecordingOperations:
     def __init__(self) -> None:
         self.created_indexes: list[tuple[str, str, list[str], dict[str, Any]]] = []
         self.dropped_indexes: list[tuple[str, str | None, dict[str, Any]]] = []
+        self.executed: list[Any] = []
 
     def __getattr__(self, _name: str) -> Callable[..., None]:
         return lambda *_args, **_kwargs: None
@@ -29,6 +30,9 @@ class RecordingOperations:
 
     def drop_index(self, name: str, *, table_name: str | None = None, **kwargs: Any) -> None:
         self.dropped_indexes.append((name, table_name, kwargs))
+
+    def execute(self, statement: Any) -> None:
+        self.executed.append(statement)
 
 
 def test_upload_request_metadata_has_global_ordering_index() -> None:
@@ -49,7 +53,7 @@ def test_upload_ordering_index_migration_creates_and_validates_global_ordering_i
     operations = RecordingOperations()
     monkeypatch.setattr(migration, "op", operations)
     target = _target(migration)
-    lookups = iter((None, _expected_index(migration)))
+    lookups = iter((None, _expected_index(migration), _expected_index(migration)))
     monkeypatch.setattr(migration, "_resolve_target_table", lambda: target)
     monkeypatch.setattr(migration, "_find_existing_index", lambda actual_target: next(lookups))
     monkeypatch.setattr(migration, "_downgrade_candidates", lambda: [_expected_index(migration)])
@@ -108,6 +112,14 @@ def test_0010_generates_safe_offline_sql_without_database(
         assert "t.relkind IN ('r', 'p')" in result.stdout
         assert "left(ins.nspname, 3) <> 'pg_'" in result.stdout
         assert "NOT LIKE 'pg_%'" not in result.stdout
+        assert (
+            "obj_description(i.oid, 'pg_class') = "
+            "'yd_upd_approver:alembic:0010_upload_created_index'"
+        ) in result.stdout
+    else:
+        assert "COMMENT ON INDEX %I.%I IS %L" in result.stdout
+        assert "existing_comment IS NOT NULL" in result.stdout
+        assert "ownership marker was not stored" in result.stdout
 
 
 def test_upload_ordering_index_downgrade_refuses_ambiguous_candidates(monkeypatch) -> None:  # noqa: ANN001
@@ -138,12 +150,85 @@ def test_upload_ordering_index_downgrade_rejects_missing_candidate(monkeypatch) 
     assert operations.dropped_indexes == []
 
 
+@pytest.mark.parametrize("comment", [None, "another-owner"])
+def test_downgrade_candidates_require_exact_ownership_marker(monkeypatch, comment) -> None:  # noqa: ANN001
+    migration = _migration_module()
+    monkeypatch.setattr(
+        migration,
+        "_index_rows",
+        lambda *_args, **_kwargs: [_expected_index(migration, ownership_comment=comment)],
+    )
+
+    assert migration._downgrade_candidates() == []
+
+
+def test_downgrade_candidates_select_owned_and_ignore_unowned(monkeypatch) -> None:  # noqa: ANN001
+    migration = _migration_module()
+    owned = _expected_index(migration)
+    unowned = _expected_index(migration, schema="other", ownership_comment=None)
+    monkeypatch.setattr(migration, "_index_rows", lambda *_args, **_kwargs: [owned, unowned])
+
+    assert migration._downgrade_candidates() == [owned]
+
+
+def test_upgrade_adopts_uncommented_compatible_index(monkeypatch) -> None:  # noqa: ANN001
+    migration = _migration_module()
+    operations = RecordingOperations()
+    monkeypatch.setattr(migration, "op", operations)
+    monkeypatch.setattr(migration, "_quote_identifier", lambda value: f'"{value}"')
+    target = _target(migration)
+    unowned = _expected_index(migration, ownership_comment=None)
+    lookups = iter((unowned, _expected_index(migration)))
+    monkeypatch.setattr(migration, "_resolve_target_table", lambda: target)
+    monkeypatch.setattr(migration, "_find_existing_index", lambda _target: next(lookups))
+
+    migration.upgrade()
+
+    assert operations.created_indexes == []
+    statement = str(operations.executed[0])
+    assert 'COMMENT ON INDEX "public"."ix_upload_requests_created_id"' in statement
+    assert migration._INDEX_OWNERSHIP_MARKER in statement
+
+
+def test_upgrade_refuses_foreign_comment_without_overwriting_it(monkeypatch) -> None:  # noqa: ANN001
+    migration = _migration_module()
+    operations = RecordingOperations()
+    monkeypatch.setattr(migration, "op", operations)
+    monkeypatch.setattr(migration, "_resolve_target_table", lambda: _target(migration))
+    monkeypatch.setattr(
+        migration,
+        "_find_existing_index",
+        lambda _target: _expected_index(migration, ownership_comment="another-owner"),
+    )
+
+    with pytest.raises(RuntimeError, match="ownership conflict"):
+        migration.upgrade()
+
+    assert operations.executed == []
+
+
+def test_upgrade_fails_when_ownership_marker_is_not_persisted(monkeypatch) -> None:  # noqa: ANN001
+    migration = _migration_module()
+    operations = RecordingOperations()
+    monkeypatch.setattr(migration, "op", operations)
+    monkeypatch.setattr(migration, "_quote_identifier", lambda value: f'"{value}"')
+    target = _target(migration)
+    unowned = _expected_index(migration, ownership_comment=None)
+    monkeypatch.setattr(migration, "_resolve_target_table", lambda: target)
+    monkeypatch.setattr(migration, "_find_existing_index", lambda _target: unowned)
+
+    with pytest.raises(RuntimeError, match="ownership marker was not stored"):
+        migration.upgrade()
+
+    assert len(operations.executed) == 1
+
+
 def test_upload_ordering_index_migration_accepts_concurrently_created_index(monkeypatch) -> None:  # noqa: ANN001
     migration = _migration_module()
     operations = RecordingOperations()
     monkeypatch.setattr(migration, "op", operations)
     target = _target(migration)
-    lookups = iter((None, _expected_index(migration)))
+    lookups = iter((None, _expected_index(migration), _expected_index(migration)))
     monkeypatch.setattr(migration, "_resolve_target_table", lambda: target)
     monkeypatch.setattr(migration, "_find_existing_index", lambda actual_target: next(lookups))
 
@@ -193,6 +278,7 @@ def test_upload_ordering_index_migration_rejects_missing_index_after_creation(
 
 def _expected_index(migration, **changes: Any):  # noqa: ANN001
     fields = {
+        "index_oid": 84,
         "schema": "public",
         "table_oid": 42,
         "table_schema": "public",
@@ -207,6 +293,7 @@ def _expected_index(migration, **changes: Any):  # noqa: ANN001
         "is_expression": False,
         "is_valid": True,
         "is_ready": True,
+        "ownership_comment": "yd_upd_approver:alembic:0010_upload_created_index",
     }
     fields.update(changes)
     return migration._IndexSignature(**fields)
@@ -384,7 +471,7 @@ def test_upload_ordering_index_migration_ignores_shadow_schema_index(monkeypatch
     monkeypatch.setattr(migration, "op", operations)
     target = _target(migration)
     monkeypatch.setattr(migration, "_resolve_target_table", lambda: target)
-    lookups = iter((None, _expected_index(migration)))
+    lookups = iter((None, _expected_index(migration), _expected_index(migration)))
     monkeypatch.setattr(migration, "_find_existing_index", lambda actual_target: next(lookups))
 
     migration.upgrade()

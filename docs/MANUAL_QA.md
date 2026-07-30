@@ -246,8 +246,14 @@ PostgreSQL is the source of truth for durable Telegram notifications. Redis is n
 7. Before production migration, create a database backup. Run `alembic upgrade head`, verify the new head is `0010_upload_created_index`, then verify the upload ordering index exists exactly once with columns `(created_at, id)`:
 
 ```sql
-SELECT indexname, indexdef
+SELECT indexes.schemaname, indexes.tablename, indexes.indexname, indexes.indexdef,
+       obj_description(index_class.oid, 'pg_class') AS ownership_comment
 FROM pg_indexes AS indexes
+JOIN pg_class AS index_class
+  ON index_class.relname = indexes.indexname
+JOIN pg_namespace AS index_namespace
+  ON index_namespace.oid = index_class.relnamespace
+  AND index_namespace.nspname = indexes.schemaname
 JOIN pg_class AS table_class
   ON table_class.oid = to_regclass('upload_requests')
 JOIN pg_namespace AS table_namespace
@@ -256,6 +262,10 @@ JOIN pg_namespace AS table_namespace
 WHERE indexes.tablename = table_class.relname
   AND indexes.indexname = 'ix_upload_requests_created_id';
 ```
+
+Confirm that `ownership_comment` is exactly
+`yd_upd_approver:alembic:0010_upload_created_index`; a matching definition without this marker
+is not owned by revision 0010 and will not be removed by its downgrade.
 
 Then verify workers still claim upload and Telegram outbox jobs.
 

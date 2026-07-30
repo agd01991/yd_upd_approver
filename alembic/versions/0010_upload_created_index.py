@@ -18,10 +18,12 @@ depends_on = None
 _INDEX_NAME = "ix_upload_requests_created_id"
 _EXPECTED_KEY_COLUMNS = ("created_at", "id")
 _EXPECTED_KEY_OPTIONS = (0, 0)
+_INDEX_OWNERSHIP_MARKER = "yd_upd_approver:alembic:0010_upload_created_index"
 
 
 @dataclass(frozen=True)
 class _IndexSignature:
+    index_oid: int
     schema: str
     table_oid: int
     table_schema: str
@@ -36,6 +38,7 @@ class _IndexSignature:
     is_expression: bool
     is_valid: bool
     is_ready: bool
+    ownership_comment: str | None
 
 
 @dataclass(frozen=True)
@@ -80,7 +83,8 @@ def _index_rows(where: str, parameters: dict[str, object] | None = None) -> list
         op.get_bind()
         .execute(
             text(f"""
-        SELECT index_namespace.nspname AS schema, index_definition.indrelid AS table_oid,
+        SELECT index_class.oid AS index_oid, index_namespace.nspname AS schema,
+               index_definition.indrelid AS table_oid,
                table_namespace.nspname AS table_schema, table_class.relname AS table_name,
                array_agg(attribute.attname ORDER BY key_attribute.ordinality)
                    FILTER (WHERE key_attribute.ordinality <= index_definition.indnkeyatts)
@@ -93,7 +97,9 @@ def _index_rows(where: str, parameters: dict[str, object] | None = None) -> list
                bool_or(index_definition.indisunique) AS is_unique,
                bool_or(index_definition.indpred IS NOT NULL) AS is_partial,
                bool_or(index_definition.indexprs IS NOT NULL) AS is_expression,
-               bool_or(index_definition.indisvalid) AS is_valid, bool_or(index_definition.indisready) AS is_ready
+               bool_or(index_definition.indisvalid) AS is_valid,
+               bool_or(index_definition.indisready) AS is_ready,
+               obj_description(index_class.oid, 'pg_class') AS ownership_comment
         FROM pg_class AS index_class
         JOIN pg_namespace AS index_namespace ON index_namespace.oid = index_class.relnamespace
         JOIN pg_index AS index_definition ON index_definition.indexrelid = index_class.oid
@@ -108,8 +114,8 @@ def _index_rows(where: str, parameters: dict[str, object] | None = None) -> list
         LEFT JOIN pg_attribute AS attribute ON attribute.attrelid = index_definition.indrelid
             AND attribute.attnum = key_attribute.attnum
         WHERE index_class.relname = '{_INDEX_NAME}' AND {where}
-        GROUP BY index_namespace.nspname, index_definition.indrelid, table_namespace.nspname,
-                 table_class.relname, access_method.amname
+        GROUP BY index_class.oid, index_namespace.nspname, index_definition.indrelid,
+                 table_namespace.nspname, table_class.relname, access_method.amname
     """),
             parameters or {},
         )
@@ -118,6 +124,7 @@ def _index_rows(where: str, parameters: dict[str, object] | None = None) -> list
     )
     return [
         _IndexSignature(
+            index_oid=row["index_oid"],
             schema=row["schema"],
             table_oid=row["table_oid"],
             table_schema=row["table_schema"],
@@ -132,6 +139,7 @@ def _index_rows(where: str, parameters: dict[str, object] | None = None) -> list
             is_expression=row["is_expression"],
             is_valid=row["is_valid"],
             is_ready=row["is_ready"],
+            ownership_comment=row["ownership_comment"],
         )
         for row in rows
     ]
@@ -196,13 +204,37 @@ def _downgrade_candidates() -> list[_IndexSignature]:
         and not index.is_expression
         and index.is_valid
         and index.is_ready
+        and index.ownership_comment == _INDEX_OWNERSHIP_MARKER
     ]
 
 
+def _quote_identifier(value: str) -> str:
+    return op.get_bind().dialect.identifier_preparer.quote(value)
+
+
+def _mark_owned_index(index: _IndexSignature, target: _TargetTable) -> None:
+    if index.ownership_comment not in (None, _INDEX_OWNERSHIP_MARKER):
+        raise RuntimeError(
+            f"Cannot apply {revision}: ownership conflict for index {_INDEX_NAME}; "
+            "its existing comment belongs to another owner."
+        )
+    if index.ownership_comment is None:
+        qualified_name = f"{_quote_identifier(index.schema)}.{_quote_identifier(_INDEX_NAME)}"
+        marker = _INDEX_OWNERSHIP_MARKER.replace("'", "''")
+        op.execute(text(f"COMMENT ON INDEX {qualified_name} IS '{marker}'"))
+    marked = _find_existing_index(target)
+    _validate_existing_index(marked, target)
+    if marked is None or marked.ownership_comment != _INDEX_OWNERSHIP_MARKER:
+        raise RuntimeError(
+            f"Cannot apply {revision}: ownership marker was not stored for index {_INDEX_NAME}."
+        )
+
+
 def _offline_upgrade_sql() -> str:
-    return """
+    return f"""
 DO $$
-DECLARE target_oid oid; target_schema text; named_count integer; valid_count integer;
+DECLARE target_oid oid; target_schema text; index_oid oid; existing_comment text;
+        named_count integer; valid_count integer;
 BEGIN
   SELECT c.oid, n.nspname INTO target_oid, target_schema FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE c.oid = to_regclass('upload_requests') AND c.relkind IN ('r', 'p');
   IF NOT FOUND THEN RAISE EXCEPTION 'Cannot apply 0010_upload_created_index: target table upload_requests was not found'; END IF;
@@ -213,6 +245,17 @@ BEGIN
     IF named_count = 0 THEN RAISE EXCEPTION 'Cannot apply 0010_upload_created_index: index ix_upload_requests_created_id was not found after creation'; END IF;
     RAISE EXCEPTION 'Cannot apply 0010_upload_created_index: index ix_upload_requests_created_id has an incompatible signature';
   END IF;
+  SELECT i.oid, obj_description(i.oid, 'pg_class') INTO STRICT index_oid, existing_comment
+    FROM pg_class i JOIN pg_namespace n ON n.oid = i.relnamespace
+    WHERE n.nspname = target_schema AND i.relname = 'ix_upload_requests_created_id';
+  IF existing_comment IS NOT NULL AND existing_comment <> '{_INDEX_OWNERSHIP_MARKER}' THEN
+    RAISE EXCEPTION 'Cannot apply 0010_upload_created_index: ownership conflict for index ix_upload_requests_created_id; its existing comment belongs to another owner';
+  END IF;
+  EXECUTE format('COMMENT ON INDEX %I.%I IS %L', target_schema,
+                 'ix_upload_requests_created_id', '{_INDEX_OWNERSHIP_MARKER}');
+  IF obj_description(index_oid, 'pg_class') IS DISTINCT FROM '{_INDEX_OWNERSHIP_MARKER}' THEN
+    RAISE EXCEPTION 'Cannot apply 0010_upload_created_index: ownership marker was not stored for index ix_upload_requests_created_id';
+  END IF;
 END $$;
 """
 
@@ -222,7 +265,7 @@ def _offline_downgrade_sql() -> str:
 DO $$
 DECLARE candidate_count integer; candidate_schema text; candidate_schemas text;
 BEGIN
-  SELECT count(*), min(ins.nspname), string_agg(format('%I', ins.nspname), ', ' ORDER BY ins.nspname) INTO candidate_count, candidate_schema, candidate_schemas FROM pg_class i JOIN pg_namespace ins ON ins.oid = i.relnamespace JOIN pg_index x ON x.indexrelid = i.oid JOIN pg_class t ON t.oid = x.indrelid JOIN pg_namespace tns ON tns.oid = t.relnamespace JOIN pg_am am ON am.oid = i.relam WHERE i.relname = 'ix_upload_requests_created_id' AND ins.oid = tns.oid AND t.relname = 'upload_requests' AND t.relkind IN ('r', 'p') AND left(ins.nspname, 3) <> 'pg_' AND ins.nspname <> 'information_schema' AND x.indnkeyatts = 2 AND x.indnatts = 2 AND am.amname = 'btree' AND NOT x.indisunique AND x.indpred IS NULL AND x.indexprs IS NULL AND x.indisvalid AND x.indisready AND (SELECT array_agg(a.attname ORDER BY k.ordinality) FROM unnest(x.indkey) WITH ORDINALITY AS k(attnum, ordinality) JOIN pg_attribute a ON a.attrelid = x.indrelid AND a.attnum = k.attnum WHERE k.ordinality <= x.indnkeyatts) = ARRAY['created_at', 'id']::name[] AND (SELECT array_agg(o.option ORDER BY o.ordinality) FROM unnest(x.indoption) WITH ORDINALITY AS o(option, ordinality) WHERE o.ordinality <= x.indnkeyatts) = ARRAY[0, 0]::smallint[];
+  SELECT count(*), min(ins.nspname), string_agg(format('%I', ins.nspname), ', ' ORDER BY ins.nspname) INTO candidate_count, candidate_schema, candidate_schemas FROM pg_class i JOIN pg_namespace ins ON ins.oid = i.relnamespace JOIN pg_index x ON x.indexrelid = i.oid JOIN pg_class t ON t.oid = x.indrelid JOIN pg_namespace tns ON tns.oid = t.relnamespace JOIN pg_am am ON am.oid = i.relam WHERE i.relname = 'ix_upload_requests_created_id' AND ins.oid = tns.oid AND t.relname = 'upload_requests' AND t.relkind IN ('r', 'p') AND left(ins.nspname, 3) <> 'pg_' AND ins.nspname <> 'information_schema' AND obj_description(i.oid, 'pg_class') = 'yd_upd_approver:alembic:0010_upload_created_index' AND x.indnkeyatts = 2 AND x.indnatts = 2 AND am.amname = 'btree' AND NOT x.indisunique AND x.indpred IS NULL AND x.indexprs IS NULL AND x.indisvalid AND x.indisready AND (SELECT array_agg(a.attname ORDER BY k.ordinality) FROM unnest(x.indkey) WITH ORDINALITY AS k(attnum, ordinality) JOIN pg_attribute a ON a.attrelid = x.indrelid AND a.attnum = k.attnum WHERE k.ordinality <= x.indnkeyatts) = ARRAY['created_at', 'id']::name[] AND (SELECT array_agg(o.option ORDER BY o.ordinality) FROM unnest(x.indoption) WITH ORDINALITY AS o(option, ordinality) WHERE o.ordinality <= x.indnkeyatts) = ARRAY[0, 0]::smallint[];
   IF candidate_count = 0 THEN RAISE EXCEPTION 'Cannot downgrade 0010_upload_created_index: no compatible managed index was found'; END IF;
   IF candidate_count > 1 THEN RAISE EXCEPTION 'Cannot downgrade 0010_upload_created_index: ambiguous compatible indexes in schemas: %', candidate_schemas; END IF;
   EXECUTE format('DROP INDEX %I.%I', candidate_schema, 'ix_upload_requests_created_id');
@@ -238,11 +281,15 @@ def upgrade() -> None:
     existing = _find_existing_index(target)
     if existing is not None:
         _validate_existing_index(existing, target)
+        _mark_owned_index(existing, target)
         return
     op.create_index(
         _INDEX_NAME, target.name, ["created_at", "id"], schema=target.schema, if_not_exists=True
     )
-    _validate_existing_index(_find_existing_index(target), target)
+    created = _find_existing_index(target)
+    _validate_existing_index(created, target)
+    assert created is not None
+    _mark_owned_index(created, target)
 
 
 def downgrade() -> None:
