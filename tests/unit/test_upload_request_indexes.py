@@ -102,6 +102,10 @@ def test_0010_generates_safe_offline_sql_without_database(
     assert "Traceback" not in result.stdout + result.stderr
     for value in required:
         assert value in result.stdout
+    if command[0] == "downgrade":
+        assert "t.relkind IN ('r', 'p')" in result.stdout
+        assert "left(ins.nspname, 3) <> 'pg_'" in result.stdout
+        assert "NOT LIKE 'pg_%'" not in result.stdout
 
 
 def test_upload_ordering_index_downgrade_refuses_ambiguous_candidates(monkeypatch) -> None:  # noqa: ANN001
