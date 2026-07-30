@@ -102,6 +102,8 @@ def test_0010_generates_safe_offline_sql_without_database(
     assert "Traceback" not in result.stdout + result.stderr
     for value in required:
         assert value in result.stdout
+    assert "unnest(x.indoption) WITH ORDINALITY" in result.stdout
+    assert "ARRAY[0, 0]::smallint[]" in result.stdout
     if command[0] == "downgrade":
         assert "t.relkind IN ('r', 'p')" in result.stdout
         assert "left(ins.nspname, 3) <> 'pg_'" in result.stdout
@@ -196,6 +198,7 @@ def _expected_index(migration, **changes: Any):  # noqa: ANN001
         "table_schema": "public",
         "table_name": "upload_requests",
         "key_columns": ("created_at", "id"),
+        "key_options": (0, 0),
         "key_column_count": 2,
         "total_column_count": 2,
         "access_method": "btree",
@@ -259,6 +262,52 @@ def test_upload_ordering_index_migration_accepts_correct_intermediate_index(monk
     migration.upgrade()
 
     assert operations.created_indexes == []
+    assert operations.dropped_indexes == []
+
+
+@pytest.mark.parametrize("key_options", [(1, 0), (2, 0), (0, 1), (0, 2)])
+def test_upload_ordering_index_migration_rejects_wrong_key_options(
+    monkeypatch, key_options: tuple[int, int]
+) -> None:  # noqa: ANN001
+    migration = _migration_module()
+    operations = RecordingOperations()
+    monkeypatch.setattr(migration, "op", operations)
+    monkeypatch.setattr(migration, "_resolve_target_table", lambda: _target(migration))
+    monkeypatch.setattr(
+        migration,
+        "_find_existing_index",
+        lambda actual_target: _expected_index(migration, key_options=key_options),
+    )
+
+    with pytest.raises(RuntimeError, match="unexpected definition"):
+        migration.upgrade()
+
+    assert operations.created_indexes == []
+    assert operations.dropped_indexes == []
+
+
+def test_downgrade_candidates_require_expected_key_options(monkeypatch) -> None:  # noqa: ANN001
+    migration = _migration_module()
+    expected = _expected_index(migration)
+    wrong_order = _expected_index(migration, schema="shadow", key_options=(1, 0))
+    monkeypatch.setattr(migration, "_index_rows", lambda *_args, **_kwargs: [expected, wrong_order])
+
+    assert migration._downgrade_candidates() == [expected]
+
+
+def test_downgrade_rejects_only_wrong_order_candidate(monkeypatch) -> None:  # noqa: ANN001
+    migration = _migration_module()
+    operations = RecordingOperations()
+    monkeypatch.setattr(migration, "op", operations)
+    monkeypatch.setattr(
+        migration,
+        "_index_rows",
+        lambda *_args, **_kwargs: [_expected_index(migration, key_options=(2, 0))],
+    )
+
+    with pytest.raises(RuntimeError, match="no compatible managed index"):
+        migration.downgrade()
+
     assert operations.dropped_indexes == []
 
 

@@ -16,6 +16,8 @@ branch_labels = None
 depends_on = None
 
 _INDEX_NAME = "ix_upload_requests_created_id"
+_EXPECTED_KEY_COLUMNS = ("created_at", "id")
+_EXPECTED_KEY_OPTIONS = (0, 0)
 
 
 @dataclass(frozen=True)
@@ -25,6 +27,7 @@ class _IndexSignature:
     table_schema: str
     table_name: str
     key_columns: tuple[str | None, ...]
+    key_options: tuple[int, ...]
     key_column_count: int
     total_column_count: int
     access_method: str
@@ -82,6 +85,9 @@ def _index_rows(where: str, parameters: dict[str, object] | None = None) -> list
                array_agg(attribute.attname ORDER BY key_attribute.ordinality)
                    FILTER (WHERE key_attribute.ordinality <= index_definition.indnkeyatts)
                    AS key_columns,
+               array_agg(key_option.option ORDER BY key_attribute.ordinality)
+                   FILTER (WHERE key_attribute.ordinality <= index_definition.indnkeyatts)
+                   AS key_options,
                max(index_definition.indnkeyatts) AS key_column_count,
                max(index_definition.indnatts) AS total_column_count, access_method.amname AS access_method,
                bool_or(index_definition.indisunique) AS is_unique,
@@ -96,6 +102,9 @@ def _index_rows(where: str, parameters: dict[str, object] | None = None) -> list
         JOIN pg_am AS access_method ON access_method.oid = index_class.relam
         LEFT JOIN LATERAL unnest(index_definition.indkey)
             WITH ORDINALITY AS key_attribute(attnum, ordinality) ON TRUE
+        LEFT JOIN LATERAL unnest(index_definition.indoption)
+            WITH ORDINALITY AS key_option(option, ordinality)
+            ON key_option.ordinality = key_attribute.ordinality
         LEFT JOIN pg_attribute AS attribute ON attribute.attrelid = index_definition.indrelid
             AND attribute.attnum = key_attribute.attnum
         WHERE index_class.relname = '{_INDEX_NAME}' AND {where}
@@ -114,6 +123,7 @@ def _index_rows(where: str, parameters: dict[str, object] | None = None) -> list
             table_schema=row["table_schema"],
             table_name=row["table_name"],
             key_columns=tuple(row["key_columns"] or ()),
+            key_options=tuple(row["key_options"] or ()),
             key_column_count=row["key_column_count"],
             total_column_count=row["total_column_count"],
             access_method=row["access_method"],
@@ -138,7 +148,8 @@ def _matches_expected_index(index: _IndexSignature, target: _TargetTable) -> boo
         and index.table_oid == target.oid
         and index.table_schema == target.schema
         and index.table_name == target.name
-        and index.key_columns == ("created_at", "id")
+        and index.key_columns == _EXPECTED_KEY_COLUMNS
+        and index.key_options == _EXPECTED_KEY_OPTIONS
         and index.key_column_count == 2
         and index.total_column_count == 2
         and index.access_method == "btree"
@@ -159,8 +170,9 @@ def _validate_existing_index(index: _IndexSignature | None, target: _TargetTable
         return
     raise RuntimeError(
         f"Cannot apply {revision}: index {_INDEX_NAME} exists with an unexpected definition. "
-        f"Expected table upload_requests with key columns (created_at, id); found table "
-        f"{index.table_schema}.{index.table_name} with key columns {list(index.key_columns)!r}."
+        f"Expected table upload_requests with key columns (created_at, id) and key options "
+        f"{_EXPECTED_KEY_OPTIONS!r}; found table {index.table_schema}.{index.table_name} with "
+        f"key columns {list(index.key_columns)!r} and key options {index.key_options!r}."
     )
 
 
@@ -174,7 +186,8 @@ def _downgrade_candidates() -> list[_IndexSignature]:
             "AND left(index_namespace.nspname, 3) <> 'pg_' "
             "AND index_namespace.nspname <> 'information_schema'"
         )
-        if index.key_columns == ("created_at", "id")
+        if index.key_columns == _EXPECTED_KEY_COLUMNS
+        and index.key_options == _EXPECTED_KEY_OPTIONS
         and index.key_column_count == 2
         and index.total_column_count == 2
         and index.access_method == "btree"
@@ -195,7 +208,7 @@ BEGIN
   IF NOT FOUND THEN RAISE EXCEPTION 'Cannot apply 0010_upload_created_index: target table upload_requests was not found'; END IF;
   SELECT count(*) INTO named_count FROM pg_class i JOIN pg_namespace n ON n.oid = i.relnamespace WHERE n.nspname = target_schema AND i.relname = 'ix_upload_requests_created_id';
   IF named_count = 0 THEN EXECUTE format('CREATE INDEX IF NOT EXISTS %I ON %I.%I (created_at, id)', 'ix_upload_requests_created_id', target_schema, 'upload_requests'); END IF;
-  SELECT count(*) INTO valid_count FROM pg_class i JOIN pg_namespace ins ON ins.oid = i.relnamespace JOIN pg_index x ON x.indexrelid = i.oid JOIN pg_class t ON t.oid = x.indrelid JOIN pg_namespace tns ON tns.oid = t.relnamespace JOIN pg_am am ON am.oid = i.relam WHERE i.relname = 'ix_upload_requests_created_id' AND ins.nspname = target_schema AND x.indrelid = target_oid AND ins.oid = tns.oid AND t.relname = 'upload_requests' AND x.indnkeyatts = 2 AND x.indnatts = 2 AND am.amname = 'btree' AND NOT x.indisunique AND x.indpred IS NULL AND x.indexprs IS NULL AND x.indisvalid AND x.indisready AND (SELECT array_agg(a.attname ORDER BY k.ordinality) FROM unnest(x.indkey) WITH ORDINALITY AS k(attnum, ordinality) JOIN pg_attribute a ON a.attrelid = x.indrelid AND a.attnum = k.attnum WHERE k.ordinality <= x.indnkeyatts) = ARRAY['created_at', 'id']::name[];
+  SELECT count(*) INTO valid_count FROM pg_class i JOIN pg_namespace ins ON ins.oid = i.relnamespace JOIN pg_index x ON x.indexrelid = i.oid JOIN pg_class t ON t.oid = x.indrelid JOIN pg_namespace tns ON tns.oid = t.relnamespace JOIN pg_am am ON am.oid = i.relam WHERE i.relname = 'ix_upload_requests_created_id' AND ins.nspname = target_schema AND x.indrelid = target_oid AND ins.oid = tns.oid AND t.relname = 'upload_requests' AND x.indnkeyatts = 2 AND x.indnatts = 2 AND am.amname = 'btree' AND NOT x.indisunique AND x.indpred IS NULL AND x.indexprs IS NULL AND x.indisvalid AND x.indisready AND (SELECT array_agg(a.attname ORDER BY k.ordinality) FROM unnest(x.indkey) WITH ORDINALITY AS k(attnum, ordinality) JOIN pg_attribute a ON a.attrelid = x.indrelid AND a.attnum = k.attnum WHERE k.ordinality <= x.indnkeyatts) = ARRAY['created_at', 'id']::name[] AND (SELECT array_agg(o.option ORDER BY o.ordinality) FROM unnest(x.indoption) WITH ORDINALITY AS o(option, ordinality) WHERE o.ordinality <= x.indnkeyatts) = ARRAY[0, 0]::smallint[];
   IF valid_count = 0 THEN
     IF named_count = 0 THEN RAISE EXCEPTION 'Cannot apply 0010_upload_created_index: index ix_upload_requests_created_id was not found after creation'; END IF;
     RAISE EXCEPTION 'Cannot apply 0010_upload_created_index: index ix_upload_requests_created_id has an incompatible signature';
@@ -209,7 +222,7 @@ def _offline_downgrade_sql() -> str:
 DO $$
 DECLARE candidate_count integer; candidate_schema text; candidate_schemas text;
 BEGIN
-  SELECT count(*), min(ins.nspname), string_agg(format('%I', ins.nspname), ', ' ORDER BY ins.nspname) INTO candidate_count, candidate_schema, candidate_schemas FROM pg_class i JOIN pg_namespace ins ON ins.oid = i.relnamespace JOIN pg_index x ON x.indexrelid = i.oid JOIN pg_class t ON t.oid = x.indrelid JOIN pg_namespace tns ON tns.oid = t.relnamespace JOIN pg_am am ON am.oid = i.relam WHERE i.relname = 'ix_upload_requests_created_id' AND ins.oid = tns.oid AND t.relname = 'upload_requests' AND t.relkind IN ('r', 'p') AND left(ins.nspname, 3) <> 'pg_' AND ins.nspname <> 'information_schema' AND x.indnkeyatts = 2 AND x.indnatts = 2 AND am.amname = 'btree' AND NOT x.indisunique AND x.indpred IS NULL AND x.indexprs IS NULL AND x.indisvalid AND x.indisready AND (SELECT array_agg(a.attname ORDER BY k.ordinality) FROM unnest(x.indkey) WITH ORDINALITY AS k(attnum, ordinality) JOIN pg_attribute a ON a.attrelid = x.indrelid AND a.attnum = k.attnum WHERE k.ordinality <= x.indnkeyatts) = ARRAY['created_at', 'id']::name[];
+  SELECT count(*), min(ins.nspname), string_agg(format('%I', ins.nspname), ', ' ORDER BY ins.nspname) INTO candidate_count, candidate_schema, candidate_schemas FROM pg_class i JOIN pg_namespace ins ON ins.oid = i.relnamespace JOIN pg_index x ON x.indexrelid = i.oid JOIN pg_class t ON t.oid = x.indrelid JOIN pg_namespace tns ON tns.oid = t.relnamespace JOIN pg_am am ON am.oid = i.relam WHERE i.relname = 'ix_upload_requests_created_id' AND ins.oid = tns.oid AND t.relname = 'upload_requests' AND t.relkind IN ('r', 'p') AND left(ins.nspname, 3) <> 'pg_' AND ins.nspname <> 'information_schema' AND x.indnkeyatts = 2 AND x.indnatts = 2 AND am.amname = 'btree' AND NOT x.indisunique AND x.indpred IS NULL AND x.indexprs IS NULL AND x.indisvalid AND x.indisready AND (SELECT array_agg(a.attname ORDER BY k.ordinality) FROM unnest(x.indkey) WITH ORDINALITY AS k(attnum, ordinality) JOIN pg_attribute a ON a.attrelid = x.indrelid AND a.attnum = k.attnum WHERE k.ordinality <= x.indnkeyatts) = ARRAY['created_at', 'id']::name[] AND (SELECT array_agg(o.option ORDER BY o.ordinality) FROM unnest(x.indoption) WITH ORDINALITY AS o(option, ordinality) WHERE o.ordinality <= x.indnkeyatts) = ARRAY[0, 0]::smallint[];
   IF candidate_count = 0 THEN RAISE EXCEPTION 'Cannot downgrade 0010_upload_created_index: no compatible managed index was found'; END IF;
   IF candidate_count > 1 THEN RAISE EXCEPTION 'Cannot downgrade 0010_upload_created_index: ambiguous compatible indexes in schemas: %', candidate_schemas; END IF;
   EXECUTE format('DROP INDEX %I.%I', candidate_schema, 'ix_upload_requests_created_id');
