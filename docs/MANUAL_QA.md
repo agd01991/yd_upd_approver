@@ -247,13 +247,22 @@ PostgreSQL is the source of truth for durable Telegram notifications. Redis is n
 
 ```sql
 SELECT indexname, indexdef
-FROM pg_indexes
-WHERE schemaname = current_schema()
-  AND tablename = 'upload_requests'
-  AND indexname = 'ix_upload_requests_created_id';
+FROM pg_indexes AS indexes
+JOIN pg_class AS table_class
+  ON table_class.oid = to_regclass('upload_requests')
+JOIN pg_namespace AS table_namespace
+  ON table_namespace.oid = table_class.relnamespace
+  AND indexes.schemaname = table_namespace.nspname
+WHERE indexes.tablename = table_class.relname
+  AND indexes.indexname = 'ix_upload_requests_created_id';
 ```
 
 Then verify workers still claim upload and Telegram outbox jobs.
+
+If `0010_upload_created_index` reports an incompatible index named
+`ix_upload_requests_created_id`, inspect its table and key columns first. Do not remove an
+index blindly: take a backup, analyze the conflicting object, and only then rename or remove it
+before retrying the migration.
 8. With Docker, validate configuration and service health:
 
 ```bash
