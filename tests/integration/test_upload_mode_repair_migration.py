@@ -10,6 +10,7 @@ from typing import TypeVar
 
 import pytest
 from alembic.config import Config
+from alembic.script import ScriptDirectory
 from sqlalchemy import text
 from sqlalchemy.engine import make_url
 from sqlalchemy.exc import OperationalError
@@ -739,8 +740,24 @@ def test_0010_resolves_upload_index_schema_from_target_relation(migration_db, sc
 
 @pytest.mark.parametrize(
     "scenario",
-    ["shadow-conflict", "ambiguous", "missing", "materialized", "materialized-only"],
-    ids=["shadow", "ambiguous", "missing", "materialized", "materialized-only"],
+    [
+        "shadow-conflict",
+        "wrong-desc",
+        "wrong-nulls-first",
+        "ambiguous",
+        "missing",
+        "materialized",
+        "materialized-only",
+    ],
+    ids=[
+        "shadow",
+        "wrong-desc",
+        "wrong-nulls-first",
+        "ambiguous",
+        "missing",
+        "materialized",
+        "materialized-only",
+    ],
 )
 def test_0010_downgrade_finds_only_the_managed_index_across_schemas(migration_db, scenario: str):
     """Downgrade must not resolve upload_requests again through the changed search_path."""
@@ -776,6 +793,18 @@ def test_0010_downgrade_finds_only_the_managed_index_across_schemas(migration_db
                 text(
                     "CREATE INDEX ix_upload_requests_created_id "
                     "ON role_shadow.upload_requests (status, id)"
+                )
+            )
+        elif scenario in {"wrong-desc", "wrong-nulls-first"}:
+            ordering = (
+                "created_at DESC NULLS LAST, id ASC"
+                if scenario == "wrong-desc"
+                else "created_at ASC NULLS FIRST, id ASC"
+            )
+            await conn.execute(
+                text(
+                    "CREATE INDEX ix_upload_requests_created_id "
+                    f"ON role_shadow.upload_requests ({ordering})"
                 )
             )
         elif scenario == "ambiguous":
@@ -829,7 +858,12 @@ def test_0010_downgrade_finds_only_the_managed_index_across_schemas(migration_db
                     text("SELECT to_regclass('public.ix_upload_requests_created_id')")
                 )
             ).scalar_one()
-            if scenario in {"shadow-conflict", "materialized"}:
+            if scenario in {
+                "shadow-conflict",
+                "wrong-desc",
+                "wrong-nulls-first",
+                "materialized",
+            }:
                 assert await _revision(conn) == "0009_db_integrity"
                 assert public_index is None
                 assert shadow_index is not None
@@ -859,6 +893,141 @@ def test_0010_downgrade_finds_only_the_managed_index_across_schemas(migration_db
                         "ON public.upload_requests (created_at, id)"
                     )
                 )
+
+        _with_migration_connection(expected_database, cleanup)
+
+
+@pytest.mark.parametrize(
+    "ordering",
+    ["created_at DESC NULLS LAST, id ASC", "created_at ASC NULLS FIRST, id ASC"],
+    ids=["desc", "nulls-first"],
+)
+def test_0010_upgrade_rejects_existing_index_with_wrong_order(migration_db, ordering: str):
+    cfg, expected_database = migration_db
+    command.upgrade(cfg, "0009_db_integrity")
+
+    async def prepare(conn: AsyncConnection) -> None:
+        await conn.execute(
+            text(f"CREATE INDEX ix_upload_requests_created_id ON upload_requests ({ordering})")
+        )
+
+    _with_migration_connection(expected_database, prepare)
+
+    with pytest.raises(RuntimeError, match="unexpected definition"):
+        command.upgrade(cfg, CURRENT_HEAD_REVISION)
+
+    async def check(conn: AsyncConnection) -> None:
+        assert await _revision(conn) == "0009_db_integrity"
+        options = (
+            await conn.execute(
+                text(
+                    "SELECT indoption::smallint[] FROM pg_index "
+                    "WHERE indexrelid = 'ix_upload_requests_created_id'::regclass"
+                )
+            )
+        ).scalar_one()
+        assert tuple(options) != (0, 0)
+
+    _with_migration_connection(expected_database, check)
+
+
+@pytest.mark.parametrize(
+    "ordering",
+    ["created_at DESC NULLS LAST, id ASC", "created_at ASC NULLS FIRST, id ASC"],
+    ids=["desc", "nulls-first"],
+)
+def test_0010_downgrade_rejects_only_wrong_order_candidate(migration_db, ordering: str):
+    cfg, expected_database = migration_db
+    command.upgrade(cfg, CURRENT_HEAD_REVISION)
+
+    async def prepare(conn: AsyncConnection) -> None:
+        await conn.execute(text("CREATE SCHEMA role_shadow"))
+        await conn.execute(
+            text(
+                "CREATE TABLE role_shadow.upload_requests "
+                "(id bigint NOT NULL, created_at timestamptz NOT NULL)"
+            )
+        )
+        await conn.execute(
+            text(
+                "CREATE INDEX ix_upload_requests_created_id "
+                f"ON role_shadow.upload_requests ({ordering})"
+            )
+        )
+        await conn.execute(text("DROP INDEX public.ix_upload_requests_created_id"))
+
+    _with_migration_connection(expected_database, prepare)
+    try:
+        with pytest.raises(RuntimeError, match="no compatible managed index"):
+            command.downgrade(cfg, "0009_db_integrity")
+
+        async def check(conn: AsyncConnection) -> None:
+            assert await _revision(conn) == CURRENT_HEAD_REVISION
+            assert (
+                await conn.execute(
+                    text("SELECT to_regclass('role_shadow.ix_upload_requests_created_id')")
+                )
+            ).scalar_one() is not None
+
+        _with_migration_connection(expected_database, check)
+    finally:
+
+        async def cleanup(conn: AsyncConnection) -> None:
+            await conn.execute(text("DROP SCHEMA IF EXISTS role_shadow CASCADE"))
+            await conn.execute(
+                text(
+                    "CREATE INDEX IF NOT EXISTS ix_upload_requests_created_id "
+                    "ON public.upload_requests (created_at, id)"
+                )
+            )
+
+        _with_migration_connection(expected_database, cleanup)
+
+
+def test_0010_offline_runtime_rejects_wrong_order_indexes(migration_db):
+    cfg, expected_database = migration_db
+    migration = ScriptDirectory.from_config(cfg).get_revision(CURRENT_HEAD_REVISION).module
+    command.upgrade(cfg, "0009_db_integrity")
+
+    async def check_upgrade(conn: AsyncConnection) -> None:
+        await conn.execute(
+            text(
+                "CREATE INDEX ix_upload_requests_created_id "
+                "ON public.upload_requests (created_at DESC NULLS LAST, id ASC)"
+            )
+        )
+        with pytest.raises(Exception, match="incompatible signature"):
+            await conn.execute(text(migration._offline_upgrade_sql()))
+        await conn.execute(text("DROP INDEX public.ix_upload_requests_created_id"))
+
+        await conn.execute(text("CREATE SCHEMA role_shadow"))
+        await conn.execute(
+            text(
+                "CREATE TABLE role_shadow.upload_requests "
+                "(id bigint NOT NULL, created_at timestamptz NOT NULL)"
+            )
+        )
+        await conn.execute(
+            text(
+                "CREATE INDEX ix_upload_requests_created_id "
+                "ON role_shadow.upload_requests (created_at ASC NULLS FIRST, id ASC)"
+            )
+        )
+        with pytest.raises(Exception, match="no compatible managed index"):
+            await conn.execute(text(migration._offline_downgrade_sql()))
+        assert (
+            await conn.execute(
+                text("SELECT to_regclass('role_shadow.ix_upload_requests_created_id')")
+            )
+        ).scalar_one() is not None
+
+    try:
+        _with_migration_connection(expected_database, check_upgrade)
+    finally:
+
+        async def cleanup(conn: AsyncConnection) -> None:
+            await conn.execute(text("DROP SCHEMA IF EXISTS role_shadow CASCADE"))
+            await conn.execute(text("DROP INDEX IF EXISTS public.ix_upload_requests_created_id"))
 
         _with_migration_connection(expected_database, cleanup)
 
