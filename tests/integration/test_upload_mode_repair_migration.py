@@ -738,7 +738,9 @@ def test_0010_resolves_upload_index_schema_from_target_relation(migration_db, sc
 
 
 @pytest.mark.parametrize(
-    "scenario", ["shadow-conflict", "ambiguous", "missing"], ids=["shadow", "ambiguous", "missing"]
+    "scenario",
+    ["shadow-conflict", "ambiguous", "missing", "materialized", "materialized-only"],
+    ids=["shadow", "ambiguous", "missing", "materialized", "materialized-only"],
 )
 def test_0010_downgrade_finds_only_the_managed_index_across_schemas(migration_db, scenario: str):
     """Downgrade must not resolve upload_requests again through the changed search_path."""
@@ -748,12 +750,27 @@ def test_0010_downgrade_finds_only_the_managed_index_across_schemas(migration_db
 
     async def prepare(conn: AsyncConnection) -> None:
         await conn.execute(text("CREATE SCHEMA role_shadow"))
-        await conn.execute(
-            text(
-                "CREATE TABLE role_shadow.upload_requests "
-                "(id bigint NOT NULL, created_at timestamptz NOT NULL, status text NOT NULL DEFAULT '')"
+        if scenario.startswith("materialized"):
+            await conn.execute(
+                text(
+                    "CREATE MATERIALIZED VIEW role_shadow.upload_requests AS "
+                    "SELECT 1::bigint AS id, now() AS created_at"
+                )
             )
-        )
+            await conn.execute(
+                text(
+                    "CREATE INDEX ix_upload_requests_created_id "
+                    "ON role_shadow.upload_requests (created_at, id)"
+                )
+            )
+        else:
+            await conn.execute(
+                text(
+                    "CREATE TABLE role_shadow.upload_requests "
+                    "(id bigint NOT NULL, created_at timestamptz NOT NULL, "
+                    "status text NOT NULL DEFAULT '')"
+                )
+            )
         if scenario == "shadow-conflict":
             await conn.execute(
                 text(
@@ -768,14 +785,15 @@ def test_0010_downgrade_finds_only_the_managed_index_across_schemas(migration_db
                     "ON role_shadow.upload_requests (created_at, id)"
                 )
             )
-        else:
+        elif scenario in {"missing", "materialized-only"}:
             await conn.execute(text("DROP INDEX public.ix_upload_requests_created_id"))
-            await conn.execute(
-                text(
-                    "CREATE INDEX ix_upload_requests_created_id "
-                    "ON role_shadow.upload_requests (status, id)"
+            if scenario == "missing":
+                await conn.execute(
+                    text(
+                        "CREATE INDEX ix_upload_requests_created_id "
+                        "ON role_shadow.upload_requests (status, id)"
+                    )
                 )
-            )
         await conn.execute(
             text(f'ALTER DATABASE "{quoted_database}" SET search_path TO role_shadow, public')
         )
@@ -794,7 +812,7 @@ def test_0010_downgrade_finds_only_the_managed_index_across_schemas(migration_db
         if scenario == "ambiguous":
             with pytest.raises(RuntimeError, match="ambiguous compatible indexes"):
                 command.downgrade(cfg, "0009_db_integrity")
-        elif scenario == "missing":
+        elif scenario in {"missing", "materialized-only"}:
             with pytest.raises(RuntimeError, match="no compatible managed index"):
                 command.downgrade(cfg, "0009_db_integrity")
         else:
@@ -811,21 +829,86 @@ def test_0010_downgrade_finds_only_the_managed_index_across_schemas(migration_db
                     text("SELECT to_regclass('public.ix_upload_requests_created_id')")
                 )
             ).scalar_one()
-            if scenario == "shadow-conflict":
+            if scenario in {"shadow-conflict", "materialized"}:
                 assert await _revision(conn) == "0009_db_integrity"
                 assert public_index is None
                 assert shadow_index is not None
             else:
                 assert await _revision(conn) == CURRENT_HEAD_REVISION
                 assert shadow_index is not None
-                assert public_index is None if scenario == "missing" else public_index is not None
+                assert (
+                    public_index is None
+                    if scenario in {"missing", "materialized-only"}
+                    else public_index is not None
+                )
 
         _with_migration_connection(expected_database, check)
     finally:
 
         async def cleanup(conn: AsyncConnection) -> None:
             await conn.execute(text(f'ALTER DATABASE "{quoted_database}" RESET search_path'))
+            await conn.execute(text("SET search_path TO public"))
             await conn.execute(text("DROP SCHEMA IF EXISTS role_shadow CASCADE"))
+            if (
+                scenario in {"missing", "materialized-only"}
+                and await _revision(conn) == CURRENT_HEAD_REVISION
+            ):
+                await conn.execute(
+                    text(
+                        "CREATE INDEX IF NOT EXISTS ix_upload_requests_created_id "
+                        "ON public.upload_requests (created_at, id)"
+                    )
+                )
+
+        _with_migration_connection(expected_database, cleanup)
+
+
+def test_0010_downgrade_accepts_user_schema_starting_with_pg(migration_db):
+    cfg, expected_database = migration_db
+    command.upgrade(cfg, "0009_db_integrity")
+    quoted_database = expected_database.replace('"', '""')
+
+    async def prepare(conn: AsyncConnection) -> None:
+        await conn.execute(text("CREATE SCHEMA pgapp"))
+        await conn.execute(text("ALTER TABLE public.upload_requests SET SCHEMA pgapp"))
+        await conn.execute(
+            text(f'ALTER DATABASE "{quoted_database}" SET search_path TO pgapp, public')
+        )
+
+    try:
+        _with_migration_connection(expected_database, prepare)
+        command.upgrade(cfg, CURRENT_HEAD_REVISION)
+
+        async def check_upgrade(conn: AsyncConnection) -> None:
+            assert await _revision(conn) == CURRENT_HEAD_REVISION
+            assert (
+                await conn.execute(
+                    text("SELECT to_regclass('pgapp.ix_upload_requests_created_id')")
+                )
+            ).scalar_one() is not None
+
+        _with_migration_connection(expected_database, check_upgrade)
+        command.downgrade(cfg, "0009_db_integrity")
+
+        async def check_downgrade(conn: AsyncConnection) -> None:
+            assert await _revision(conn) == "0009_db_integrity"
+            assert (
+                await conn.execute(
+                    text("SELECT to_regclass('pgapp.ix_upload_requests_created_id')")
+                )
+            ).scalar_one() is None
+
+        _with_migration_connection(expected_database, check_downgrade)
+    finally:
+
+        async def cleanup(conn: AsyncConnection) -> None:
+            await conn.execute(text(f'ALTER DATABASE "{quoted_database}" RESET search_path'))
+            await conn.execute(text("SET search_path TO public"))
+            if (
+                await conn.execute(text("SELECT to_regclass('pgapp.upload_requests')"))
+            ).scalar_one():
+                await conn.execute(text("ALTER TABLE pgapp.upload_requests SET SCHEMA public"))
+            await conn.execute(text("DROP SCHEMA IF EXISTS pgapp CASCADE"))
 
         _with_migration_connection(expected_database, cleanup)
 
