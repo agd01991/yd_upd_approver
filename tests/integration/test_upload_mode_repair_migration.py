@@ -19,7 +19,7 @@ from sqlalchemy.pool import NullPool
 
 from alembic import command
 
-CURRENT_HEAD_REVISION = "0010_upload_created_index"
+CURRENT_HEAD_REVISION = "0011_upload_index_ownership"
 TELEGRAM_OUTBOX_REVISION = "0008_telegram_outbox"
 
 MIGRATION_DATABASE_URL = os.getenv("MIGRATION_DATABASE_URL")
@@ -901,7 +901,7 @@ def test_0010_downgrade_finds_only_the_managed_index_across_schemas(migration_db
                 assert public_index is None
                 assert shadow_index is not None
             else:
-                assert await _revision(conn) == CURRENT_HEAD_REVISION
+                assert await _revision(conn) == "0010_upload_created_index"
                 assert shadow_index is not None
                 assert (
                     public_index is None
@@ -918,7 +918,7 @@ def test_0010_downgrade_finds_only_the_managed_index_across_schemas(migration_db
             await conn.execute(text("DROP SCHEMA IF EXISTS role_shadow CASCADE"))
             if (
                 scenario in {"missing", "materialized-only"}
-                and await _revision(conn) == CURRENT_HEAD_REVISION
+                and await _revision(conn) == "0010_upload_created_index"
             ):
                 await _restore_managed_upload_index(conn)
 
@@ -1009,7 +1009,7 @@ def test_0010_downgrade_rejects_only_wrong_order_candidate(migration_db, orderin
 
 def test_0010_offline_runtime_rejects_wrong_order_indexes(migration_db):
     cfg, expected_database = migration_db
-    migration = ScriptDirectory.from_config(cfg).get_revision(CURRENT_HEAD_REVISION).module
+    migration = ScriptDirectory.from_config(cfg).get_revision("0010_upload_created_index").module
     command.upgrade(cfg, "0009_db_integrity")
 
     async def check_upgrade(conn: AsyncConnection) -> None:
@@ -1191,6 +1191,136 @@ def test_0010_upgrade_refuses_foreign_index_comment(migration_db):
         await conn.execute(text("DROP INDEX public.ix_upload_requests_created_id"))
 
     _with_migration_connection(expected_database, check)
+
+
+def test_0011_backfills_legacy_0010_and_preserves_index_oid(migration_db):
+    cfg, expected_database = migration_db
+    command.upgrade(cfg, "0010_upload_created_index")
+
+    async def make_legacy(conn: AsyncConnection) -> int:
+        oid = (
+            await conn.execute(text("SELECT 'public.ix_upload_requests_created_id'::regclass::oid"))
+        ).scalar_one()
+        await conn.execute(text("COMMENT ON INDEX public.ix_upload_requests_created_id IS NULL"))
+        assert await _revision(conn) == "0010_upload_created_index"
+        return oid
+
+    old_oid = _with_migration_connection(expected_database, make_legacy)
+    command.upgrade(cfg, "head")
+
+    async def check_backfill(conn: AsyncConnection) -> None:
+        assert await _revision(conn) == CURRENT_HEAD_REVISION
+        row = (
+            await conn.execute(
+                text(
+                    "SELECT i.oid, obj_description(i.oid, 'pg_class'), x.indoption::smallint[] "
+                    "FROM pg_class i JOIN pg_index x ON x.indexrelid=i.oid "
+                    "WHERE i.oid='public.ix_upload_requests_created_id'::regclass"
+                )
+            )
+        ).one()
+        assert row[0] == old_oid
+        assert row[1] == INDEX_OWNERSHIP_MARKER
+        assert tuple(row[2]) == (0, 0)
+
+    _with_migration_connection(expected_database, check_backfill)
+    command.downgrade(cfg, "0009_db_integrity")
+
+
+def test_0011_does_not_mark_foreign_only_candidate(migration_db):
+    cfg, expected_database = migration_db
+    command.upgrade(cfg, "0010_upload_created_index")
+
+    async def prepare(conn: AsyncConnection) -> None:
+        await conn.execute(text("DROP INDEX public.ix_upload_requests_created_id"))
+        await conn.execute(text("CREATE SCHEMA foreign_owner"))
+        await conn.execute(
+            text(
+                "CREATE TABLE foreign_owner.upload_requests "
+                "(id bigint NOT NULL, created_at timestamptz NOT NULL)"
+            )
+        )
+        await conn.execute(
+            text(
+                "CREATE INDEX ix_upload_requests_created_id "
+                "ON foreign_owner.upload_requests (created_at, id)"
+            )
+        )
+
+    _with_migration_connection(expected_database, prepare)
+    try:
+        with pytest.raises(RuntimeError, match="managed index not found"):
+            command.upgrade(cfg, "head")
+
+        async def check(conn: AsyncConnection) -> None:
+            assert await _revision(conn) == "0010_upload_created_index"
+            assert (
+                await conn.execute(
+                    text(
+                        "SELECT obj_description("
+                        "'foreign_owner.ix_upload_requests_created_id'::regclass, 'pg_class')"
+                    )
+                )
+            ).scalar_one_or_none() is None
+
+        _with_migration_connection(expected_database, check)
+    finally:
+
+        async def cleanup(conn: AsyncConnection) -> None:
+            await conn.execute(text("DROP SCHEMA foreign_owner CASCADE"))
+            await _restore_managed_upload_index(conn)
+
+        _with_migration_connection(expected_database, cleanup)
+
+
+@pytest.mark.parametrize("comment", ["", "foreign-owner"], ids=["empty", "foreign"])
+def test_0011_refuses_non_null_legacy_comment(migration_db, comment: str):
+    cfg, expected_database = migration_db
+    command.upgrade(cfg, "0010_upload_created_index")
+
+    async def prepare(conn: AsyncConnection) -> None:
+        escaped_comment = comment.replace("'", "''")
+        await conn.execute(
+            text(f"COMMENT ON INDEX public.ix_upload_requests_created_id IS '{escaped_comment}'")
+        )
+
+    _with_migration_connection(expected_database, prepare)
+    with pytest.raises(RuntimeError, match="ownership conflict"):
+        command.upgrade(cfg, "head")
+
+    async def check(conn: AsyncConnection) -> None:
+        assert await _revision(conn) == "0010_upload_created_index"
+        assert (
+            await conn.execute(
+                text(
+                    "SELECT obj_description("
+                    "'public.ix_upload_requests_created_id'::regclass, 'pg_class')"
+                )
+            )
+        ).scalar_one() == comment
+        await _restore_managed_upload_index(conn)
+
+    _with_migration_connection(expected_database, check)
+
+
+def test_0011_downgrade_preserves_marker_for_strict_0010_downgrade(migration_db):
+    cfg, expected_database = migration_db
+    command.upgrade(cfg, "head")
+    command.downgrade(cfg, "0010_upload_created_index")
+
+    async def at_0010(conn: AsyncConnection) -> None:
+        assert await _revision(conn) == "0010_upload_created_index"
+        assert (
+            await conn.execute(
+                text(
+                    "SELECT obj_description("
+                    "'public.ix_upload_requests_created_id'::regclass, 'pg_class')"
+                )
+            )
+        ).scalar_one() == INDEX_OWNERSHIP_MARKER
+
+    _with_migration_connection(expected_database, at_0010)
+    command.downgrade(cfg, "0009_db_integrity")
 
 
 async def _telegram_outbox_schema_state(conn: AsyncConnection) -> dict[str, bool]:

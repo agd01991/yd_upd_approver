@@ -213,6 +213,8 @@ def _quote_identifier(value: str) -> str:
 
 
 def _mark_owned_index(index: _IndexSignature, target: _TargetTable) -> None:
+    # Installations that ran the original 0010 are brought to this invariant by
+    # the forward revision 0011_upload_index_ownership.
     if index.ownership_comment not in (None, _INDEX_OWNERSHIP_MARKER):
         raise RuntimeError(
             f"Cannot apply {revision}: ownership conflict for index {_INDEX_NAME}; "
