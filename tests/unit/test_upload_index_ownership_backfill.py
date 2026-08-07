@@ -61,6 +61,12 @@ def test_marker_matches_revision_0010() -> None:
     assert migration._INDEX_OWNERSHIP_MARKER == old._INDEX_OWNERSHIP_MARKER
 
 
+def test_online_catalog_query_casts_table_relkind_to_text() -> None:
+    migration = _migration()
+    assert "t.relkind::text AS table_kind" in migration._INDEX_SELECT
+    assert "t.relkind AS table_kind" not in migration._INDEX_SELECT
+
+
 def test_owned_index_is_idempotent(monkeypatch) -> None:  # noqa: ANN001
     migration = _migration()
     operations = Operations()

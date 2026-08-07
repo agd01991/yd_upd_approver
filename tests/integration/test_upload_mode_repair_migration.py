@@ -986,7 +986,7 @@ def test_0010_downgrade_rejects_only_wrong_order_candidate(migration_db, orderin
 
     _with_migration_connection(expected_database, prepare)
     try:
-        with pytest.raises(RuntimeError, match="no compatible managed index"):
+        with pytest.raises(RuntimeError, match="managed index not found"):
             command.downgrade(cfg, "0009_db_integrity")
 
         async def check(conn: AsyncConnection) -> None:
@@ -1136,7 +1136,7 @@ def test_0010_downgrade_never_removes_unowned_compatible_index(migration_db, rep
 
     _with_migration_connection(expected_database, prepare)
     try:
-        with pytest.raises(RuntimeError, match="no compatible managed index"):
+        with pytest.raises(RuntimeError, match="managed index not found"):
             command.downgrade(cfg, "0009_db_integrity")
 
         async def check(conn: AsyncConnection) -> None:
@@ -1191,6 +1191,65 @@ def test_0010_upgrade_refuses_foreign_index_comment(migration_db):
         await conn.execute(text("DROP INDEX public.ix_upload_requests_created_id"))
 
     _with_migration_connection(expected_database, check)
+
+
+def test_0011_fresh_upgrade_has_owned_index_with_full_signature(migration_db):
+    cfg, expected_database = migration_db
+    command.upgrade(cfg, "head")
+
+    async def check(conn: AsyncConnection) -> None:
+        assert await _revision(conn) == CURRENT_HEAD_REVISION
+        row = (
+            await conn.execute(
+                text("""
+                    SELECT t.relkind::text, ins.nspname, tns.nspname, t.relname,
+                           array_agg(a.attname ORDER BY k.ordinality)
+                             FILTER (WHERE k.ordinality <= x.indnkeyatts),
+                           array_agg(o.option ORDER BY k.ordinality)
+                             FILTER (WHERE k.ordinality <= x.indnkeyatts),
+                           x.indnkeyatts, x.indnatts, am.amname, x.indisunique,
+                           x.indpred IS NOT NULL, x.indexprs IS NOT NULL,
+                           x.indisvalid, x.indisready,
+                           obj_description(i.oid, 'pg_class')
+                    FROM pg_class i
+                    JOIN pg_namespace ins ON ins.oid = i.relnamespace
+                    JOIN pg_index x ON x.indexrelid = i.oid
+                    JOIN pg_class t ON t.oid = x.indrelid
+                    JOIN pg_namespace tns ON tns.oid = t.relnamespace
+                    JOIN pg_am am ON am.oid = i.relam
+                    LEFT JOIN LATERAL unnest(x.indkey) WITH ORDINALITY
+                      AS k(attnum, ordinality) ON TRUE
+                    LEFT JOIN LATERAL unnest(x.indoption) WITH ORDINALITY
+                      AS o(option, ordinality) ON o.ordinality = k.ordinality
+                    LEFT JOIN pg_attribute a
+                      ON a.attrelid = x.indrelid AND a.attnum = k.attnum
+                    WHERE i.oid = 'public.ix_upload_requests_created_id'::regclass
+                    GROUP BY i.oid, ins.nspname, tns.nspname, t.relkind, t.relname,
+                             x.indnkeyatts, x.indnatts, am.amname, x.indisunique,
+                             x.indpred, x.indexprs, x.indisvalid, x.indisready
+                """)
+            )
+        ).one()
+        assert row == (
+            "r",
+            "public",
+            "public",
+            "upload_requests",
+            ["created_at", "id"],
+            [0, 0],
+            2,
+            2,
+            "btree",
+            False,
+            False,
+            False,
+            True,
+            True,
+            INDEX_OWNERSHIP_MARKER,
+        )
+
+    _with_migration_connection(expected_database, check)
+    command.downgrade(cfg, "base")
 
 
 def test_0011_backfills_legacy_0010_and_preserves_index_oid(migration_db):

@@ -53,7 +53,7 @@ class _TargetTable:
 
 _INDEX_SELECT = """
 SELECT i.oid AS index_oid, ins.nspname AS schema, x.indrelid AS table_oid,
-       tns.nspname AS table_schema, t.relname AS table_name, t.relkind AS table_kind,
+       tns.nspname AS table_schema, t.relname AS table_name, t.relkind::text AS table_kind,
        i.relname AS index_name,
        array_agg(a.attname ORDER BY k.ordinality)
          FILTER (WHERE k.ordinality <= x.indnkeyatts) AS key_columns,
