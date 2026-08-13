@@ -283,7 +283,11 @@ For a database already at an old, unmarked `0010_upload_created_index`, **first 
 then perform a rollback. A direct downgrade from an unmarked `0010` intentionally fails safely;
 it does not guess that an unmarked object is owned. Downgrading `0011` to `0010` validates and
 preserves the marker so that the strict `0010` downgrade can remove only the managed index.
-An empty string or any other non-NULL comment is foreign ownership and is never overwritten.
+A SQL `NULL` from `obj_description` means that no comment is stored. PostgreSQL treats
+`COMMENT ON INDEX ... IS ''` like `IS NULL`: it removes the comment, so a subsequent catalog
+read returns SQL `NULL`. Such an unmarked index may be adopted only after all identity and
+signature checks succeed. Any actually stored, non-empty foreign comment remains foreign
+ownership and is never overwritten.
 
 One unavoidable limitation applies only to this one-time backfill: an unmarked, structurally
 identical replacement index on the correctly fingerprinted application table cannot be
