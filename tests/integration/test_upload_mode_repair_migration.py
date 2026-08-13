@@ -1332,32 +1332,122 @@ def test_0011_does_not_mark_foreign_only_candidate(migration_db):
         _with_migration_connection(expected_database, cleanup)
 
 
-@pytest.mark.parametrize("comment", ["", "foreign-owner"], ids=["empty", "foreign"])
-def test_0011_refuses_non_null_legacy_comment(migration_db, comment: str):
+def test_0011_refuses_foreign_legacy_comment(migration_db):
     cfg, expected_database = migration_db
     command.upgrade(cfg, "0010_upload_created_index")
 
-    async def prepare(conn: AsyncConnection) -> None:
-        escaped_comment = comment.replace("'", "''")
+    async def prepare(conn: AsyncConnection) -> int:
+        oid = (
+            await conn.execute(text("SELECT 'public.ix_upload_requests_created_id'::regclass::oid"))
+        ).scalar_one()
         await conn.execute(
-            text(f"COMMENT ON INDEX public.ix_upload_requests_created_id IS '{escaped_comment}'")
+            text("COMMENT ON INDEX public.ix_upload_requests_created_id IS 'foreign-owner'")
         )
+        return oid
 
-    _with_migration_connection(expected_database, prepare)
-    with pytest.raises(RuntimeError, match="ownership conflict"):
-        command.upgrade(cfg, "head")
+    try:
+        old_oid = _with_migration_connection(expected_database, prepare)
+        with pytest.raises(RuntimeError, match="ownership conflict"):
+            command.upgrade(cfg, "head")
+
+        async def check(conn: AsyncConnection) -> None:
+            assert await _revision(conn) == "0010_upload_created_index"
+            row = (
+                await conn.execute(
+                    text(
+                        "SELECT i.oid, obj_description(i.oid, 'pg_class') "
+                        "FROM pg_class i "
+                        "WHERE i.oid = 'public.ix_upload_requests_created_id'::regclass"
+                    )
+                )
+            ).one()
+            assert row == (old_oid, "foreign-owner")
+
+        _with_migration_connection(expected_database, check)
+    finally:
+        _with_migration_connection(expected_database, _restore_managed_upload_index)
+
+
+def test_0011_refuses_empty_non_null_catalog_comment(migration_db):
+    cfg, expected_database = migration_db
+    command.upgrade(cfg, "0010_upload_created_index")
+
+    async def prepare(conn: AsyncConnection) -> int:
+        oid = (
+            await conn.execute(text("SELECT 'public.ix_upload_requests_created_id'::regclass::oid"))
+        ).scalar_one()
+        result = await conn.execute(
+            text(
+                "UPDATE pg_catalog.pg_description SET description = :comment "
+                "WHERE objoid = :index_oid "
+                "AND classoid = 'pg_catalog.pg_class'::regclass AND objsubid = 0"
+            ),
+            {"comment": "", "index_oid": oid},
+        )
+        assert result.rowcount == 1
+        comment = (
+            await conn.execute(
+                text("SELECT obj_description(:index_oid, 'pg_class')"), {"index_oid": oid}
+            )
+        ).scalar_one()
+        assert comment == ""
+        return oid
+
+    try:
+        old_oid = _with_migration_connection(expected_database, prepare)
+        with pytest.raises(RuntimeError, match="ownership conflict"):
+            command.upgrade(cfg, "head")
+
+        async def check(conn: AsyncConnection) -> None:
+            assert await _revision(conn) == "0010_upload_created_index"
+            row = (
+                await conn.execute(
+                    text(
+                        "SELECT i.oid, obj_description(i.oid, 'pg_class') "
+                        "FROM pg_class i "
+                        "WHERE i.oid = 'public.ix_upload_requests_created_id'::regclass"
+                    )
+                )
+            ).one()
+            assert row == (old_oid, "")
+
+        _with_migration_connection(expected_database, check)
+    finally:
+        _with_migration_connection(expected_database, _restore_managed_upload_index)
+
+
+def test_0011_backfills_after_empty_comment_is_removed_by_postgresql(migration_db):
+    cfg, expected_database = migration_db
+    command.upgrade(cfg, "0010_upload_created_index")
+
+    async def remove_comment(conn: AsyncConnection) -> int:
+        oid = (
+            await conn.execute(text("SELECT 'public.ix_upload_requests_created_id'::regclass::oid"))
+        ).scalar_one()
+        await conn.execute(text("COMMENT ON INDEX public.ix_upload_requests_created_id IS ''"))
+        comment = (
+            await conn.execute(
+                text("SELECT obj_description(:index_oid, 'pg_class')"), {"index_oid": oid}
+            )
+        ).scalar_one_or_none()
+        assert comment is None
+        return oid
+
+    old_oid = _with_migration_connection(expected_database, remove_comment)
+    command.upgrade(cfg, "head")
 
     async def check(conn: AsyncConnection) -> None:
-        assert await _revision(conn) == "0010_upload_created_index"
-        assert (
+        assert await _revision(conn) == CURRENT_HEAD_REVISION
+        row = (
             await conn.execute(
                 text(
-                    "SELECT obj_description("
-                    "'public.ix_upload_requests_created_id'::regclass, 'pg_class')"
+                    "SELECT i.oid, obj_description(i.oid, 'pg_class') "
+                    "FROM pg_class i "
+                    "WHERE i.oid = 'public.ix_upload_requests_created_id'::regclass"
                 )
             )
-        ).scalar_one() == comment
-        await _restore_managed_upload_index(conn)
+        ).one()
+        assert row == (old_oid, INDEX_OWNERSHIP_MARKER)
 
     _with_migration_connection(expected_database, check)
 
