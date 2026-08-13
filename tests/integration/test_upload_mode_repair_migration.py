@@ -1368,54 +1368,6 @@ def test_0011_refuses_foreign_legacy_comment(migration_db):
         _with_migration_connection(expected_database, _restore_managed_upload_index)
 
 
-def test_0011_refuses_empty_non_null_catalog_comment(migration_db):
-    cfg, expected_database = migration_db
-    command.upgrade(cfg, "0010_upload_created_index")
-
-    async def prepare(conn: AsyncConnection) -> int:
-        oid = (
-            await conn.execute(text("SELECT 'public.ix_upload_requests_created_id'::regclass::oid"))
-        ).scalar_one()
-        result = await conn.execute(
-            text(
-                "UPDATE pg_catalog.pg_description SET description = :comment "
-                "WHERE objoid = :index_oid "
-                "AND classoid = 'pg_catalog.pg_class'::regclass AND objsubid = 0"
-            ),
-            {"comment": "", "index_oid": oid},
-        )
-        assert result.rowcount == 1
-        comment = (
-            await conn.execute(
-                text("SELECT obj_description(:index_oid, 'pg_class')"), {"index_oid": oid}
-            )
-        ).scalar_one()
-        assert comment == ""
-        return oid
-
-    try:
-        old_oid = _with_migration_connection(expected_database, prepare)
-        with pytest.raises(RuntimeError, match="ownership conflict"):
-            command.upgrade(cfg, "head")
-
-        async def check(conn: AsyncConnection) -> None:
-            assert await _revision(conn) == "0010_upload_created_index"
-            row = (
-                await conn.execute(
-                    text(
-                        "SELECT i.oid, obj_description(i.oid, 'pg_class') "
-                        "FROM pg_class i "
-                        "WHERE i.oid = 'public.ix_upload_requests_created_id'::regclass"
-                    )
-                )
-            ).one()
-            assert row == (old_oid, "")
-
-        _with_migration_connection(expected_database, check)
-    finally:
-        _with_migration_connection(expected_database, _restore_managed_upload_index)
-
-
 def test_0011_backfills_after_empty_comment_is_removed_by_postgresql(migration_db):
     cfg, expected_database = migration_db
     command.upgrade(cfg, "0010_upload_created_index")

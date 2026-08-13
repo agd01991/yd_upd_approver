@@ -91,7 +91,9 @@ def test_null_comment_is_backfilled_and_post_validated(monkeypatch) -> None:  # 
     assert 'COMMENT ON INDEX "public"."ix_upload_requests_created_id"' in operations.executed[0]
 
 
-@pytest.mark.parametrize("comment", ["", "another-owner"])
+@pytest.mark.parametrize(
+    "comment", [pytest.param("", id="empty-non-null"), pytest.param("another-owner", id="foreign")]
+)
 def test_non_null_comment_is_not_overwritten(monkeypatch, comment: str) -> None:  # noqa: ANN001
     migration = _migration()
     operations = Operations()
