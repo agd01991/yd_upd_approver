@@ -18,6 +18,7 @@ def _migration():
 def _index(migration, **changes):  # noqa: ANN001, ANN003
     value = migration._IndexSignature(
         index_oid=84,
+        index_schema_oid=2200,
         schema="public",
         table_oid=42,
         table_schema="public",
@@ -26,12 +27,15 @@ def _index(migration, **changes):  # noqa: ANN001, ANN003
         index_name="ix_upload_requests_created_id",
         key_columns=("created_at", "id"),
         key_options=(0, 0),
+        key_opclasses=(3127, 1978),
+        expected_key_opclasses=(3127, 1978),
         key_column_count=2,
         total_column_count=2,
         access_method="btree",
         is_unique=False,
         is_partial=False,
         is_expression=False,
+        is_exclusion=False,
         is_valid=True,
         is_ready=True,
         ownership_comment=migration._INDEX_OWNERSHIP_MARKER,
@@ -72,6 +76,7 @@ def test_owned_index_is_idempotent(monkeypatch) -> None:  # noqa: ANN001
     operations = Operations()
     monkeypatch.setattr(migration, "op", operations)
     monkeypatch.setattr(migration, "_owned_indexes", lambda: [_index(migration)])
+    monkeypatch.setattr(migration, "_resolve_application_target", lambda: _target(migration))
     migration._online_upgrade()
     assert operations.executed == []
 
@@ -85,10 +90,17 @@ def test_null_comment_is_backfilled_and_post_validated(monkeypatch) -> None:  # 
     monkeypatch.setattr(migration, "_owned_indexes", lambda: [])
     monkeypatch.setattr(migration, "_resolve_application_target", lambda: _target(migration))
     monkeypatch.setattr(migration, "_target_index", lambda _target: [candidate])
-    monkeypatch.setattr(migration, "_rows", lambda *_args, **_kwargs: [_index(migration)])
+    temporary = _index(migration, index_name="__yd_0011_adopt_84", ownership_comment=None)
+    marked = replace(temporary, ownership_comment=migration._INDEX_OWNERSHIP_MARKER)
+    final = _index(migration)
+    rows = iter(([temporary], [marked], [final]))
+    monkeypatch.setattr(migration, "_rows", lambda *_args, **_kwargs: next(rows))
     migration._online_upgrade()
-    assert len(operations.executed) == 1
-    assert 'COMMENT ON INDEX "public"."ix_upload_requests_created_id"' in operations.executed[0]
+    assert len(operations.executed) == 3
+    assert 'COMMENT ON INDEX "public"."__yd_0011_adopt_84"' in operations.executed[1]
+    assert str(operations.executed[0]).startswith("ALTER INDEX")
+    assert "RENAME TO" in str(operations.executed[0])
+    assert str(operations.executed[2]).endswith('RENAME TO "ix_upload_requests_created_id"')
 
 
 @pytest.mark.parametrize(
@@ -121,19 +133,24 @@ def test_non_null_comment_is_not_overwritten(monkeypatch, comment: str) -> None:
         {"schema": "pg_catalog", "table_schema": "pg_catalog"},
         {"is_partial": True},
         {"is_expression": True},
+        {"is_exclusion": True},
+        {"key_opclasses": (1978, 3127)},
+        {"key_opclasses": (9999, 1978)},
+        {"table_oid": 99},
+        {"index_schema_oid": 9999},
         {"is_valid": False},
         {"is_ready": False},
     ],
 )
 def test_full_signature_is_enforced(changes: dict[str, object]) -> None:
     migration = _migration()
-    expected = changes == {"schema": "pgapp", "table_schema": "pgapp"}
-    assert migration._matches(_index(migration, **changes)) is expected
+    assert migration._matches(_index(migration, **changes), _target(migration)) is False
 
 
 def test_expected_marker_on_incompatible_object_is_not_ignored(monkeypatch) -> None:  # noqa: ANN001
     migration = _migration()
     monkeypatch.setattr(migration, "_owned_indexes", lambda: [_index(migration, table_kind="m")])
+    monkeypatch.setattr(migration, "_resolve_application_target", lambda: _target(migration))
     with pytest.raises(RuntimeError, match="incompatible index signature"):
         migration._online_upgrade()
 
@@ -143,6 +160,7 @@ def test_multiple_owned_indexes_are_ambiguous(monkeypatch) -> None:  # noqa: ANN
     monkeypatch.setattr(
         migration, "_owned_indexes", lambda: [_index(migration), _index(migration, index_oid=85)]
     )
+    monkeypatch.setattr(migration, "_resolve_application_target", lambda: _target(migration))
     with pytest.raises(RuntimeError, match="ambiguous owned indexes"):
         migration._online_upgrade()
 
@@ -172,8 +190,36 @@ def test_post_marker_validation_failure_fails_upgrade(monkeypatch) -> None:  # n
     monkeypatch.setattr(migration, "_resolve_application_target", lambda: _target(migration))
     monkeypatch.setattr(migration, "_target_index", lambda _target: [candidate])
     monkeypatch.setattr(migration, "_rows", lambda *_args, **_kwargs: [candidate])
-    with pytest.raises(RuntimeError, match="marker post-validation failure"):
+    with pytest.raises(RuntimeError, match="locked index"):
         migration._online_upgrade()
+
+
+def test_foreign_comment_seen_under_exact_index_lock_is_not_overwritten(monkeypatch) -> None:  # noqa: ANN001
+    migration = _migration()
+    operations = Operations()
+    candidate = _index(migration, ownership_comment=None)
+    monkeypatch.setattr(migration, "op", operations)
+    monkeypatch.setattr(migration, "_quote", lambda value: f'"{value}"')
+    monkeypatch.setattr(migration, "_owned_indexes", lambda: [])
+    monkeypatch.setattr(migration, "_resolve_application_target", lambda: _target(migration))
+    monkeypatch.setattr(migration, "_target_index", lambda _target: [candidate])
+    monkeypatch.setattr(
+        migration,
+        "_rows",
+        lambda *_args, **_kwargs: [
+            _index(
+                migration,
+                index_name="__yd_0011_adopt_84",
+                ownership_comment="foreign-owner",
+            )
+        ],
+    )
+
+    with pytest.raises(RuntimeError, match="locked index validation failure"):
+        migration._online_upgrade()
+
+    assert len(operations.executed) == 1
+    assert str(operations.executed[0]).startswith("ALTER INDEX")
 
 
 def test_downgrade_preserves_marker(monkeypatch) -> None:  # noqa: ANN001
@@ -182,6 +228,7 @@ def test_downgrade_preserves_marker(monkeypatch) -> None:  # noqa: ANN001
     monkeypatch.setattr(migration, "op", operations)
     monkeypatch.setattr(migration.context, "is_offline_mode", lambda: False)
     monkeypatch.setattr(migration, "_owned_indexes", lambda: [_index(migration)])
+    monkeypatch.setattr(migration, "_resolve_application_target", lambda: _target(migration))
     migration.downgrade()
     assert operations.executed == []
 
@@ -190,6 +237,7 @@ def test_downgrade_requires_marker(monkeypatch) -> None:  # noqa: ANN001
     migration = _migration()
     monkeypatch.setattr(migration.context, "is_offline_mode", lambda: False)
     monkeypatch.setattr(migration, "_owned_indexes", lambda: [])
+    monkeypatch.setattr(migration, "_resolve_application_target", lambda: _target(migration))
     with pytest.raises(RuntimeError, match="managed index not found"):
         migration.downgrade()
 
@@ -208,6 +256,10 @@ def test_offline_runtime_sql_has_safe_semantics(command: list[str], is_downgrade
     assert result.returncode == 0, result.stderr
     sql = result.stdout
     assert "ARRAY[0,0]::smallint[]" in sql
+    assert "unnest(x.indclass)" in sql
+    assert "pg_opclass" in sql and "opc.opcdefault" in sql
+    assert "NOT x.indisexclusion" in sql
+    assert "pg_description" not in sql
     assert "unnest(x.indoption)" in sql and "WITH ORDINALITY" in sql
     assert "t.relkind IN ('r','p')" in sql
     assert "left(n.nspname,3)<>'pg_'" in sql
@@ -220,5 +272,7 @@ def test_offline_runtime_sql_has_safe_semantics(command: list[str], is_downgrade
         assert "ix_upload_requests_user_created_id" in sql
         assert "ix_upload_requests_status_created_id" in sql
         assert "COMMENT ON INDEX %I.%I IS %L" in sql
+        assert "ALTER INDEX %I.%I RENAME TO %I" in sql
+        assert "i.oid=index_oid" in sql
         assert "existing_comment IS NOT NULL" in sql
         assert "marker post-validation failure" in sql

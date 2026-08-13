@@ -1207,8 +1207,13 @@ def test_0011_fresh_upgrade_has_owned_index_with_full_signature(migration_db):
                              FILTER (WHERE k.ordinality <= x.indnkeyatts),
                            array_agg(o.option ORDER BY k.ordinality)
                              FILTER (WHERE k.ordinality <= x.indnkeyatts),
+                           array_agg(ic.opclass_oid ORDER BY k.ordinality)
+                             FILTER (WHERE k.ordinality <= x.indnkeyatts),
+                           array_agg(default_opc.oid ORDER BY k.ordinality)
+                             FILTER (WHERE k.ordinality <= x.indnkeyatts),
                            x.indnkeyatts, x.indnatts, am.amname, x.indisunique,
                            x.indpred IS NOT NULL, x.indexprs IS NOT NULL,
+                           x.indisexclusion,
                            x.indisvalid, x.indisready,
                            obj_description(i.oid, 'pg_class')
                     FROM pg_class i
@@ -1223,10 +1228,14 @@ def test_0011_fresh_upgrade_has_owned_index_with_full_signature(migration_db):
                       AS o(option, ordinality) ON o.ordinality = k.ordinality
                     LEFT JOIN pg_attribute a
                       ON a.attrelid = x.indrelid AND a.attnum = k.attnum
+                    LEFT JOIN LATERAL unnest(x.indclass) WITH ORDINALITY
+                      AS ic(opclass_oid, ordinality) ON ic.ordinality = k.ordinality
+                    LEFT JOIN pg_opclass default_opc ON default_opc.opcmethod = i.relam
+                      AND default_opc.opcintype = a.atttypid AND default_opc.opcdefault
                     WHERE i.oid = 'public.ix_upload_requests_created_id'::regclass
                     GROUP BY i.oid, ins.nspname, tns.nspname, t.relkind, t.relname,
                              x.indnkeyatts, x.indnatts, am.amname, x.indisunique,
-                             x.indpred, x.indexprs, x.indisvalid, x.indisready
+                             x.indpred, x.indexprs, x.indisexclusion, x.indisvalid, x.indisready
                 """)
             )
         ).one()
@@ -1237,9 +1246,12 @@ def test_0011_fresh_upgrade_has_owned_index_with_full_signature(migration_db):
             "upload_requests",
             ["created_at", "id"],
             [0, 0],
+            row[6],
+            row[6],
             2,
             2,
             "btree",
+            False,
             False,
             False,
             False,
@@ -1327,6 +1339,70 @@ def test_0011_does_not_mark_foreign_only_candidate(migration_db):
 
         async def cleanup(conn: AsyncConnection) -> None:
             await conn.execute(text("DROP SCHEMA foreign_owner CASCADE"))
+            await _restore_managed_upload_index(conn)
+
+        _with_migration_connection(expected_database, cleanup)
+
+
+def test_0011_rejects_foreign_marked_index_before_adopting_target(migration_db):
+    cfg, expected_database = migration_db
+    command.upgrade(cfg, "0010_upload_created_index")
+
+    async def prepare(conn: AsyncConnection) -> tuple[int, int]:
+        target_oid = (
+            await conn.execute(text("SELECT 'public.ix_upload_requests_created_id'::regclass::oid"))
+        ).scalar_one()
+        await conn.execute(text("COMMENT ON INDEX public.ix_upload_requests_created_id IS NULL"))
+        await conn.execute(text("CREATE SCHEMA foreign_owner"))
+        await conn.execute(
+            text(
+                "CREATE TABLE foreign_owner.upload_requests "
+                "(id integer NOT NULL, created_at timestamptz NOT NULL)"
+            )
+        )
+        await conn.execute(
+            text(
+                "CREATE INDEX ix_upload_requests_created_id "
+                "ON foreign_owner.upload_requests (created_at, id)"
+            )
+        )
+        await conn.execute(
+            text(
+                "COMMENT ON INDEX foreign_owner.ix_upload_requests_created_id IS "
+                "'yd_upd_approver:alembic:0010_upload_created_index'"
+            )
+        )
+        foreign_oid = (
+            await conn.execute(
+                text("SELECT 'foreign_owner.ix_upload_requests_created_id'::regclass::oid")
+            )
+        ).scalar_one()
+        await conn.execute(text("SET search_path TO foreign_owner, public"))
+        return target_oid, foreign_oid
+
+    target_oid, foreign_oid = _with_migration_connection(expected_database, prepare)
+    try:
+        with pytest.raises(RuntimeError, match="incompatible index signature"):
+            command.upgrade(cfg, "head")
+
+        async def check(conn: AsyncConnection) -> None:
+            assert await _revision(conn) == "0010_upload_created_index"
+            rows = (
+                await conn.execute(
+                    text(
+                        "SELECT i.oid, obj_description(i.oid,'pg_class') FROM pg_class i "
+                        "WHERE i.oid IN (:target_oid,:foreign_oid) ORDER BY i.oid"
+                    ),
+                    {"target_oid": target_oid, "foreign_oid": foreign_oid},
+                )
+            ).all()
+            assert dict(rows) == {target_oid: None, foreign_oid: INDEX_OWNERSHIP_MARKER}
+
+        _with_migration_connection(expected_database, check)
+    finally:
+
+        async def cleanup(conn: AsyncConnection) -> None:
+            await conn.execute(text("DROP SCHEMA IF EXISTS foreign_owner CASCADE"))
             await _restore_managed_upload_index(conn)
 
         _with_migration_connection(expected_database, cleanup)

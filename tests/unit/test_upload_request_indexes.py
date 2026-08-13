@@ -179,14 +179,18 @@ def test_upgrade_adopts_uncommented_compatible_index(monkeypatch) -> None:  # no
     target = _target(migration)
     unowned = _expected_index(migration, ownership_comment=None)
     lookups = iter((unowned, _expected_index(migration)))
+    locked = _expected_index(migration, ownership_comment=None)
+    marked = _expected_index(migration)
+    oid_lookups = iter(([locked], [marked]))
     monkeypatch.setattr(migration, "_resolve_target_table", lambda: target)
     monkeypatch.setattr(migration, "_find_existing_index", lambda _target: next(lookups))
+    monkeypatch.setattr(migration, "_index_rows", lambda *_args, **_kwargs: next(oid_lookups))
 
     migration.upgrade()
 
     assert operations.created_indexes == []
-    statement = str(operations.executed[0])
-    assert 'COMMENT ON INDEX "public"."ix_upload_requests_created_id"' in statement
+    statement = str(operations.executed[1])
+    assert 'COMMENT ON INDEX "public"."__yd_0010_adopt_84"' in statement
     assert migration._INDEX_OWNERSHIP_MARKER in statement
 
 
@@ -216,11 +220,12 @@ def test_upgrade_fails_when_ownership_marker_is_not_persisted(monkeypatch) -> No
     unowned = _expected_index(migration, ownership_comment=None)
     monkeypatch.setattr(migration, "_resolve_target_table", lambda: target)
     monkeypatch.setattr(migration, "_find_existing_index", lambda _target: unowned)
+    monkeypatch.setattr(migration, "_index_rows", lambda *_args, **_kwargs: [unowned])
 
     with pytest.raises(RuntimeError, match="ownership marker was not stored"):
         migration.upgrade()
 
-    assert len(operations.executed) == 1
+    assert len(operations.executed) == 2
 
 
 def test_upload_ordering_index_migration_accepts_concurrently_created_index(monkeypatch) -> None:  # noqa: ANN001
@@ -279,18 +284,22 @@ def test_upload_ordering_index_migration_rejects_missing_index_after_creation(
 def _expected_index(migration, **changes: Any):  # noqa: ANN001
     fields = {
         "index_oid": 84,
+        "index_schema_oid": 2200,
         "schema": "public",
         "table_oid": 42,
         "table_schema": "public",
         "table_name": "upload_requests",
         "key_columns": ("created_at", "id"),
         "key_options": (0, 0),
+        "key_opclasses": (3127, 1978),
+        "expected_key_opclasses": (3127, 1978),
         "key_column_count": 2,
         "total_column_count": 2,
         "access_method": "btree",
         "is_unique": False,
         "is_partial": False,
         "is_expression": False,
+        "is_exclusion": False,
         "is_valid": True,
         "is_ready": True,
         "ownership_comment": "yd_upd_approver:alembic:0010_upload_created_index",
@@ -320,8 +329,8 @@ def test_target_table_resolution_uses_resolved_public_relation(monkeypatch) -> N
         def mappings(self):
             return self
 
-        def one_or_none(self):
-            return {"oid": 42, "schema_oid": 2200, "schema": "public", "name": "upload_requests"}
+        def all(self):
+            return [{"oid": 42, "schema_oid": 2200, "schema": "public", "name": "upload_requests"}]
 
     class Bind:
         def execute(self, _statement):
