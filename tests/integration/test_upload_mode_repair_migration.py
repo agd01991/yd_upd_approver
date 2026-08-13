@@ -986,7 +986,7 @@ def test_0010_downgrade_rejects_only_wrong_order_candidate(migration_db, orderin
 
     _with_migration_connection(expected_database, prepare)
     try:
-        with pytest.raises(RuntimeError, match="no compatible managed index"):
+        with pytest.raises(RuntimeError, match="managed index not found"):
             command.downgrade(cfg, "0009_db_integrity")
 
         async def check(conn: AsyncConnection) -> None:
@@ -1136,7 +1136,7 @@ def test_0010_downgrade_never_removes_unowned_compatible_index(migration_db, rep
 
     _with_migration_connection(expected_database, prepare)
     try:
-        with pytest.raises(RuntimeError, match="no compatible managed index"):
+        with pytest.raises(RuntimeError, match="managed index not found"):
             command.downgrade(cfg, "0009_db_integrity")
 
         async def check(conn: AsyncConnection) -> None:
@@ -1191,6 +1191,65 @@ def test_0010_upgrade_refuses_foreign_index_comment(migration_db):
         await conn.execute(text("DROP INDEX public.ix_upload_requests_created_id"))
 
     _with_migration_connection(expected_database, check)
+
+
+def test_0011_fresh_upgrade_has_owned_index_with_full_signature(migration_db):
+    cfg, expected_database = migration_db
+    command.upgrade(cfg, "head")
+
+    async def check(conn: AsyncConnection) -> None:
+        assert await _revision(conn) == CURRENT_HEAD_REVISION
+        row = (
+            await conn.execute(
+                text("""
+                    SELECT t.relkind::text, ins.nspname, tns.nspname, t.relname,
+                           array_agg(a.attname ORDER BY k.ordinality)
+                             FILTER (WHERE k.ordinality <= x.indnkeyatts),
+                           array_agg(o.option ORDER BY k.ordinality)
+                             FILTER (WHERE k.ordinality <= x.indnkeyatts),
+                           x.indnkeyatts, x.indnatts, am.amname, x.indisunique,
+                           x.indpred IS NOT NULL, x.indexprs IS NOT NULL,
+                           x.indisvalid, x.indisready,
+                           obj_description(i.oid, 'pg_class')
+                    FROM pg_class i
+                    JOIN pg_namespace ins ON ins.oid = i.relnamespace
+                    JOIN pg_index x ON x.indexrelid = i.oid
+                    JOIN pg_class t ON t.oid = x.indrelid
+                    JOIN pg_namespace tns ON tns.oid = t.relnamespace
+                    JOIN pg_am am ON am.oid = i.relam
+                    LEFT JOIN LATERAL unnest(x.indkey) WITH ORDINALITY
+                      AS k(attnum, ordinality) ON TRUE
+                    LEFT JOIN LATERAL unnest(x.indoption) WITH ORDINALITY
+                      AS o(option, ordinality) ON o.ordinality = k.ordinality
+                    LEFT JOIN pg_attribute a
+                      ON a.attrelid = x.indrelid AND a.attnum = k.attnum
+                    WHERE i.oid = 'public.ix_upload_requests_created_id'::regclass
+                    GROUP BY i.oid, ins.nspname, tns.nspname, t.relkind, t.relname,
+                             x.indnkeyatts, x.indnatts, am.amname, x.indisunique,
+                             x.indpred, x.indexprs, x.indisvalid, x.indisready
+                """)
+            )
+        ).one()
+        assert row == (
+            "r",
+            "public",
+            "public",
+            "upload_requests",
+            ["created_at", "id"],
+            [0, 0],
+            2,
+            2,
+            "btree",
+            False,
+            False,
+            False,
+            True,
+            True,
+            INDEX_OWNERSHIP_MARKER,
+        )
+
+    _with_migration_connection(expected_database, check)
+    command.downgrade(cfg, "base")
 
 
 def test_0011_backfills_legacy_0010_and_preserves_index_oid(migration_db):
@@ -1273,32 +1332,74 @@ def test_0011_does_not_mark_foreign_only_candidate(migration_db):
         _with_migration_connection(expected_database, cleanup)
 
 
-@pytest.mark.parametrize("comment", ["", "foreign-owner"], ids=["empty", "foreign"])
-def test_0011_refuses_non_null_legacy_comment(migration_db, comment: str):
+def test_0011_refuses_foreign_legacy_comment(migration_db):
     cfg, expected_database = migration_db
     command.upgrade(cfg, "0010_upload_created_index")
 
-    async def prepare(conn: AsyncConnection) -> None:
-        escaped_comment = comment.replace("'", "''")
+    async def prepare(conn: AsyncConnection) -> int:
+        oid = (
+            await conn.execute(text("SELECT 'public.ix_upload_requests_created_id'::regclass::oid"))
+        ).scalar_one()
         await conn.execute(
-            text(f"COMMENT ON INDEX public.ix_upload_requests_created_id IS '{escaped_comment}'")
+            text("COMMENT ON INDEX public.ix_upload_requests_created_id IS 'foreign-owner'")
         )
+        return oid
 
-    _with_migration_connection(expected_database, prepare)
-    with pytest.raises(RuntimeError, match="ownership conflict"):
-        command.upgrade(cfg, "head")
+    try:
+        old_oid = _with_migration_connection(expected_database, prepare)
+        with pytest.raises(RuntimeError, match="ownership conflict"):
+            command.upgrade(cfg, "head")
+
+        async def check(conn: AsyncConnection) -> None:
+            assert await _revision(conn) == "0010_upload_created_index"
+            row = (
+                await conn.execute(
+                    text(
+                        "SELECT i.oid, obj_description(i.oid, 'pg_class') "
+                        "FROM pg_class i "
+                        "WHERE i.oid = 'public.ix_upload_requests_created_id'::regclass"
+                    )
+                )
+            ).one()
+            assert row == (old_oid, "foreign-owner")
+
+        _with_migration_connection(expected_database, check)
+    finally:
+        _with_migration_connection(expected_database, _restore_managed_upload_index)
+
+
+def test_0011_backfills_after_empty_comment_is_removed_by_postgresql(migration_db):
+    cfg, expected_database = migration_db
+    command.upgrade(cfg, "0010_upload_created_index")
+
+    async def remove_comment(conn: AsyncConnection) -> int:
+        oid = (
+            await conn.execute(text("SELECT 'public.ix_upload_requests_created_id'::regclass::oid"))
+        ).scalar_one()
+        await conn.execute(text("COMMENT ON INDEX public.ix_upload_requests_created_id IS ''"))
+        comment = (
+            await conn.execute(
+                text("SELECT obj_description(:index_oid, 'pg_class')"), {"index_oid": oid}
+            )
+        ).scalar_one_or_none()
+        assert comment is None
+        return oid
+
+    old_oid = _with_migration_connection(expected_database, remove_comment)
+    command.upgrade(cfg, "head")
 
     async def check(conn: AsyncConnection) -> None:
-        assert await _revision(conn) == "0010_upload_created_index"
-        assert (
+        assert await _revision(conn) == CURRENT_HEAD_REVISION
+        row = (
             await conn.execute(
                 text(
-                    "SELECT obj_description("
-                    "'public.ix_upload_requests_created_id'::regclass, 'pg_class')"
+                    "SELECT i.oid, obj_description(i.oid, 'pg_class') "
+                    "FROM pg_class i "
+                    "WHERE i.oid = 'public.ix_upload_requests_created_id'::regclass"
                 )
             )
-        ).scalar_one() == comment
-        await _restore_managed_upload_index(conn)
+        ).one()
+        assert row == (old_oid, INDEX_OWNERSHIP_MARKER)
 
     _with_migration_connection(expected_database, check)
 
