@@ -15,6 +15,21 @@ def _migration():
     )
 
 
+def test_anchor_opclasses_are_validated_from_ordered_catalog_oids() -> None:
+    sql = _migration()._anchor_predicate("x", ("status", "created_at", "id"))
+
+    assert "unnest(x.indclass) WITH ORDINALITY" in sql
+    assert "ic.ordinality = k.ordinality" in sql
+    assert "LEFT JOIN pg_opclass opc ON opc.oid = ic.opclass_oid" in sql
+    assert "opc.opcmethod = am.oid AND opc.opcdefault" in sql
+    assert "opc.opcintype = a.atttypid" in sql
+    assert "typ.typtype = 'e'" in sql
+    assert "opc.opcintype = 'pg_catalog.anyenum'::regtype" in sql
+    assert "count(*) = x.indnkeyatts" in sql
+    assert "COALESCE(bool_and" in sql
+    assert "enum_ops" not in sql
+
+
 def _index(migration, **changes):  # noqa: ANN001, ANN003
     value = migration._IndexSignature(
         index_oid=84,

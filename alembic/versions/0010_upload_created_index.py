@@ -42,16 +42,23 @@ def _anchor_predicate(index_alias: str, columns: tuple[str, ...]) -> str:
            FROM unnest({index_alias}.indoption) WITH ORDINALITY o(option, ordinality)
            WHERE o.ordinality <= {index_alias}.indnkeyatts)
           = ARRAY[0,0,0]::smallint[]
-      AND (SELECT array_agg(ic.opclass_oid ORDER BY ic.ordinality)
-           FROM unnest({index_alias}.indclass) WITH ORDINALITY ic(opclass_oid, ordinality)
-           WHERE ic.ordinality <= {index_alias}.indnkeyatts)
-          = (SELECT array_agg(opc.oid ORDER BY k.ordinality)
-             FROM unnest({index_alias}.indkey) WITH ORDINALITY k(attnum, ordinality)
-             JOIN pg_attribute a ON a.attrelid={index_alias}.indrelid AND a.attnum=k.attnum
-             JOIN pg_opclass opc
-               ON opc.opcmethod=(SELECT oid FROM pg_am WHERE amname='btree')
-              AND opc.opcintype=a.atttypid AND opc.opcdefault
-             WHERE k.ordinality <= {index_alias}.indnkeyatts)"""
+      AND (SELECT count(*) = {index_alias}.indnkeyatts
+                  AND COALESCE(bool_and((
+                        ic.opclass_oid IS NOT NULL AND a.attnum IS NOT NULL
+                        AND typ.oid IS NOT NULL AND opc.oid IS NOT NULL
+                        AND opc.opcmethod = am.oid AND opc.opcdefault
+                        AND (opc.opcintype = a.atttypid OR
+                             (typ.typtype = 'e' AND
+                              opc.opcintype = 'pg_catalog.anyenum'::regtype))
+                      ) IS TRUE), false)
+           FROM unnest({index_alias}.indkey) WITH ORDINALITY k(attnum, ordinality)
+           LEFT JOIN unnest({index_alias}.indclass) WITH ORDINALITY
+             ic(opclass_oid, ordinality) ON ic.ordinality = k.ordinality
+           LEFT JOIN pg_attribute a
+             ON a.attrelid={index_alias}.indrelid AND a.attnum=k.attnum
+           LEFT JOIN pg_type typ ON typ.oid = a.atttypid
+           LEFT JOIN pg_opclass opc ON opc.oid = ic.opclass_oid
+           WHERE k.ordinality <= {index_alias}.indnkeyatts)"""
 
 
 def _anchor_exists(table_alias: str, name: str, columns: tuple[str, ...]) -> str:

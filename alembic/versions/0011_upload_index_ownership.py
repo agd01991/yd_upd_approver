@@ -37,15 +37,22 @@ def _anchor_predicate(alias: str, columns: tuple[str, ...]) -> str:
       AND (SELECT array_agg(o.option ORDER BY o.ordinality) FROM unnest({alias}.indoption)
            WITH ORDINALITY o(option, ordinality) WHERE o.ordinality <= {alias}.indnkeyatts)
           = ARRAY[0,0,0]::smallint[]
-      AND (SELECT array_agg(ic.opclass_oid ORDER BY ic.ordinality)
-           FROM unnest({alias}.indclass) WITH ORDINALITY ic(opclass_oid, ordinality)
-           WHERE ic.ordinality <= {alias}.indnkeyatts)
-          = (SELECT array_agg(opc.oid ORDER BY k.ordinality) FROM unnest({alias}.indkey)
-             WITH ORDINALITY k(attnum, ordinality) JOIN pg_attribute a
-             ON a.attrelid={alias}.indrelid AND a.attnum=k.attnum JOIN pg_opclass opc
-             ON opc.opcmethod=(SELECT oid FROM pg_am WHERE amname='btree')
-             AND opc.opcintype=a.atttypid AND opc.opcdefault
-             WHERE k.ordinality <= {alias}.indnkeyatts)"""
+      AND (SELECT count(*) = {alias}.indnkeyatts
+                  AND COALESCE(bool_and((
+                        ic.opclass_oid IS NOT NULL AND a.attnum IS NOT NULL
+                        AND typ.oid IS NOT NULL AND opc.oid IS NOT NULL
+                        AND opc.opcmethod = am.oid AND opc.opcdefault
+                        AND (opc.opcintype = a.atttypid OR
+                             (typ.typtype = 'e' AND
+                              opc.opcintype = 'pg_catalog.anyenum'::regtype))
+                      ) IS TRUE), false)
+           FROM unnest({alias}.indkey) WITH ORDINALITY k(attnum, ordinality)
+           LEFT JOIN unnest({alias}.indclass) WITH ORDINALITY
+             ic(opclass_oid, ordinality) ON ic.ordinality = k.ordinality
+           LEFT JOIN pg_attribute a ON a.attrelid={alias}.indrelid AND a.attnum=k.attnum
+           LEFT JOIN pg_type typ ON typ.oid = a.atttypid
+           LEFT JOIN pg_opclass opc ON opc.oid = ic.opclass_oid
+           WHERE k.ordinality <= {alias}.indnkeyatts)"""
 
 
 def _target_anchor_predicates(table_alias: str) -> str:
