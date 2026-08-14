@@ -59,6 +59,39 @@ def test_anchor_opclasses_are_validated_from_ordered_catalog_oids() -> None:
     assert "count(*) = x.indnkeyatts" in sql
     assert "COALESCE(bool_and" in sql
     assert "enum_ops" not in sql
+    assert "array_agg(a.atttypid ORDER BY k.ordinality)" in sql
+    assert "'pg_catalog.int4'::regtype::oid" in sql
+    assert "'pg_catalog.timestamptz'::regtype::oid" in sql
+    assert "typ.typname = 'uploadstatus'" in sql
+    assert "pg_enum enum" in sql and "enum.enumsortorder" in sql
+    assert "min(typ.oid)" not in sql
+    assert "to_regtype('uploadstatus')" not in sql
+
+
+def test_0010_and_0011_share_independent_ordered_anchor_type_identity() -> None:
+    migration_0010 = _migration_module()
+    migration_0011 = (
+        ScriptDirectory.from_config(Config("alembic.ini"))
+        .get_revision("0011_upload_index_ownership")
+        .module
+    )
+
+    for columns in (
+        ("user_id", "created_at", "id"),
+        ("status", "created_at", "id"),
+    ):
+        expected = migration_0010._expected_anchor_type_oids(columns)
+        assert expected == migration_0011._expected_anchor_type_oids(columns)
+        for sql in (
+            migration_0010._anchor_predicate("x", columns),
+            migration_0011._anchor_predicate("x", columns),
+        ):
+            assert "array_agg(a.atttypid ORDER BY k.ordinality)" in sql
+            assert f"= {expected}" in sql
+
+    status_sql = migration_0010._expected_anchor_type_oids(("status", "created_at", "id"))
+    assert "a.atttypid" not in status_sql
+    assert "ARRAY['new','stored','pending_approval'" in status_sql
 
 
 def test_upload_ordering_index_migration_creates_and_validates_global_ordering_index(

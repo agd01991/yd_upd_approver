@@ -1057,7 +1057,7 @@ def test_0010_offline_runtime_rejects_wrong_order_indexes(migration_db):
 
 @pytest.mark.parametrize("execution", ["online", "offline-0010-to-0011"])
 def test_anchor_fingerprint_ignores_name_only_shadow_target(migration_db, execution: str):
-    """Both generated SQL and online resolution ignore incompatible named anchors."""
+    """A perfect shadow fingerprint using a different enum OID is rejected."""
     cfg, expected_database = migration_db
     command.upgrade(cfg, "0009_db_integrity")
     quoted_database = expected_database.replace('"', '""')
@@ -1066,21 +1066,29 @@ def test_anchor_fingerprint_ignores_name_only_shadow_target(migration_db, execut
         await conn.execute(text("CREATE SCHEMA anchor_shadow"))
         await conn.execute(
             text(
-                "CREATE TABLE anchor_shadow.upload_requests (id bigint NOT NULL, "
-                "user_id bigint NOT NULL, status varchar NOT NULL, created_at timestamptz NOT NULL)"
+                "CREATE TYPE anchor_shadow.shadow_uploadstatus AS ENUM "
+                "('new','stored','pending_approval','approved','uploading','uploaded',"
+                "'rejected','failed','cancelled','deleted_temp')"
             )
         )
-        # Names match, but column order and indoption deliberately do not.
+        await conn.execute(
+            text(
+                "CREATE TABLE anchor_shadow.upload_requests (id integer NOT NULL, "
+                "user_id integer NOT NULL, status anchor_shadow.shadow_uploadstatus NOT NULL, "
+                "created_at timestamptz NOT NULL)"
+            )
+        )
+        # Every index property and built-in type matches. Only the enum OID differs.
         await conn.execute(
             text(
                 "CREATE INDEX ix_upload_requests_user_created_id ON "
-                "anchor_shadow.upload_requests (created_at DESC, user_id, id)"
+                "anchor_shadow.upload_requests (user_id, created_at, id)"
             )
         )
         await conn.execute(
             text(
                 "CREATE INDEX ix_upload_requests_status_created_id ON "
-                "anchor_shadow.upload_requests (created_at, status DESC, id)"
+                "anchor_shadow.upload_requests (status, created_at, id)"
             )
         )
         await conn.execute(

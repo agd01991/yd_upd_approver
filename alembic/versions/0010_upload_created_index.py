@@ -24,6 +24,46 @@ _ANCHOR_SIGNATURES = (
     ("ix_upload_requests_status_created_id", ("status", "created_at", "id")),
 )
 
+_UPLOAD_STATUS_LABELS = (
+    "new",
+    "stored",
+    "pending_approval",
+    "approved",
+    "uploading",
+    "uploaded",
+    "rejected",
+    "failed",
+    "cancelled",
+    "deleted_temp",
+)
+
+
+def _expected_anchor_type_oids(columns: tuple[str, ...]) -> str:
+    """Build expected type OIDs without consulting the candidate table.
+
+    The schema invariant established by 0001 is one catalog enum named
+    ``uploadstatus`` with exactly these labels.  Zero matches rejects every target;
+    multiple matches make the scalar subquery fail.  Thus schema/search_path
+    duplicates fail closed rather than selecting an arbitrary enum OID.
+    """
+    labels = ",".join(f"'{label}'" for label in _UPLOAD_STATUS_LABELS)
+    upload_status_oid = f"""(SELECT typ.oid
+             FROM pg_type typ
+             JOIN pg_namespace type_ns ON type_ns.oid = typ.typnamespace
+             WHERE typ.typname = 'uploadstatus' AND typ.typtype = 'e'
+               AND left(type_ns.nspname, 3) <> 'pg_'
+               AND type_ns.nspname <> 'information_schema'
+               AND (SELECT array_agg(enum.enumlabel ORDER BY enum.enumsortorder)
+                    FROM pg_enum enum WHERE enum.enumtypid = typ.oid)
+                   = ARRAY[{labels}]::text[])"""
+    expected = {
+        "user_id": "'pg_catalog.int4'::regtype::oid",
+        "status": upload_status_oid,
+        "created_at": "'pg_catalog.timestamptz'::regtype::oid",
+        "id": "'pg_catalog.int4'::regtype::oid",
+    }
+    return "ARRAY[" + ",".join(expected[column] for column in columns) + "]::oid[]"
+
 
 def _anchor_predicate(index_alias: str, columns: tuple[str, ...]) -> str:
     """Return the complete, search-path-independent anchor fingerprint."""
@@ -38,6 +78,11 @@ def _anchor_predicate(index_alias: str, columns: tuple[str, ...]) -> str:
            JOIN pg_attribute a ON a.attrelid={index_alias}.indrelid AND a.attnum=k.attnum
            WHERE k.ordinality <= {index_alias}.indnkeyatts)
           = ARRAY[{column_array}]::name[]
+      AND (SELECT array_agg(a.atttypid ORDER BY k.ordinality)
+           FROM unnest({index_alias}.indkey) WITH ORDINALITY k(attnum, ordinality)
+           JOIN pg_attribute a ON a.attrelid={index_alias}.indrelid AND a.attnum=k.attnum
+           WHERE k.ordinality <= {index_alias}.indnkeyatts)
+          = {_expected_anchor_type_oids(columns)}
       AND (SELECT array_agg(o.option ORDER BY o.ordinality)
            FROM unnest({index_alias}.indoption) WITH ORDINALITY o(option, ordinality)
            WHERE o.ordinality <= {index_alias}.indnkeyatts)
