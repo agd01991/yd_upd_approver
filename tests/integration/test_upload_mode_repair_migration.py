@@ -1055,6 +1055,93 @@ def test_0010_offline_runtime_rejects_wrong_order_indexes(migration_db):
         _with_migration_connection(expected_database, cleanup)
 
 
+@pytest.mark.parametrize("execution", ["online", "offline-0010-to-0011"])
+def test_anchor_fingerprint_ignores_name_only_shadow_target(migration_db, execution: str):
+    """Both generated SQL and online resolution ignore incompatible named anchors."""
+    cfg, expected_database = migration_db
+    command.upgrade(cfg, "0009_db_integrity")
+    quoted_database = expected_database.replace('"', '""')
+
+    async def prepare(conn: AsyncConnection) -> None:
+        await conn.execute(text("CREATE SCHEMA anchor_shadow"))
+        await conn.execute(
+            text(
+                "CREATE TABLE anchor_shadow.upload_requests (id bigint NOT NULL, "
+                "user_id bigint NOT NULL, status varchar NOT NULL, created_at timestamptz NOT NULL)"
+            )
+        )
+        # Names match, but column order and indoption deliberately do not.
+        await conn.execute(
+            text(
+                "CREATE INDEX ix_upload_requests_user_created_id ON "
+                "anchor_shadow.upload_requests (created_at DESC, user_id, id)"
+            )
+        )
+        await conn.execute(
+            text(
+                "CREATE INDEX ix_upload_requests_status_created_id ON "
+                "anchor_shadow.upload_requests (created_at, status DESC, id)"
+            )
+        )
+        await conn.execute(
+            text(f'ALTER DATABASE "{quoted_database}" SET search_path TO anchor_shadow, public')
+        )
+
+    try:
+        _with_migration_connection(expected_database, prepare)
+        if execution == "online":
+            command.upgrade(cfg, CURRENT_HEAD_REVISION)
+        else:
+            migration_0010 = (
+                ScriptDirectory.from_config(cfg).get_revision("0010_upload_created_index").module
+            )
+            migration_0011 = (
+                ScriptDirectory.from_config(cfg).get_revision("0011_upload_index_ownership").module
+            )
+
+            async def execute_offline(conn: AsyncConnection) -> None:
+                await conn.execute(text("SET search_path TO anchor_shadow, public"))
+                await conn.execute(text(migration_0010._offline_upgrade_sql()))
+                await conn.execute(text(migration_0011._offline_sql(backfill=True)))
+
+            _with_migration_connection(expected_database, execute_offline)
+
+        async def check(conn: AsyncConnection) -> None:
+            public_comment = (
+                await conn.execute(
+                    text(
+                        "SELECT obj_description('public.ix_upload_requests_created_id'::regclass, "
+                        "'pg_class')"
+                    )
+                )
+            ).scalar_one()
+            shadow_rows = (
+                await conn.execute(
+                    text(
+                        "SELECT i.relname,obj_description(i.oid,'pg_class') FROM pg_class i "
+                        "JOIN pg_namespace n ON n.oid=i.relnamespace "
+                        "WHERE n.nspname='anchor_shadow' ORDER BY i.relname"
+                    )
+                )
+            ).all()
+            assert public_comment == INDEX_OWNERSHIP_MARKER
+            assert shadow_rows == [
+                ("ix_upload_requests_status_created_id", None),
+                ("ix_upload_requests_user_created_id", None),
+                ("upload_requests", None),
+            ]
+
+        _with_migration_connection(expected_database, check)
+    finally:
+
+        async def cleanup(conn: AsyncConnection) -> None:
+            await conn.execute(text(f'ALTER DATABASE "{quoted_database}" RESET search_path'))
+            await conn.execute(text("SET search_path TO public"))
+            await conn.execute(text("DROP SCHEMA IF EXISTS anchor_shadow CASCADE"))
+
+        _with_migration_connection(expected_database, cleanup)
+
+
 def test_0010_downgrade_accepts_user_schema_starting_with_pg(migration_db):
     cfg, expected_database = migration_db
     command.upgrade(cfg, "0009_db_integrity")

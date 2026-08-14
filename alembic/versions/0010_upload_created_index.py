@@ -19,6 +19,53 @@ _INDEX_NAME = "ix_upload_requests_created_id"
 _EXPECTED_KEY_COLUMNS = ("created_at", "id")
 _EXPECTED_KEY_OPTIONS = (0, 0)
 _INDEX_OWNERSHIP_MARKER = "yd_upd_approver:alembic:0010_upload_created_index"
+_ANCHOR_SIGNATURES = (
+    ("ix_upload_requests_user_created_id", ("user_id", "created_at", "id")),
+    ("ix_upload_requests_status_created_id", ("status", "created_at", "id")),
+)
+
+
+def _anchor_predicate(index_alias: str, columns: tuple[str, ...]) -> str:
+    """Return the complete, search-path-independent anchor fingerprint."""
+    column_array = ",".join(f"'{column}'" for column in columns)
+    return f"""{index_alias}.indnkeyatts = 3 AND {index_alias}.indnatts = 3
+      AND am.amname = 'btree' AND NOT {index_alias}.indisunique
+      AND {index_alias}.indpred IS NULL AND {index_alias}.indexprs IS NULL
+      AND NOT {index_alias}.indisexclusion
+      AND {index_alias}.indisvalid AND {index_alias}.indisready
+      AND (SELECT array_agg(a.attname ORDER BY k.ordinality)
+           FROM unnest({index_alias}.indkey) WITH ORDINALITY k(attnum, ordinality)
+           JOIN pg_attribute a ON a.attrelid={index_alias}.indrelid AND a.attnum=k.attnum
+           WHERE k.ordinality <= {index_alias}.indnkeyatts)
+          = ARRAY[{column_array}]::name[]
+      AND (SELECT array_agg(o.option ORDER BY o.ordinality)
+           FROM unnest({index_alias}.indoption) WITH ORDINALITY o(option, ordinality)
+           WHERE o.ordinality <= {index_alias}.indnkeyatts)
+          = ARRAY[0,0,0]::smallint[]
+      AND (SELECT array_agg(ic.opclass_oid ORDER BY ic.ordinality)
+           FROM unnest({index_alias}.indclass) WITH ORDINALITY ic(opclass_oid, ordinality)
+           WHERE ic.ordinality <= {index_alias}.indnkeyatts)
+          = (SELECT array_agg(opc.oid ORDER BY k.ordinality)
+             FROM unnest({index_alias}.indkey) WITH ORDINALITY k(attnum, ordinality)
+             JOIN pg_attribute a ON a.attrelid={index_alias}.indrelid AND a.attnum=k.attnum
+             JOIN pg_opclass opc
+               ON opc.opcmethod=(SELECT oid FROM pg_am WHERE amname='btree')
+              AND opc.opcintype=a.atttypid AND opc.opcdefault
+             WHERE k.ordinality <= {index_alias}.indnkeyatts)"""
+
+
+def _anchor_exists(table_alias: str, name: str, columns: tuple[str, ...]) -> str:
+    return f"""EXISTS (
+            SELECT 1 FROM pg_class i JOIN pg_index x ON x.indexrelid=i.oid
+            JOIN pg_am am ON am.oid=i.relam
+            WHERE x.indrelid={table_alias}.oid AND i.relnamespace={table_alias}.relnamespace
+              AND i.relname='{name}' AND {_anchor_predicate("x", columns)})"""
+
+
+def _target_anchor_predicates(table_alias: str) -> str:
+    return " AND ".join(
+        _anchor_exists(table_alias, name, columns) for name, columns in _ANCHOR_SIGNATURES
+    )
 
 
 @dataclass(frozen=True)
@@ -59,10 +106,11 @@ def _is_offline_mode() -> bool:
 
 
 def _resolve_target_table() -> _TargetTable:
+    anchors = _target_anchor_predicates("table_class")
     row = (
         op.get_bind()
         .execute(
-            text("""
+            text(f"""
         SELECT table_class.oid AS oid, table_namespace.oid AS schema_oid,
                table_namespace.nspname AS schema, table_class.relname AS name
         FROM pg_class AS table_class
@@ -71,14 +119,7 @@ def _resolve_target_table() -> _TargetTable:
           AND table_class.relkind IN ('r', 'p')
           AND left(table_namespace.nspname, 3) <> 'pg_'
           AND table_namespace.nspname <> 'information_schema'
-          AND EXISTS (
-            SELECT 1 FROM pg_class i JOIN pg_index x ON x.indexrelid=i.oid
-            WHERE x.indrelid=table_class.oid
-              AND i.relname='ix_upload_requests_user_created_id')
-          AND EXISTS (
-            SELECT 1 FROM pg_class i JOIN pg_index x ON x.indexrelid=i.oid
-            WHERE x.indrelid=table_class.oid
-              AND i.relname='ix_upload_requests_status_created_id')
+          AND {anchors}
     """)
         )
         .mappings()
@@ -302,12 +343,13 @@ def _mark_owned_index(index: _IndexSignature, target: _TargetTable) -> None:
 
 
 def _offline_upgrade_sql() -> str:
+    anchors = _target_anchor_predicates("c")
     return f"""
 DO $$
 DECLARE target_oid oid; target_schema text; index_oid oid; existing_comment text;
         named_count integer; valid_count integer; target_count integer; temporary_name text;
 BEGIN
-  SELECT count(*),min(c.oid),min(n.nspname) INTO target_count,target_oid,target_schema FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE c.relname='upload_requests' AND c.relkind IN ('r','p') AND left(n.nspname,3)<>'pg_' AND n.nspname<>'information_schema' AND EXISTS (SELECT 1 FROM pg_class i JOIN pg_index x ON x.indexrelid=i.oid WHERE x.indrelid=c.oid AND i.relname='ix_upload_requests_user_created_id') AND EXISTS (SELECT 1 FROM pg_class i JOIN pg_index x ON x.indexrelid=i.oid WHERE x.indrelid=c.oid AND i.relname='ix_upload_requests_status_created_id');
+  SELECT count(*),min(c.oid),min(n.nspname) INTO target_count,target_oid,target_schema FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE c.relname='upload_requests' AND c.relkind IN ('r','p') AND left(n.nspname,3)<>'pg_' AND n.nspname<>'information_schema' AND {anchors};
   IF target_count=0 THEN RAISE EXCEPTION 'Cannot apply 0010_upload_created_index: target table upload_requests was not found'; END IF;
   IF target_count>1 THEN RAISE EXCEPTION 'Cannot apply 0010_upload_created_index: application target is ambiguous'; END IF;
   SELECT count(*) INTO named_count FROM pg_class i JOIN pg_namespace n ON n.oid = i.relnamespace WHERE n.nspname = target_schema AND i.relname = 'ix_upload_requests_created_id';

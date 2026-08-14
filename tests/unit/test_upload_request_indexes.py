@@ -117,6 +117,27 @@ def test_0010_generates_safe_offline_sql_without_database(
             "'yd_upd_approver:alembic:0010_upload_created_index'"
         ) in result.stdout
     else:
+        for columns in (
+            "ARRAY['user_id','created_at','id']::name[]",
+            "ARRAY['status','created_at','id']::name[]",
+        ):
+            assert columns in result.stdout
+        for predicate in (
+            "x.indnkeyatts = 3",
+            "x.indnatts = 3",
+            "am.amname = 'btree'",
+            "NOT x.indisunique",
+            "x.indpred IS NULL",
+            "x.indexprs IS NULL",
+            "NOT x.indisexclusion",
+            "x.indisvalid",
+            "x.indisready",
+            "ARRAY[0,0,0]::smallint[]",
+            "unnest(x.indclass)",
+            "opc.opcdefault",
+            "i.relnamespace=c.relnamespace",
+        ):
+            assert result.stdout.count(predicate) >= 2
         assert "COMMENT ON INDEX %I.%I IS %L" in result.stdout
         assert "existing_comment IS NOT NULL" in result.stdout
         assert "ownership marker was not stored" in result.stdout
@@ -343,6 +364,39 @@ def test_target_table_resolution_uses_resolved_public_relation(monkeypatch) -> N
     monkeypatch.setattr(migration, "op", Operations())
 
     assert migration._resolve_target_table() == _target(migration)
+
+
+def test_0010_online_and_offline_target_lookups_share_complete_anchor_fingerprints(
+    monkeypatch,
+) -> None:  # noqa: ANN001
+    migration = _migration_module()
+    statements: list[str] = []
+
+    class Result:
+        def mappings(self):
+            return self
+
+        def all(self):
+            return []
+
+    class Bind:
+        def execute(self, statement):  # noqa: ANN001
+            statements.append(str(statement))
+            return Result()
+
+    class Operations:
+        def get_bind(self):
+            return Bind()
+
+    monkeypatch.setattr(migration, "op", Operations())
+    with pytest.raises(RuntimeError, match="does not resolve"):
+        migration._resolve_target_table()
+    online = statements[0]
+    offline = migration._offline_upgrade_sql()
+    for name, columns in migration._ANCHOR_SIGNATURES:
+        expected = migration._anchor_predicate("x", columns)
+        assert name in online and name in offline
+        assert expected in online and expected in offline
 
 
 def test_upload_ordering_index_migration_accepts_correct_intermediate_index(monkeypatch) -> None:  # noqa: ANN001

@@ -19,6 +19,43 @@ _INDEX_NAME = "ix_upload_requests_created_id"
 _INDEX_OWNERSHIP_MARKER = "yd_upd_approver:alembic:0010_upload_created_index"
 _EXPECTED_KEY_COLUMNS = ("created_at", "id")
 _EXPECTED_KEY_OPTIONS = (0, 0)
+_ANCHOR_SIGNATURES = (
+    ("ix_upload_requests_user_created_id", ("user_id", "created_at", "id")),
+    ("ix_upload_requests_status_created_id", ("status", "created_at", "id")),
+)
+
+
+def _anchor_predicate(alias: str, columns: tuple[str, ...]) -> str:
+    column_array = ",".join(f"'{column}'" for column in columns)
+    return f"""{alias}.indnkeyatts = 3 AND {alias}.indnatts = 3 AND am.amname = 'btree'
+      AND NOT {alias}.indisunique AND {alias}.indpred IS NULL AND {alias}.indexprs IS NULL
+      AND NOT {alias}.indisexclusion AND {alias}.indisvalid AND {alias}.indisready
+      AND (SELECT array_agg(a.attname ORDER BY k.ordinality) FROM unnest({alias}.indkey)
+           WITH ORDINALITY k(attnum, ordinality) JOIN pg_attribute a
+           ON a.attrelid={alias}.indrelid AND a.attnum=k.attnum
+           WHERE k.ordinality <= {alias}.indnkeyatts) = ARRAY[{column_array}]::name[]
+      AND (SELECT array_agg(o.option ORDER BY o.ordinality) FROM unnest({alias}.indoption)
+           WITH ORDINALITY o(option, ordinality) WHERE o.ordinality <= {alias}.indnkeyatts)
+          = ARRAY[0,0,0]::smallint[]
+      AND (SELECT array_agg(ic.opclass_oid ORDER BY ic.ordinality)
+           FROM unnest({alias}.indclass) WITH ORDINALITY ic(opclass_oid, ordinality)
+           WHERE ic.ordinality <= {alias}.indnkeyatts)
+          = (SELECT array_agg(opc.oid ORDER BY k.ordinality) FROM unnest({alias}.indkey)
+             WITH ORDINALITY k(attnum, ordinality) JOIN pg_attribute a
+             ON a.attrelid={alias}.indrelid AND a.attnum=k.attnum JOIN pg_opclass opc
+             ON opc.opcmethod=(SELECT oid FROM pg_am WHERE amname='btree')
+             AND opc.opcintype=a.atttypid AND opc.opcdefault
+             WHERE k.ordinality <= {alias}.indnkeyatts)"""
+
+
+def _target_anchor_predicates(table_alias: str) -> str:
+    return " AND ".join(
+        f"""EXISTS (SELECT 1 FROM pg_class i JOIN pg_index x ON x.indexrelid=i.oid
+        JOIN pg_am am ON am.oid=i.relam WHERE x.indrelid={table_alias}.oid
+        AND i.relnamespace={table_alias}.relnamespace AND i.relname='{name}'
+        AND {_anchor_predicate("x", columns)})"""
+        for name, columns in _ANCHOR_SIGNATURES
+    )
 
 
 @dataclass(frozen=True)
@@ -158,44 +195,16 @@ def _matches(
 
 
 def _resolve_application_target() -> _TargetTable:
+    anchors = _target_anchor_predicates("t")
     rows = (
         op.get_bind()
         .execute(
-            text("""
+            text(f"""
 SELECT t.oid, n.oid AS schema_oid, n.nspname AS schema, t.relname AS name
 FROM pg_class t JOIN pg_namespace n ON n.oid = t.relnamespace
 WHERE t.relname = 'upload_requests' AND t.relkind IN ('r', 'p')
   AND left(n.nspname, 3) <> 'pg_' AND n.nspname <> 'information_schema'
-  AND EXISTS (
-    SELECT 1 FROM pg_class i JOIN pg_index x ON x.indexrelid = i.oid
-    JOIN pg_am am ON am.oid = i.relam
-    WHERE x.indrelid = t.oid AND i.relnamespace = t.relnamespace
-      AND i.relname = 'ix_upload_requests_user_created_id'
-      AND x.indnkeyatts = 3 AND x.indnatts = 3 AND am.amname = 'btree'
-      AND NOT x.indisunique AND x.indpred IS NULL AND x.indexprs IS NULL
-      AND x.indisvalid AND x.indisready
-      AND (SELECT array_agg(a.attname ORDER BY k.ordinality)
-           FROM unnest(x.indkey) WITH ORDINALITY k(attnum, ordinality)
-           JOIN pg_attribute a ON a.attrelid=x.indrelid AND a.attnum=k.attnum
-           WHERE k.ordinality <= x.indnkeyatts) = ARRAY['user_id','created_at','id']::name[]
-      AND (SELECT array_agg(o.option ORDER BY o.ordinality)
-           FROM unnest(x.indoption) WITH ORDINALITY o(option, ordinality)
-           WHERE o.ordinality <= x.indnkeyatts) = ARRAY[0,0,0]::smallint[])
-  AND EXISTS (
-    SELECT 1 FROM pg_class i JOIN pg_index x ON x.indexrelid = i.oid
-    JOIN pg_am am ON am.oid = i.relam
-    WHERE x.indrelid = t.oid AND i.relnamespace = t.relnamespace
-      AND i.relname = 'ix_upload_requests_status_created_id'
-      AND x.indnkeyatts = 3 AND x.indnatts = 3 AND am.amname = 'btree'
-      AND NOT x.indisunique AND x.indpred IS NULL AND x.indexprs IS NULL
-      AND x.indisvalid AND x.indisready
-      AND (SELECT array_agg(a.attname ORDER BY k.ordinality)
-           FROM unnest(x.indkey) WITH ORDINALITY k(attnum, ordinality)
-           JOIN pg_attribute a ON a.attrelid=x.indrelid AND a.attnum=k.attnum
-           WHERE k.ordinality <= x.indnkeyatts) = ARRAY['status','created_at','id']::name[]
-      AND (SELECT array_agg(o.option ORDER BY o.ordinality)
-           FROM unnest(x.indoption) WITH ORDINALITY o(option, ordinality)
-           WHERE o.ordinality <= x.indnkeyatts) = ARRAY[0,0,0]::smallint[])
+  AND {anchors}
 """)
         )
         .mappings()
@@ -305,6 +314,7 @@ def _signature_predicate(alias: str = "x") -> str:
 
 
 def _offline_sql(*, backfill: bool) -> str:
+    anchors = _target_anchor_predicates("t")
     action = "apply" if backfill else "downgrade"
     backfill_sql = (
         ""
@@ -333,8 +343,7 @@ BEGIN
  SELECT count(*),min(t.oid),min(n.oid),min(n.nspname) INTO target_count,target_oid,target_schema_oid,target_schema
  FROM pg_class t JOIN pg_namespace n ON n.oid=t.relnamespace
  WHERE t.relname='upload_requests' AND t.relkind IN ('r','p') AND left(n.nspname,3)<>'pg_' AND n.nspname<>'information_schema'
- AND EXISTS (SELECT 1 FROM pg_class i JOIN pg_index q ON q.indexrelid=i.oid WHERE q.indrelid=t.oid AND i.relname='ix_upload_requests_user_created_id')
- AND EXISTS (SELECT 1 FROM pg_class i JOIN pg_index q ON q.indexrelid=i.oid WHERE q.indrelid=t.oid AND i.relname='ix_upload_requests_status_created_id');
+ AND {anchors};
  IF target_count=0 THEN RAISE EXCEPTION 'Cannot {action} {revision}: application target not found'; END IF;
  IF target_count>1 THEN RAISE EXCEPTION 'Cannot {action} {revision}: ambiguous application targets'; END IF;
  SELECT count(*),count(*) FILTER (WHERE i.relname='{_INDEX_NAME}' AND i.relnamespace=target_schema_oid AND x.indrelid=target_oid AND n.nspname=tn.nspname AND t.relname='upload_requests' AND t.relkind IN ('r','p') AND left(n.nspname,3)<>'pg_' AND n.nspname<>'information_schema' AND {_signature_predicate()})

@@ -250,6 +250,7 @@ def test_downgrade_requires_marker(monkeypatch) -> None:  # noqa: ANN001
     ],
 )
 def test_offline_runtime_sql_has_safe_semantics(command: list[str], is_downgrade: bool) -> None:
+    migration = _migration()
     result = subprocess.run(  # noqa: S603
         [sys.executable, "-m", "alembic", *command], capture_output=True, text=True, check=False
     )
@@ -265,6 +266,9 @@ def test_offline_runtime_sql_has_safe_semantics(command: list[str], is_downgrade
     assert "left(n.nspname,3)<>'pg_'" in sql
     assert "NOT LIKE 'pg_%'" not in sql
     assert "yd_upd_approver:alembic:0010_upload_created_index" in sql
+    for name, columns in migration._ANCHOR_SIGNATURES:
+        assert name in sql
+        assert migration._anchor_predicate("x", columns) in sql
     if is_downgrade:
         assert "DROP INDEX" not in sql
         assert "managed index not found" in sql
