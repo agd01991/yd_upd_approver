@@ -46,6 +46,21 @@ def test_upload_request_metadata_has_global_ordering_index() -> None:
     assert indexes["ix_upload_requests_status_created_id"] == ["status", "created_at", "id"]
 
 
+def test_anchor_opclasses_are_validated_from_ordered_catalog_oids() -> None:
+    sql = _migration_module()._anchor_predicate("x", ("status", "created_at", "id"))
+
+    assert "unnest(x.indclass) WITH ORDINALITY" in sql
+    assert "ic.ordinality = k.ordinality" in sql
+    assert "LEFT JOIN pg_opclass opc ON opc.oid = ic.opclass_oid" in sql
+    assert "opc.opcmethod = am.oid AND opc.opcdefault" in sql
+    assert "opc.opcintype = a.atttypid" in sql
+    assert "typ.typtype = 'e'" in sql
+    assert "opc.opcintype = 'pg_catalog.anyenum'::regtype" in sql
+    assert "count(*) = x.indnkeyatts" in sql
+    assert "COALESCE(bool_and" in sql
+    assert "enum_ops" not in sql
+
+
 def test_upload_ordering_index_migration_creates_and_validates_global_ordering_index(
     monkeypatch,
 ) -> None:  # noqa: ANN001
