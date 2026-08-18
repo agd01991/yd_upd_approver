@@ -15,6 +15,29 @@ def _migration():
     )
 
 
+def test_anchor_opclasses_are_validated_from_ordered_catalog_oids() -> None:
+    sql = _migration()._anchor_predicate("x", ("status", "created_at", "id"))
+
+    assert "unnest(x.indclass) WITH ORDINALITY" in sql
+    assert "ic.ordinality = k.ordinality" in sql
+    assert "LEFT JOIN pg_opclass opc ON opc.oid = ic.opclass_oid" in sql
+    assert "opc.opcmethod = am.oid AND opc.opcdefault" in sql
+    assert "opc.opcintype = a.atttypid" in sql
+    assert "typ.typtype = 'e'" in sql
+    assert "opc.opcintype = 'pg_catalog.anyenum'::regtype" in sql
+    assert "count(*) = x.indnkeyatts" in sql
+    assert "COALESCE(bool_and" in sql
+    assert "enum_ops" not in sql
+    assert "array_agg(a.atttypid ORDER BY k.ordinality)" in sql
+    assert "'pg_catalog.int4'::regtype::oid" in sql
+    assert "'pg_catalog.timestamptz'::regtype::oid" in sql
+    assert "typ.typname = 'uploadstatus'" in sql
+    assert "pg_enum enum" in sql and "enum.enumsortorder" in sql
+    assert "array_agg(enum.enumlabel::text ORDER BY enum.enumsortorder)" in sql
+    assert "min(typ.oid)" not in sql
+    assert "to_regtype('uploadstatus')" not in sql
+
+
 def _index(migration, **changes):  # noqa: ANN001, ANN003
     value = migration._IndexSignature(
         index_oid=84,
@@ -250,6 +273,7 @@ def test_downgrade_requires_marker(monkeypatch) -> None:  # noqa: ANN001
     ],
 )
 def test_offline_runtime_sql_has_safe_semantics(command: list[str], is_downgrade: bool) -> None:
+    migration = _migration()
     result = subprocess.run(  # noqa: S603
         [sys.executable, "-m", "alembic", *command], capture_output=True, text=True, check=False
     )
@@ -265,6 +289,9 @@ def test_offline_runtime_sql_has_safe_semantics(command: list[str], is_downgrade
     assert "left(n.nspname,3)<>'pg_'" in sql
     assert "NOT LIKE 'pg_%'" not in sql
     assert "yd_upd_approver:alembic:0010_upload_created_index" in sql
+    for name, columns in migration._ANCHOR_SIGNATURES:
+        assert name in sql
+        assert migration._anchor_predicate("x", columns) in sql
     if is_downgrade:
         assert "DROP INDEX" not in sql
         assert "managed index not found" in sql
