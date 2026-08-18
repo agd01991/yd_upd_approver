@@ -243,11 +243,20 @@ PostgreSQL is the source of truth for durable Telegram notifications. Redis is n
 4. Navigate forward and backward across pages with rows sharing identical `created_at` values; confirm there are no duplicates or missing rows.
 5. Approve/reject/block users, uploads, and folder rename requests from a non-first page; confirm the current page refreshes instead of always resetting to the first page.
 6. In two browser sessions, try to create two pending folder rename requests for the same user and assign/rename two users to the same canonical folder. One operation should succeed and the other should return a safe validation/conflict response, not a 500.
-7. Before production migration, create a database backup. Run `alembic upgrade head`, verify the new head is `0010_upload_created_index`, then verify the upload ordering index exists exactly once with columns `(created_at, id)`:
+7. Before production migration, create a database backup. Run `alembic upgrade head`, verify
+   `alembic current` reports the new head `0011_upload_index_ownership`, then verify the upload
+   ordering index exists exactly once on the application `upload_requests` table with columns
+   `(created_at, id)`:
 
 ```sql
-SELECT indexname, indexdef
+SELECT indexes.schemaname, indexes.tablename, indexes.indexname, indexes.indexdef,
+       obj_description(index_class.oid, 'pg_class') AS ownership_comment
 FROM pg_indexes AS indexes
+JOIN pg_class AS index_class
+  ON index_class.relname = indexes.indexname
+JOIN pg_namespace AS index_namespace
+  ON index_namespace.oid = index_class.relnamespace
+  AND index_namespace.nspname = indexes.schemaname
 JOIN pg_class AS table_class
   ON table_class.oid = to_regclass('upload_requests')
 JOIN pg_namespace AS table_namespace
@@ -256,6 +265,34 @@ JOIN pg_namespace AS table_namespace
 WHERE indexes.tablename = table_class.relname
   AND indexes.indexname = 'ix_upload_requests_created_id';
 ```
+
+Confirm that `ownership_comment` is exactly
+`yd_upd_approver:alembic:0010_upload_created_index`; a matching definition without this marker
+is not owned by revision 0010 and will not be removed by its downgrade.
+
+Revision `0011_upload_index_ownership` is a forward-only ownership backfill for databases that
+had already applied the original, unmarked revision `0010`. It identifies the application table
+without relying on `search_path`: the table must be an ordinary or partitioned user table named
+`upload_requests`, and the full ordinary btree signatures of both
+`ix_upload_requests_user_created_id (user_id, created_at, id)` and
+`ix_upload_requests_status_created_id (status, created_at, id)` must belong to the same table OID.
+The managed index must have the full `(created_at, id)` ascending/default-null-order signature.
+
+For a database already at an old, unmarked `0010_upload_created_index`, **first run**
+`alembic upgrade head`, verify the current revision and exact ownership comment above, and only
+then perform a rollback. A direct downgrade from an unmarked `0010` intentionally fails safely;
+it does not guess that an unmarked object is owned. Downgrading `0011` to `0010` validates and
+preserves the marker so that the strict `0010` downgrade can remove only the managed index.
+A SQL `NULL` from `obj_description` means that no comment is stored. PostgreSQL treats
+`COMMENT ON INDEX ... IS ''` like `IS NULL`: it removes the comment, so a subsequent catalog
+read returns SQL `NULL`. Such an unmarked index may be adopted only after all identity and
+signature checks succeed. Any actually stored, non-empty foreign comment remains foreign
+ownership and is never overwritten.
+
+One unavoidable limitation applies only to this one-time backfill: an unmarked, structurally
+identical replacement index on the correctly fingerprinted application table cannot be
+distinguished from the historical index created by the old `0010`. This limited adoption rule
+does not apply to the normal `0010` downgrade, which continues to require the exact marker.
 
 Then verify workers still claim upload and Telegram outbox jobs.
 
