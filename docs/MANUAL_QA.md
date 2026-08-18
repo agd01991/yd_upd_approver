@@ -246,29 +246,52 @@ PostgreSQL is the source of truth for durable Telegram notifications. Redis is n
 7. Before production migration, create a database backup. Run `alembic upgrade head`, verify
    `alembic current` reports the new head `0011_upload_index_ownership`, then verify the upload
    ordering index exists exactly once on the application `upload_requests` table with columns
-   `(created_at, id)`:
+   `(created_at, id)`. Before running the query, replace
+   `REPLACE_WITH_APPLICATION_SCHEMA` with the trusted name of the schema that contains the
+   application table (do not infer it from `search_path`):
 
 ```sql
-SELECT indexes.schemaname, indexes.tablename, indexes.indexname, indexes.indexdef,
+WITH qa_parameters(application_schema) AS (
+    VALUES ('REPLACE_WITH_APPLICATION_SCHEMA')
+),
+target_table AS (
+    SELECT table_class.oid, table_class.relnamespace, table_namespace.nspname
+    FROM qa_parameters
+    JOIN pg_namespace AS table_namespace
+      ON table_namespace.nspname = qa_parameters.application_schema
+    JOIN pg_class AS table_class
+      ON table_class.relnamespace = table_namespace.oid
+     AND table_class.relname = 'upload_requests'
+     AND table_class.relkind IN ('r', 'p')
+)
+SELECT target_table.nspname AS application_schema,
+       target_table.oid AS table_oid,
+       index_class.oid AS index_oid,
+       index_class.relname AS index_name,
+       array_agg(attribute.attname ORDER BY key.ordinality) AS key_columns,
+       pg_get_indexdef(index_class.oid) AS index_definition,
        obj_description(index_class.oid, 'pg_class') AS ownership_comment
-FROM pg_indexes AS indexes
+FROM target_table
+JOIN pg_index AS index_definition
+  ON index_definition.indrelid = target_table.oid
 JOIN pg_class AS index_class
-  ON index_class.relname = indexes.indexname
-JOIN pg_namespace AS index_namespace
-  ON index_namespace.oid = index_class.relnamespace
-  AND index_namespace.nspname = indexes.schemaname
-JOIN pg_class AS table_class
-  ON table_class.oid = to_regclass('upload_requests')
-JOIN pg_namespace AS table_namespace
-  ON table_namespace.oid = table_class.relnamespace
-  AND indexes.schemaname = table_namespace.nspname
-WHERE indexes.tablename = table_class.relname
-  AND indexes.indexname = 'ix_upload_requests_created_id';
+  ON index_class.oid = index_definition.indexrelid
+ AND index_class.relnamespace = target_table.relnamespace
+JOIN LATERAL unnest(index_definition.indkey)
+  WITH ORDINALITY AS key(attnum, ordinality)
+  ON key.ordinality <= index_definition.indnkeyatts
+JOIN pg_attribute AS attribute
+  ON attribute.attrelid = target_table.oid
+ AND attribute.attnum = key.attnum
+WHERE index_class.relname = 'ix_upload_requests_created_id'
+GROUP BY target_table.nspname, target_table.oid, index_class.oid, index_class.relname;
 ```
 
-Confirm that `ownership_comment` is exactly
-`yd_upd_approver:alembic:0010_upload_created_index`; a matching definition without this marker
-is not owned by revision 0010 and will not be removed by its downgrade.
+The correct result is exactly one row. Confirm that `application_schema` equals the trusted
+schema supplied above, `key_columns` is exactly `(created_at, id)`, and `ownership_comment` is
+exactly `yd_upd_approver:alembic:0010_upload_created_index`. Zero rows, multiple rows, or any
+mismatch is a QA failure: do not proceed with the downgrade. A matching definition without this
+marker is not owned by revision 0010 and will not be removed by its downgrade.
 
 Revision `0011_upload_index_ownership` is a forward-only ownership backfill for databases that
 had already applied the original, unmarked revision `0010`. It identifies the application table

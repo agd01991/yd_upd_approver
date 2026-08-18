@@ -6,6 +6,7 @@ import logging
 import os
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import TypeVar
 
 import pytest
@@ -34,6 +35,17 @@ T = TypeVar("T")
 SYSTEM_DATABASES = {"postgres", "template0", "template1"}
 SAFE_SUFFIXES = ("_test", "_tests")
 INDEX_OWNERSHIP_MARKER = "yd_upd_approver:alembic:0010_upload_created_index"
+
+
+def _manual_qa_upload_index_sql(application_schema: str) -> str:
+    manual_qa = Path("docs/MANUAL_QA.md").read_text()
+    first_placeholder = manual_qa.index("REPLACE_WITH_APPLICATION_SCHEMA")
+    placeholder_offset = manual_qa.index("REPLACE_WITH_APPLICATION_SCHEMA", first_placeholder + 1)
+    query_start = manual_qa.rindex("```sql", 0, placeholder_offset) + len("```sql")
+    query_end = manual_qa.index("```", placeholder_offset)
+    return manual_qa[query_start:query_end].replace(
+        "REPLACE_WITH_APPLICATION_SCHEMA", application_schema
+    )
 
 
 async def _restore_managed_upload_index(conn: AsyncConnection) -> None:
@@ -615,6 +627,62 @@ def test_0010_rejects_conflicting_preexisting_upload_ordering_index(
         assert row[1] == columns
 
     _with_migration_connection(expected_database, conflict_is_unchanged)
+
+
+def test_manual_qa_upload_index_query_ignores_shadow_search_path(migration_db):
+    cfg, expected_database = migration_db
+    command.upgrade(cfg, CURRENT_HEAD_REVISION)
+
+    async def check(conn: AsyncConnection) -> None:
+        await conn.execute(text("CREATE SCHEMA qa_shadow"))
+        try:
+            await conn.execute(
+                text(
+                    "CREATE TABLE qa_shadow.upload_requests ("
+                    "id bigint NOT NULL, created_at timestamptz NOT NULL)"
+                )
+            )
+            await conn.execute(
+                text(
+                    "CREATE INDEX ix_upload_requests_created_id "
+                    "ON qa_shadow.upload_requests (created_at, id)"
+                )
+            )
+            shadow_table_oid = (
+                await conn.execute(text("SELECT 'qa_shadow.upload_requests'::regclass::oid"))
+            ).scalar_one()
+            shadow_index_oid = (
+                await conn.execute(
+                    text("SELECT 'qa_shadow.ix_upload_requests_created_id'::regclass::oid")
+                )
+            ).scalar_one()
+            await conn.execute(text("SET search_path TO qa_shadow, public"))
+
+            rows = (await conn.execute(text(_manual_qa_upload_index_sql("public")))).all()
+            assert len(rows) == 1
+            row = rows[0]
+            assert row.application_schema == "public"
+            assert row.table_oid != shadow_table_oid
+            assert row.index_oid != shadow_index_oid
+            assert list(row.key_columns) == ["created_at", "id"]
+            assert row.ownership_comment == INDEX_OWNERSHIP_MARKER
+
+            assert (await conn.execute(text(_manual_qa_upload_index_sql("qa_missing")))).all() == []
+            assert (
+                await conn.execute(
+                    text(
+                        "SELECT c.oid, obj_description(c.oid, 'pg_class') "
+                        "FROM pg_class AS c JOIN pg_namespace AS n ON n.oid = c.relnamespace "
+                        "WHERE n.nspname = 'qa_shadow' AND c.relname IN "
+                        "('upload_requests', 'ix_upload_requests_created_id') ORDER BY c.oid"
+                    )
+                )
+            ).all() == [(shadow_table_oid, None), (shadow_index_oid, None)]
+        finally:
+            await conn.execute(text("SET search_path TO public"))
+            await conn.execute(text("DROP SCHEMA IF EXISTS qa_shadow CASCADE"))
+
+    _with_migration_connection(expected_database, check)
 
 
 @pytest.mark.parametrize("scenario", ["existing", "shadow", "conflict"])
