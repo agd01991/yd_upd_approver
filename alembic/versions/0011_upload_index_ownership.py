@@ -53,7 +53,7 @@ def _expected_anchor_type_oids(columns: tuple[str, ...]) -> str:
              WHERE typ.typname = 'uploadstatus' AND typ.typtype = 'e'
                AND left(type_ns.nspname, 3) <> 'pg_'
                AND type_ns.nspname <> 'information_schema'
-               AND (SELECT array_agg(enum.enumlabel ORDER BY enum.enumsortorder)
+               AND (SELECT array_agg(enum.enumlabel::text ORDER BY enum.enumsortorder)
                     FROM pg_enum enum WHERE enum.enumtypid = typ.oid)
                    = ARRAY[{labels}]::text[])"""
     expected = {
