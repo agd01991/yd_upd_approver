@@ -33,6 +33,7 @@ def test_anchor_opclasses_are_validated_from_ordered_catalog_oids() -> None:
     assert "'pg_catalog.timestamptz'::regtype::oid" in sql
     assert "typ.typname = 'uploadstatus'" in sql
     assert "pg_enum enum" in sql and "enum.enumsortorder" in sql
+    assert "array_agg(enum.enumlabel::text ORDER BY enum.enumsortorder)" in sql
     assert "min(typ.oid)" not in sql
     assert "to_regtype('uploadstatus')" not in sql
 

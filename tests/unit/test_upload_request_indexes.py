@@ -64,6 +64,7 @@ def test_anchor_opclasses_are_validated_from_ordered_catalog_oids() -> None:
     assert "'pg_catalog.timestamptz'::regtype::oid" in sql
     assert "typ.typname = 'uploadstatus'" in sql
     assert "pg_enum enum" in sql and "enum.enumsortorder" in sql
+    assert "array_agg(enum.enumlabel::text ORDER BY enum.enumsortorder)" in sql
     assert "min(typ.oid)" not in sql
     assert "to_regtype('uploadstatus')" not in sql
 
@@ -92,6 +93,7 @@ def test_0010_and_0011_share_independent_ordered_anchor_type_identity() -> None:
     status_sql = migration_0010._expected_anchor_type_oids(("status", "created_at", "id"))
     assert "a.atttypid" not in status_sql
     assert "ARRAY['new','stored','pending_approval'" in status_sql
+    assert "array_agg(enum.enumlabel::text ORDER BY enum.enumsortorder)" in status_sql
 
 
 def test_upload_ordering_index_migration_creates_and_validates_global_ordering_index(
