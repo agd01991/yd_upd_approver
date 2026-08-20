@@ -257,9 +257,9 @@ WITH qa_parameters(application_schema) AS (
 target_table AS (
     SELECT table_class.oid, table_class.relnamespace, table_namespace.nspname
     FROM qa_parameters
-    JOIN pg_namespace AS table_namespace
+    JOIN pg_catalog.pg_namespace AS table_namespace
       ON table_namespace.nspname = qa_parameters.application_schema
-    JOIN pg_class AS table_class
+    JOIN pg_catalog.pg_class AS table_class
       ON table_class.relnamespace = table_namespace.oid
      AND table_class.relname = 'upload_requests'
      AND table_class.relkind IN ('r', 'p')
@@ -268,19 +268,19 @@ SELECT target_table.nspname AS application_schema,
        target_table.oid AS table_oid,
        index_class.oid AS index_oid,
        index_class.relname AS index_name,
-       array_agg(attribute.attname ORDER BY key.ordinality) AS key_columns,
-       pg_get_indexdef(index_class.oid) AS index_definition,
-       obj_description(index_class.oid, 'pg_class') AS ownership_comment
+       pg_catalog.array_agg(attribute.attname ORDER BY key.ordinality) AS key_columns,
+       pg_catalog.pg_get_indexdef(index_class.oid) AS index_definition,
+       pg_catalog.obj_description(index_class.oid, 'pg_class') AS ownership_comment
 FROM target_table
-JOIN pg_index AS index_definition
+JOIN pg_catalog.pg_index AS index_definition
   ON index_definition.indrelid = target_table.oid
-JOIN pg_class AS index_class
+JOIN pg_catalog.pg_class AS index_class
   ON index_class.oid = index_definition.indexrelid
  AND index_class.relnamespace = target_table.relnamespace
-JOIN LATERAL unnest(index_definition.indkey)
+JOIN LATERAL pg_catalog.unnest(index_definition.indkey)
   WITH ORDINALITY AS key(attnum, ordinality)
   ON key.ordinality <= index_definition.indnkeyatts
-JOIN pg_attribute AS attribute
+JOIN pg_catalog.pg_attribute AS attribute
   ON attribute.attrelid = target_table.oid
  AND attribute.attnum = key.attnum
 WHERE index_class.relname = 'ix_upload_requests_created_id'

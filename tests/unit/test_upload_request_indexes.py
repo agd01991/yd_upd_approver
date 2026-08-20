@@ -1,3 +1,4 @@
+import re
 import subprocess
 import sys
 from collections.abc import Callable
@@ -21,12 +22,26 @@ def test_manual_qa_upload_index_query_uses_explicit_application_schema() -> None
     assert "to_regclass('upload_requests')" not in query
     assert "upload_requests'::regclass" not in query
     assert "REPLACE_WITH_APPLICATION_SCHEMA" in query
-    assert "JOIN pg_namespace AS table_namespace" in query
+    assert "JOIN pg_catalog.pg_namespace AS table_namespace" in query
+    assert "JOIN pg_catalog.pg_class AS table_class" in query
+    assert "JOIN pg_catalog.pg_index AS index_definition" in query
+    assert "JOIN pg_catalog.pg_class AS index_class" in query
+    assert "JOIN pg_catalog.pg_attribute AS attribute" in query
+    assert "pg_catalog.array_agg" in query
+    assert "pg_catalog.unnest" in query
+    assert "pg_catalog.pg_get_indexdef" in query
+    assert "pg_catalog.obj_description" in query
+    for catalog_relation in ("pg_namespace", "pg_class", "pg_index", "pg_attribute"):
+        assert not re.search(
+            rf"\bJOIN\s+(?!pg_catalog\.){catalog_relation}\b", query, re.IGNORECASE
+        )
+    for catalog_function in ("array_agg", "unnest", "pg_get_indexdef", "obj_description"):
+        assert not re.search(rf"(?<!pg_catalog\.)\b{catalog_function}\s*\(", query, re.IGNORECASE)
     assert "table_class.relnamespace = table_namespace.oid" in query
     assert "index_definition.indrelid = target_table.oid" in query
     assert "index_class.relnamespace = target_table.relnamespace" in query
-    assert "array_agg(attribute.attname ORDER BY key.ordinality) AS key_columns" in query
-    assert "obj_description(index_class.oid, 'pg_class') AS ownership_comment" in query
+    assert "pg_catalog.array_agg(attribute.attname ORDER BY key.ordinality) AS key_columns" in query
+    assert "pg_catalog.obj_description(index_class.oid, 'pg_class') AS ownership_comment" in query
     assert "yd_upd_approver:alembic:0010_upload_created_index" in manual_qa
 
 
