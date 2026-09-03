@@ -634,6 +634,9 @@ def test_manual_qa_upload_index_query_ignores_shadow_search_path(migration_db):
     command.upgrade(cfg, CURRENT_HEAD_REVISION)
 
     async def check(conn: AsyncConnection) -> None:
+        original_search_path = (
+            await conn.execute(text("SELECT pg_catalog.current_setting('search_path')"))
+        ).scalar_one()
         await conn.execute(text("CREATE SCHEMA qa_shadow"))
         try:
             await conn.execute(
@@ -648,6 +651,31 @@ def test_manual_qa_upload_index_query_ignores_shadow_search_path(migration_db):
                     "ON qa_shadow.upload_requests (created_at, id)"
                 )
             )
+            await conn.execute(
+                text(
+                    "CREATE TABLE qa_shadow.pg_namespace ("
+                    "oid pg_catalog.oid, nspname pg_catalog.name)"
+                )
+            )
+            await conn.execute(
+                text(
+                    "INSERT INTO qa_shadow.pg_namespace (oid, nspname) "
+                    "VALUES (0, 'shadow namespace')"
+                )
+            )
+            await conn.execute(
+                text(
+                    "CREATE FUNCTION qa_shadow.pg_get_indexdef(pg_catalog.oid) RETURNS text "
+                    "LANGUAGE sql IMMUTABLE AS $$ SELECT 'shadow index definition'::text $$"
+                )
+            )
+            await conn.execute(
+                text(
+                    "CREATE FUNCTION qa_shadow.obj_description("
+                    "pg_catalog.oid, pg_catalog.name) RETURNS text "
+                    "LANGUAGE sql IMMUTABLE AS $$ SELECT 'shadow ownership comment'::text $$"
+                )
+            )
             shadow_table_oid = (
                 await conn.execute(text("SELECT 'qa_shadow.upload_requests'::regclass::oid"))
             ).scalar_one()
@@ -656,7 +684,25 @@ def test_manual_qa_upload_index_query_ignores_shadow_search_path(migration_db):
                     text("SELECT 'qa_shadow.ix_upload_requests_created_id'::regclass::oid")
                 )
             ).scalar_one()
-            await conn.execute(text("SET search_path TO qa_shadow, public"))
+            expected_search_path = "qa_shadow, pg_catalog, public"
+            await conn.execute(text(f"SET SESSION search_path TO {expected_search_path}"))
+            assert (
+                await conn.execute(text("SELECT pg_catalog.current_setting('search_path')"))
+            ).scalar_one() == expected_search_path
+
+            # These probes are intentionally not pg_catalog-qualified: they prove that
+            # the hostile session search_path resolves shadow relations and functions.
+            assert (
+                await conn.execute(text("SELECT nspname FROM pg_namespace"))
+            ).scalar_one() == "shadow namespace"
+            assert (
+                await conn.execute(text("SELECT pg_get_indexdef(0::pg_catalog.oid)"))
+            ).scalar_one() == "shadow index definition"
+            assert (
+                await conn.execute(
+                    text("SELECT obj_description(0::pg_catalog.oid, 'pg_class'::pg_catalog.name)")
+                )
+            ).scalar_one() == "shadow ownership comment"
 
             rows = (await conn.execute(text(_manual_qa_upload_index_sql("public")))).all()
             assert len(rows) == 1
@@ -665,22 +711,33 @@ def test_manual_qa_upload_index_query_ignores_shadow_search_path(migration_db):
             assert row.table_oid != shadow_table_oid
             assert row.index_oid != shadow_index_oid
             assert list(row.key_columns) == ["created_at", "id"]
+            assert "CREATE INDEX ix_upload_requests_created_id" in row.index_definition
+            assert "shadow index definition" not in row.index_definition
             assert row.ownership_comment == INDEX_OWNERSHIP_MARKER
 
             assert (await conn.execute(text(_manual_qa_upload_index_sql("qa_missing")))).all() == []
             assert (
                 await conn.execute(
                     text(
-                        "SELECT c.oid, obj_description(c.oid, 'pg_class') "
-                        "FROM pg_class AS c JOIN pg_namespace AS n ON n.oid = c.relnamespace "
+                        "SELECT c.oid, pg_catalog.obj_description(c.oid, 'pg_class') "
+                        "FROM pg_catalog.pg_class AS c "
+                        "JOIN pg_catalog.pg_namespace AS n ON n.oid = c.relnamespace "
                         "WHERE n.nspname = 'qa_shadow' AND c.relname IN "
                         "('upload_requests', 'ix_upload_requests_created_id') ORDER BY c.oid"
                     )
                 )
             ).all() == [(shadow_table_oid, None), (shadow_index_oid, None)]
         finally:
-            await conn.execute(text("SET search_path TO public"))
-            await conn.execute(text("DROP SCHEMA IF EXISTS qa_shadow CASCADE"))
+            try:
+                await conn.execute(
+                    text("SELECT pg_catalog.set_config('search_path', :path, false)"),
+                    {"path": original_search_path},
+                )
+                assert (
+                    await conn.execute(text("SELECT pg_catalog.current_setting('search_path')"))
+                ).scalar_one() == original_search_path
+            finally:
+                await conn.execute(text("DROP SCHEMA qa_shadow CASCADE"))
 
     _with_migration_connection(expected_database, check)
 
