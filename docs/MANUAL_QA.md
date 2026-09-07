@@ -252,17 +252,18 @@ PostgreSQL is the source of truth for durable Telegram notifications. Redis is n
 
 ```sql
 WITH qa_parameters(application_schema) AS (
-    VALUES ('REPLACE_WITH_APPLICATION_SCHEMA')
+    VALUES ('REPLACE_WITH_APPLICATION_SCHEMA'::pg_catalog.name)
 ),
 target_table AS (
     SELECT table_class.oid, table_class.relnamespace, table_namespace.nspname
     FROM qa_parameters
     JOIN pg_catalog.pg_namespace AS table_namespace
-      ON table_namespace.nspname = qa_parameters.application_schema
+      ON table_namespace.nspname OPERATOR(pg_catalog.=) qa_parameters.application_schema
     JOIN pg_catalog.pg_class AS table_class
-      ON table_class.relnamespace = table_namespace.oid
-     AND table_class.relname = 'upload_requests'
-     AND table_class.relkind IN ('r', 'p')
+      ON table_class.relnamespace OPERATOR(pg_catalog.=) table_namespace.oid
+     AND table_class.relname OPERATOR(pg_catalog.=) 'upload_requests'::pg_catalog.name
+     AND (table_class.relkind OPERATOR(pg_catalog.=) 'r'::pg_catalog."char"
+          OR table_class.relkind OPERATOR(pg_catalog.=) 'p'::pg_catalog."char")
 )
 SELECT target_table.nspname AS application_schema,
        target_table.oid AS table_oid,
@@ -273,17 +274,18 @@ SELECT target_table.nspname AS application_schema,
        pg_catalog.obj_description(index_class.oid, 'pg_class') AS ownership_comment
 FROM target_table
 JOIN pg_catalog.pg_index AS index_definition
-  ON index_definition.indrelid = target_table.oid
+  ON index_definition.indrelid OPERATOR(pg_catalog.=) target_table.oid
 JOIN pg_catalog.pg_class AS index_class
-  ON index_class.oid = index_definition.indexrelid
- AND index_class.relnamespace = target_table.relnamespace
+  ON index_class.oid OPERATOR(pg_catalog.=) index_definition.indexrelid
+ AND index_class.relnamespace OPERATOR(pg_catalog.=) target_table.relnamespace
 JOIN LATERAL pg_catalog.unnest(index_definition.indkey)
   WITH ORDINALITY AS key(attnum, ordinality)
-  ON key.ordinality <= index_definition.indnkeyatts
+  ON key.ordinality OPERATOR(pg_catalog.<=) index_definition.indnkeyatts::pg_catalog.int8
 JOIN pg_catalog.pg_attribute AS attribute
-  ON attribute.attrelid = target_table.oid
- AND attribute.attnum = key.attnum
-WHERE index_class.relname = 'ix_upload_requests_created_id'
+  ON attribute.attrelid OPERATOR(pg_catalog.=) target_table.oid
+ AND attribute.attnum OPERATOR(pg_catalog.=) key.attnum
+WHERE index_class.relname OPERATOR(pg_catalog.=)
+      'ix_upload_requests_created_id'::pg_catalog.name
 GROUP BY target_table.nspname, target_table.oid, index_class.oid, index_class.relname;
 ```
 

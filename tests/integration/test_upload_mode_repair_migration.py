@@ -676,6 +676,37 @@ def test_manual_qa_upload_index_query_ignores_shadow_search_path(migration_db):
                     "LANGUAGE sql IMMUTABLE AS $$ SELECT 'shadow ownership comment'::text $$"
                 )
             )
+            for function_name, left_type, right_type in (
+                ("oid_equals", "pg_catalog.oid", "pg_catalog.oid"),
+                ("name_equals", "pg_catalog.name", "pg_catalog.name"),
+                ("int8_less_than_or_equals_int2", "pg_catalog.int8", "pg_catalog.int2"),
+            ):
+                await conn.execute(
+                    text(
+                        f"CREATE FUNCTION qa_shadow.{function_name}({left_type}, {right_type}) "
+                        "RETURNS pg_catalog.bool LANGUAGE sql IMMUTABLE "
+                        "AS $$ SELECT false::pg_catalog.bool $$"
+                    )
+                )
+            await conn.execute(
+                text(
+                    "CREATE OPERATOR qa_shadow.= (LEFTARG = pg_catalog.oid, "
+                    "RIGHTARG = pg_catalog.oid, FUNCTION = qa_shadow.oid_equals)"
+                )
+            )
+            await conn.execute(
+                text(
+                    "CREATE OPERATOR qa_shadow.= (LEFTARG = pg_catalog.name, "
+                    "RIGHTARG = pg_catalog.name, FUNCTION = qa_shadow.name_equals)"
+                )
+            )
+            await conn.execute(
+                text(
+                    "CREATE OPERATOR qa_shadow.<= (LEFTARG = pg_catalog.int8, "
+                    "RIGHTARG = pg_catalog.int2, "
+                    "FUNCTION = qa_shadow.int8_less_than_or_equals_int2)"
+                )
+            )
             shadow_table_oid = (
                 await conn.execute(text("SELECT 'qa_shadow.upload_requests'::regclass::oid"))
             ).scalar_one()
@@ -704,6 +735,37 @@ def test_manual_qa_upload_index_query_ignores_shadow_search_path(migration_db):
                 )
             ).scalar_one() == "shadow ownership comment"
 
+            # The unqualified operators in the negative probes are intentional: these
+            # pairs prove that hostile operator lookup is active and catalog qualification
+            # changes the result.
+            assert not (
+                await conn.execute(text("SELECT 1::pg_catalog.oid = 1::pg_catalog.oid"))
+            ).scalar_one()
+            assert (
+                await conn.execute(
+                    text("SELECT 1::pg_catalog.oid OPERATOR(pg_catalog.=) 1::pg_catalog.oid")
+                )
+            ).scalar_one()
+            assert not (
+                await conn.execute(text("SELECT 1::pg_catalog.int8 <= 1::pg_catalog.int2"))
+            ).scalar_one()
+            assert (
+                await conn.execute(
+                    text("SELECT 1::pg_catalog.int8 OPERATOR(pg_catalog.<=) 1::pg_catalog.int2")
+                )
+            ).scalar_one()
+            assert not (
+                await conn.execute(text("SELECT 'same'::pg_catalog.name = 'same'::pg_catalog.name"))
+            ).scalar_one()
+            assert (
+                await conn.execute(
+                    text(
+                        "SELECT 'same'::pg_catalog.name OPERATOR(pg_catalog.=) "
+                        "'same'::pg_catalog.name"
+                    )
+                )
+            ).scalar_one()
+
             rows = (await conn.execute(text(_manual_qa_upload_index_sql("public")))).all()
             assert len(rows) == 1
             row = rows[0]
@@ -721,9 +783,13 @@ def test_manual_qa_upload_index_query_ignores_shadow_search_path(migration_db):
                     text(
                         "SELECT c.oid, pg_catalog.obj_description(c.oid, 'pg_class') "
                         "FROM pg_catalog.pg_class AS c "
-                        "JOIN pg_catalog.pg_namespace AS n ON n.oid = c.relnamespace "
-                        "WHERE n.nspname = 'qa_shadow' AND c.relname IN "
-                        "('upload_requests', 'ix_upload_requests_created_id') ORDER BY c.oid"
+                        "JOIN pg_catalog.pg_namespace AS n "
+                        "ON n.oid OPERATOR(pg_catalog.=) c.relnamespace "
+                        "WHERE n.nspname OPERATOR(pg_catalog.=) 'qa_shadow'::pg_catalog.name "
+                        "AND (c.relname OPERATOR(pg_catalog.=) "
+                        "'upload_requests'::pg_catalog.name OR "
+                        "c.relname OPERATOR(pg_catalog.=) "
+                        "'ix_upload_requests_created_id'::pg_catalog.name) ORDER BY c.oid"
                     )
                 )
             ).all() == [(shadow_table_oid, None), (shadow_index_oid, None)]
