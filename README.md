@@ -527,6 +527,12 @@ Supported query parameters are `limit` (default 25, min 1, max 100) and opaque `
 
 Before production rollout of `0009_db_integrity`, take a PostgreSQL backup and run the migration during a maintenance window. The migration backfills safe defaults, adds CHECK constraints, explicit FK delete policies, a partial unique index for pending folder rename requests, and pagination indexes. It refuses ambiguous legacy duplicate pending rename requests instead of choosing a winner automatically.
 
+Databases that ran the historical 0009 may also contain the unmarked
+`ix_upload_requests_created_id`. A direct downgrade to `0008_telegram_outbox` refuses that layout
+before changing 0009 objects. Upgrade first through `0011_upload_index_ownership`, verify the
+managed ownership marker as described in `docs/MANUAL_QA.md`, and only then downgrade to
+`0008_telegram_outbox`; do not use `alembic stamp` as a substitute for schema reconciliation.
+
 Local checks:
 
 ```bash

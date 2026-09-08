@@ -565,6 +565,152 @@ def test_existing_0009_database_receives_upload_ordering_index(
     _with_migration_connection(expected_database, index_at_head)
 
 
+def test_historical_0009_refuses_direct_downgrade_then_reconciles(migration_db):
+    cfg, expected_database = migration_db
+    command.upgrade(cfg, "0009_db_integrity")
+
+    async def recreate_historical_0009(conn: AsyncConnection) -> None:
+        await conn.execute(
+            text(
+                "INSERT INTO users (id, telegram_id, status, allowed_folders) "
+                "VALUES (9009, 99009, 'active', '[]'::jsonb)"
+            )
+        )
+        # This is the exact index DDL used by the historical 0009 revision.
+        await conn.execute(
+            text("CREATE INDEX ix_upload_requests_created_id ON upload_requests (created_at, id)")
+        )
+
+    _with_migration_connection(expected_database, recreate_historical_0009)
+
+    with pytest.raises(Exception, match="Upgrade through 0011_upload_index_ownership"):
+        command.downgrade(cfg, TELEGRAM_OUTBOX_REVISION)
+
+    async def unchanged_after_refusal(conn: AsyncConnection) -> None:
+        assert await _revision(conn) == "0009_db_integrity"
+        assert (
+            await conn.execute(text("SELECT to_regclass('public.ix_upload_requests_created_id')"))
+        ).scalar_one() is not None
+        assert (
+            await conn.execute(
+                text(
+                    "SELECT count(*) FROM pg_constraint "
+                    "WHERE conrelid='upload_requests'::regclass "
+                    "AND conname='ck_upload_requests_attempt_count_non_negative'"
+                )
+            )
+        ).scalar_one() == 1
+        assert (
+            await conn.execute(text("SELECT count(*) FROM users WHERE id=9009"))
+        ).scalar_one() == 1
+
+    _with_migration_connection(expected_database, unchanged_after_refusal)
+    command.upgrade(cfg, CURRENT_HEAD_REVISION)
+
+    async def marked_at_head(conn: AsyncConnection) -> None:
+        assert await _revision(conn) == CURRENT_HEAD_REVISION
+        assert (
+            await conn.execute(
+                text(
+                    "SELECT obj_description("
+                    "'public.ix_upload_requests_created_id'::regclass, 'pg_class')"
+                )
+            )
+        ).scalar_one() == INDEX_OWNERSHIP_MARKER
+
+    _with_migration_connection(expected_database, marked_at_head)
+    command.downgrade(cfg, TELEGRAM_OUTBOX_REVISION)
+
+    async def clean_at_0008(conn: AsyncConnection) -> None:
+        assert await _revision(conn) == TELEGRAM_OUTBOX_REVISION
+        assert (
+            await conn.execute(text("SELECT to_regclass('public.ix_upload_requests_created_id')"))
+        ).scalar_one() is None
+        assert (
+            await conn.execute(text("SELECT count(*) FROM users WHERE id=9009"))
+        ).scalar_one() == 1
+
+    _with_migration_connection(expected_database, clean_at_0008)
+
+
+def test_current_0009_downgrades_directly_without_ordering_index(migration_db):
+    cfg, expected_database = migration_db
+    command.upgrade(cfg, "0009_db_integrity")
+    command.downgrade(cfg, TELEGRAM_OUTBOX_REVISION)
+
+    async def check(conn: AsyncConnection) -> None:
+        assert await _revision(conn) == TELEGRAM_OUTBOX_REVISION
+        assert (
+            await conn.execute(text("SELECT to_regclass('public.ix_upload_requests_created_id')"))
+        ).scalar_one() is None
+
+    _with_migration_connection(expected_database, check)
+
+
+def test_0009_downgrade_ignores_same_named_index_in_shadow_schema(migration_db):
+    cfg, expected_database = migration_db
+    command.upgrade(cfg, "0009_db_integrity")
+
+    async def create_shadow(conn: AsyncConnection) -> None:
+        await conn.execute(text("CREATE SCHEMA qa_0009_shadow"))
+        await conn.execute(
+            text("CREATE TABLE qa_0009_shadow.upload_requests (created_at timestamptz, id integer)")
+        )
+        await conn.execute(
+            text(
+                "CREATE INDEX ix_upload_requests_created_id "
+                "ON qa_0009_shadow.upload_requests (created_at, id)"
+            )
+        )
+
+    _with_migration_connection(expected_database, create_shadow)
+    command.downgrade(cfg, TELEGRAM_OUTBOX_REVISION)
+
+    async def check_shadow(conn: AsyncConnection) -> None:
+        assert await _revision(conn) == TELEGRAM_OUTBOX_REVISION
+        assert (
+            await conn.execute(
+                text("SELECT to_regclass('qa_0009_shadow.ix_upload_requests_created_id')")
+            )
+        ).scalar_one() is not None
+        await conn.execute(text("DROP SCHEMA qa_0009_shadow CASCADE"))
+
+    _with_migration_connection(expected_database, check_shadow)
+
+
+@pytest.mark.parametrize("comment", [None, "foreign-owner"])
+def test_0009_downgrade_refuses_conflicting_application_index(migration_db, comment: str | None):
+    cfg, expected_database = migration_db
+    command.upgrade(cfg, "0009_db_integrity")
+
+    async def create_conflict(conn: AsyncConnection) -> None:
+        await conn.execute(
+            text("CREATE INDEX ix_upload_requests_created_id ON upload_requests (status, id)")
+        )
+        if comment is not None:
+            await conn.execute(
+                text("COMMENT ON INDEX public.ix_upload_requests_created_id IS :comment"),
+                {"comment": comment},
+            )
+
+    _with_migration_connection(expected_database, create_conflict)
+    with pytest.raises(Exception, match="0011_upload_index_ownership"):
+        command.downgrade(cfg, TELEGRAM_OUTBOX_REVISION)
+
+    async def unchanged(conn: AsyncConnection) -> None:
+        assert await _revision(conn) == "0009_db_integrity"
+        assert (
+            await conn.execute(
+                text(
+                    "SELECT obj_description("
+                    "'public.ix_upload_requests_created_id'::regclass, 'pg_class')"
+                )
+            )
+        ).scalar_one() == comment
+
+    _with_migration_connection(expected_database, unchanged)
+
+
 @pytest.mark.parametrize(
     ("index_sql", "table_name", "columns"),
     [
