@@ -265,11 +265,14 @@ target_table AS (
      AND (table_class.relkind OPERATOR(pg_catalog.=) 'r'::pg_catalog."char"
           OR table_class.relkind OPERATOR(pg_catalog.=) 'p'::pg_catalog."char")
 )
-SELECT target_table.nspname AS application_schema,
+SELECT target_table.nspname::pg_catalog.text AS application_schema,
        target_table.oid AS table_oid,
        index_class.oid AS index_oid,
-       index_class.relname AS index_name,
-       pg_catalog.array_agg(attribute.attname ORDER BY key.ordinality) AS key_columns,
+       index_class.relname::pg_catalog.text AS index_name,
+       pg_catalog.array_agg(
+           attribute.attname::pg_catalog.text
+           ORDER BY key.ordinality
+       ) AS key_columns,
        pg_catalog.pg_get_indexdef(index_class.oid) AS index_definition,
        pg_catalog.obj_description(index_class.oid, 'pg_class') AS ownership_comment
 FROM target_table

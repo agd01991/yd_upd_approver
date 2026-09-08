@@ -772,6 +772,7 @@ def test_manual_qa_upload_index_query_ignores_shadow_search_path(migration_db):
             assert row.application_schema == "public"
             assert row.table_oid != shadow_table_oid
             assert row.index_oid != shadow_index_oid
+            assert row.index_name == "ix_upload_requests_created_id"
             assert list(row.key_columns) == ["created_at", "id"]
             assert "CREATE INDEX ix_upload_requests_created_id" in row.index_definition
             assert "shadow index definition" not in row.index_definition

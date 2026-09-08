@@ -67,7 +67,16 @@ def test_manual_qa_upload_index_query_uses_explicit_application_schema() -> None
     assert "'ix_upload_requests_created_id'::pg_catalog.name" in query
     assert '::pg_catalog."char"' in query
     assert "::pg_catalog.int8" in query
-    assert "pg_catalog.array_agg(attribute.attname ORDER BY key.ordinality) AS key_columns" in query
+    assert "target_table.nspname::pg_catalog.text AS application_schema" in query
+    assert "index_class.relname::pg_catalog.text AS index_name" in query
+    key_columns_aggregate = re.search(
+        r"pg_catalog\.array_agg\(\s*"
+        r"attribute\.attname::pg_catalog\.text\s+"
+        r"ORDER BY key\.ordinality\s*\) AS key_columns",
+        query,
+    )
+    assert key_columns_aggregate is not None
+    assert "array_agg(attribute.attname ORDER BY key.ordinality)" not in query
     assert "pg_catalog.obj_description(index_class.oid, 'pg_class') AS ownership_comment" in query
     assert "yd_upd_approver:alembic:0010_upload_created_index" in manual_qa
 
