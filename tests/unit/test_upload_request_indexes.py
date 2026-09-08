@@ -37,10 +37,46 @@ def test_manual_qa_upload_index_query_uses_explicit_application_schema() -> None
         )
     for catalog_function in ("array_agg", "unnest", "pg_get_indexdef", "obj_description"):
         assert not re.search(rf"(?<!pg_catalog\.)\b{catalog_function}\s*\(", query, re.IGNORECASE)
-    assert "table_class.relnamespace = table_namespace.oid" in query
-    assert "index_definition.indrelid = target_table.oid" in query
-    assert "index_class.relnamespace = target_table.relnamespace" in query
-    assert "pg_catalog.array_agg(attribute.attname ORDER BY key.ordinality) AS key_columns" in query
+    equality_predicates = (
+        "table_namespace.nspname OPERATOR(pg_catalog.=) qa_parameters.application_schema",
+        "table_class.relnamespace OPERATOR(pg_catalog.=) table_namespace.oid",
+        "table_class.relname OPERATOR(pg_catalog.=) 'upload_requests'::pg_catalog.name",
+        "table_class.relkind OPERATOR(pg_catalog.=) 'r'::pg_catalog.\"char\"",
+        "table_class.relkind OPERATOR(pg_catalog.=) 'p'::pg_catalog.\"char\"",
+        "index_definition.indrelid OPERATOR(pg_catalog.=) target_table.oid",
+        "index_class.oid OPERATOR(pg_catalog.=) index_definition.indexrelid",
+        "index_class.relnamespace OPERATOR(pg_catalog.=) target_table.relnamespace",
+        "attribute.attrelid OPERATOR(pg_catalog.=) target_table.oid",
+        "attribute.attnum OPERATOR(pg_catalog.=) key.attnum",
+        "index_class.relname OPERATOR(pg_catalog.=)",
+    )
+    for predicate in equality_predicates:
+        assert predicate in query
+    assert query.count("OPERATOR(pg_catalog.=)") == 11
+    assert query.count("OPERATOR(pg_catalog.<=)") == 1
+    assert (
+        "key.ordinality OPERATOR(pg_catalog.<=) index_definition.indnkeyatts::pg_catalog.int8"
+    ) in query
+    operators_removed = query.replace("OPERATOR(pg_catalog.=)", "").replace(
+        "OPERATOR(pg_catalog.<=)", ""
+    )
+    assert not re.search(r"(?<![<>=!])=(?!=)", operators_removed)
+    assert not re.search(r"(?<!<)<=(?!=)", operators_removed)
+    assert not re.search(r"\brelkind\s+IN\s*\(", query, re.IGNORECASE)
+    assert "'REPLACE_WITH_APPLICATION_SCHEMA'::pg_catalog.name" in query
+    assert "'ix_upload_requests_created_id'::pg_catalog.name" in query
+    assert '::pg_catalog."char"' in query
+    assert "::pg_catalog.int8" in query
+    assert "target_table.nspname::pg_catalog.text AS application_schema" in query
+    assert "index_class.relname::pg_catalog.text AS index_name" in query
+    key_columns_aggregate = re.search(
+        r"pg_catalog\.array_agg\(\s*"
+        r"attribute\.attname::pg_catalog\.text\s+"
+        r"ORDER BY key\.ordinality\s*\) AS key_columns",
+        query,
+    )
+    assert key_columns_aggregate is not None
+    assert "array_agg(attribute.attname ORDER BY key.ordinality)" not in query
     assert "pg_catalog.obj_description(index_class.oid, 'pg_class') AS ownership_comment" in query
     assert "yd_upd_approver:alembic:0010_upload_created_index" in manual_qa
 
