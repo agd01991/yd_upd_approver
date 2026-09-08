@@ -1,6 +1,8 @@
+import re
 import subprocess
 import sys
 from collections.abc import Callable
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -8,6 +10,75 @@ from alembic.config import Config
 from alembic.script import ScriptDirectory
 
 from app.db.models import UploadRequest
+
+
+def test_manual_qa_upload_index_query_uses_explicit_application_schema() -> None:
+    manual_qa = Path("docs/MANUAL_QA.md").read_text()
+    first_placeholder = manual_qa.index("REPLACE_WITH_APPLICATION_SCHEMA")
+    placeholder_offset = manual_qa.index("REPLACE_WITH_APPLICATION_SCHEMA", first_placeholder + 1)
+    query_start = manual_qa.rindex("```sql", 0, placeholder_offset) + len("```sql")
+    query = manual_qa[query_start : manual_qa.index("```", placeholder_offset)]
+
+    assert "to_regclass('upload_requests')" not in query
+    assert "upload_requests'::regclass" not in query
+    assert "REPLACE_WITH_APPLICATION_SCHEMA" in query
+    assert "JOIN pg_catalog.pg_namespace AS table_namespace" in query
+    assert "JOIN pg_catalog.pg_class AS table_class" in query
+    assert "JOIN pg_catalog.pg_index AS index_definition" in query
+    assert "JOIN pg_catalog.pg_class AS index_class" in query
+    assert "JOIN pg_catalog.pg_attribute AS attribute" in query
+    assert "pg_catalog.array_agg" in query
+    assert "pg_catalog.unnest" in query
+    assert "pg_catalog.pg_get_indexdef" in query
+    assert "pg_catalog.obj_description" in query
+    for catalog_relation in ("pg_namespace", "pg_class", "pg_index", "pg_attribute"):
+        assert not re.search(
+            rf"\bJOIN\s+(?!pg_catalog\.){catalog_relation}\b", query, re.IGNORECASE
+        )
+    for catalog_function in ("array_agg", "unnest", "pg_get_indexdef", "obj_description"):
+        assert not re.search(rf"(?<!pg_catalog\.)\b{catalog_function}\s*\(", query, re.IGNORECASE)
+    equality_predicates = (
+        "table_namespace.nspname OPERATOR(pg_catalog.=) qa_parameters.application_schema",
+        "table_class.relnamespace OPERATOR(pg_catalog.=) table_namespace.oid",
+        "table_class.relname OPERATOR(pg_catalog.=) 'upload_requests'::pg_catalog.name",
+        "table_class.relkind OPERATOR(pg_catalog.=) 'r'::pg_catalog.\"char\"",
+        "table_class.relkind OPERATOR(pg_catalog.=) 'p'::pg_catalog.\"char\"",
+        "index_definition.indrelid OPERATOR(pg_catalog.=) target_table.oid",
+        "index_class.oid OPERATOR(pg_catalog.=) index_definition.indexrelid",
+        "index_class.relnamespace OPERATOR(pg_catalog.=) target_table.relnamespace",
+        "attribute.attrelid OPERATOR(pg_catalog.=) target_table.oid",
+        "attribute.attnum OPERATOR(pg_catalog.=) key.attnum",
+        "index_class.relname OPERATOR(pg_catalog.=)",
+    )
+    for predicate in equality_predicates:
+        assert predicate in query
+    assert query.count("OPERATOR(pg_catalog.=)") == 11
+    assert query.count("OPERATOR(pg_catalog.<=)") == 1
+    assert (
+        "key.ordinality OPERATOR(pg_catalog.<=) index_definition.indnkeyatts::pg_catalog.int8"
+    ) in query
+    operators_removed = query.replace("OPERATOR(pg_catalog.=)", "").replace(
+        "OPERATOR(pg_catalog.<=)", ""
+    )
+    assert not re.search(r"(?<![<>=!])=(?!=)", operators_removed)
+    assert not re.search(r"(?<!<)<=(?!=)", operators_removed)
+    assert not re.search(r"\brelkind\s+IN\s*\(", query, re.IGNORECASE)
+    assert "'REPLACE_WITH_APPLICATION_SCHEMA'::pg_catalog.name" in query
+    assert "'ix_upload_requests_created_id'::pg_catalog.name" in query
+    assert '::pg_catalog."char"' in query
+    assert "::pg_catalog.int8" in query
+    assert "target_table.nspname::pg_catalog.text AS application_schema" in query
+    assert "index_class.relname::pg_catalog.text AS index_name" in query
+    key_columns_aggregate = re.search(
+        r"pg_catalog\.array_agg\(\s*"
+        r"attribute\.attname::pg_catalog\.text\s+"
+        r"ORDER BY key\.ordinality\s*\) AS key_columns",
+        query,
+    )
+    assert key_columns_aggregate is not None
+    assert "array_agg(attribute.attname ORDER BY key.ordinality)" not in query
+    assert "pg_catalog.obj_description(index_class.oid, 'pg_class') AS ownership_comment" in query
+    assert "yd_upd_approver:alembic:0010_upload_created_index" in manual_qa
 
 
 @pytest.fixture(autouse=True)

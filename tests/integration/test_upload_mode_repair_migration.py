@@ -6,6 +6,7 @@ import logging
 import os
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import TypeVar
 
 import pytest
@@ -34,6 +35,17 @@ T = TypeVar("T")
 SYSTEM_DATABASES = {"postgres", "template0", "template1"}
 SAFE_SUFFIXES = ("_test", "_tests")
 INDEX_OWNERSHIP_MARKER = "yd_upd_approver:alembic:0010_upload_created_index"
+
+
+def _manual_qa_upload_index_sql(application_schema: str) -> str:
+    manual_qa = Path("docs/MANUAL_QA.md").read_text()
+    first_placeholder = manual_qa.index("REPLACE_WITH_APPLICATION_SCHEMA")
+    placeholder_offset = manual_qa.index("REPLACE_WITH_APPLICATION_SCHEMA", first_placeholder + 1)
+    query_start = manual_qa.rindex("```sql", 0, placeholder_offset) + len("```sql")
+    query_end = manual_qa.index("```", placeholder_offset)
+    return manual_qa[query_start:query_end].replace(
+        "REPLACE_WITH_APPLICATION_SCHEMA", application_schema
+    )
 
 
 async def _restore_managed_upload_index(conn: AsyncConnection) -> None:
@@ -615,6 +627,186 @@ def test_0010_rejects_conflicting_preexisting_upload_ordering_index(
         assert row[1] == columns
 
     _with_migration_connection(expected_database, conflict_is_unchanged)
+
+
+def test_manual_qa_upload_index_query_ignores_shadow_search_path(migration_db):
+    cfg, expected_database = migration_db
+    command.upgrade(cfg, CURRENT_HEAD_REVISION)
+
+    async def check(conn: AsyncConnection) -> None:
+        original_search_path = (
+            await conn.execute(text("SELECT pg_catalog.current_setting('search_path')"))
+        ).scalar_one()
+        await conn.execute(text("CREATE SCHEMA qa_shadow"))
+        try:
+            await conn.execute(
+                text(
+                    "CREATE TABLE qa_shadow.upload_requests ("
+                    "id bigint NOT NULL, created_at timestamptz NOT NULL)"
+                )
+            )
+            await conn.execute(
+                text(
+                    "CREATE INDEX ix_upload_requests_created_id "
+                    "ON qa_shadow.upload_requests (created_at, id)"
+                )
+            )
+            await conn.execute(
+                text(
+                    "CREATE TABLE qa_shadow.pg_namespace ("
+                    "oid pg_catalog.oid, nspname pg_catalog.name)"
+                )
+            )
+            await conn.execute(
+                text(
+                    "INSERT INTO qa_shadow.pg_namespace (oid, nspname) "
+                    "VALUES (0, 'shadow namespace')"
+                )
+            )
+            await conn.execute(
+                text(
+                    "CREATE FUNCTION qa_shadow.pg_get_indexdef(pg_catalog.oid) RETURNS text "
+                    "LANGUAGE sql IMMUTABLE AS $$ SELECT 'shadow index definition'::text $$"
+                )
+            )
+            await conn.execute(
+                text(
+                    "CREATE FUNCTION qa_shadow.obj_description("
+                    "pg_catalog.oid, pg_catalog.name) RETURNS text "
+                    "LANGUAGE sql IMMUTABLE AS $$ SELECT 'shadow ownership comment'::text $$"
+                )
+            )
+            for function_name, left_type, right_type in (
+                ("oid_equals", "pg_catalog.oid", "pg_catalog.oid"),
+                ("name_equals", "pg_catalog.name", "pg_catalog.name"),
+                ("int8_less_than_or_equals_int2", "pg_catalog.int8", "pg_catalog.int2"),
+            ):
+                await conn.execute(
+                    text(
+                        f"CREATE FUNCTION qa_shadow.{function_name}({left_type}, {right_type}) "
+                        "RETURNS pg_catalog.bool LANGUAGE sql IMMUTABLE "
+                        "AS $$ SELECT false::pg_catalog.bool $$"
+                    )
+                )
+            await conn.execute(
+                text(
+                    "CREATE OPERATOR qa_shadow.= (LEFTARG = pg_catalog.oid, "
+                    "RIGHTARG = pg_catalog.oid, FUNCTION = qa_shadow.oid_equals)"
+                )
+            )
+            await conn.execute(
+                text(
+                    "CREATE OPERATOR qa_shadow.= (LEFTARG = pg_catalog.name, "
+                    "RIGHTARG = pg_catalog.name, FUNCTION = qa_shadow.name_equals)"
+                )
+            )
+            await conn.execute(
+                text(
+                    "CREATE OPERATOR qa_shadow.<= (LEFTARG = pg_catalog.int8, "
+                    "RIGHTARG = pg_catalog.int2, "
+                    "FUNCTION = qa_shadow.int8_less_than_or_equals_int2)"
+                )
+            )
+            shadow_table_oid = (
+                await conn.execute(text("SELECT 'qa_shadow.upload_requests'::regclass::oid"))
+            ).scalar_one()
+            shadow_index_oid = (
+                await conn.execute(
+                    text("SELECT 'qa_shadow.ix_upload_requests_created_id'::regclass::oid")
+                )
+            ).scalar_one()
+            expected_search_path = "qa_shadow, pg_catalog, public"
+            await conn.execute(text(f"SET SESSION search_path TO {expected_search_path}"))
+            assert (
+                await conn.execute(text("SELECT pg_catalog.current_setting('search_path')"))
+            ).scalar_one() == expected_search_path
+
+            # These probes are intentionally not pg_catalog-qualified: they prove that
+            # the hostile session search_path resolves shadow relations and functions.
+            assert (
+                await conn.execute(text("SELECT nspname FROM pg_namespace"))
+            ).scalar_one() == "shadow namespace"
+            assert (
+                await conn.execute(text("SELECT pg_get_indexdef(0::pg_catalog.oid)"))
+            ).scalar_one() == "shadow index definition"
+            assert (
+                await conn.execute(
+                    text("SELECT obj_description(0::pg_catalog.oid, 'pg_class'::pg_catalog.name)")
+                )
+            ).scalar_one() == "shadow ownership comment"
+
+            # The unqualified operators in the negative probes are intentional: these
+            # pairs prove that hostile operator lookup is active and catalog qualification
+            # changes the result.
+            assert not (
+                await conn.execute(text("SELECT 1::pg_catalog.oid = 1::pg_catalog.oid"))
+            ).scalar_one()
+            assert (
+                await conn.execute(
+                    text("SELECT 1::pg_catalog.oid OPERATOR(pg_catalog.=) 1::pg_catalog.oid")
+                )
+            ).scalar_one()
+            assert not (
+                await conn.execute(text("SELECT 1::pg_catalog.int8 <= 1::pg_catalog.int2"))
+            ).scalar_one()
+            assert (
+                await conn.execute(
+                    text("SELECT 1::pg_catalog.int8 OPERATOR(pg_catalog.<=) 1::pg_catalog.int2")
+                )
+            ).scalar_one()
+            assert not (
+                await conn.execute(text("SELECT 'same'::pg_catalog.name = 'same'::pg_catalog.name"))
+            ).scalar_one()
+            assert (
+                await conn.execute(
+                    text(
+                        "SELECT 'same'::pg_catalog.name OPERATOR(pg_catalog.=) "
+                        "'same'::pg_catalog.name"
+                    )
+                )
+            ).scalar_one()
+
+            rows = (await conn.execute(text(_manual_qa_upload_index_sql("public")))).all()
+            assert len(rows) == 1
+            row = rows[0]
+            assert row.application_schema == "public"
+            assert row.table_oid != shadow_table_oid
+            assert row.index_oid != shadow_index_oid
+            assert row.index_name == "ix_upload_requests_created_id"
+            assert list(row.key_columns) == ["created_at", "id"]
+            assert "CREATE INDEX ix_upload_requests_created_id" in row.index_definition
+            assert "shadow index definition" not in row.index_definition
+            assert row.ownership_comment == INDEX_OWNERSHIP_MARKER
+
+            assert (await conn.execute(text(_manual_qa_upload_index_sql("qa_missing")))).all() == []
+            assert (
+                await conn.execute(
+                    text(
+                        "SELECT c.oid, pg_catalog.obj_description(c.oid, 'pg_class') "
+                        "FROM pg_catalog.pg_class AS c "
+                        "JOIN pg_catalog.pg_namespace AS n "
+                        "ON n.oid OPERATOR(pg_catalog.=) c.relnamespace "
+                        "WHERE n.nspname OPERATOR(pg_catalog.=) 'qa_shadow'::pg_catalog.name "
+                        "AND (c.relname OPERATOR(pg_catalog.=) "
+                        "'upload_requests'::pg_catalog.name OR "
+                        "c.relname OPERATOR(pg_catalog.=) "
+                        "'ix_upload_requests_created_id'::pg_catalog.name) ORDER BY c.oid"
+                    )
+                )
+            ).all() == [(shadow_table_oid, None), (shadow_index_oid, None)]
+        finally:
+            try:
+                await conn.execute(
+                    text("SELECT pg_catalog.set_config('search_path', :path, false)"),
+                    {"path": original_search_path},
+                )
+                assert (
+                    await conn.execute(text("SELECT pg_catalog.current_setting('search_path')"))
+                ).scalar_one() == original_search_path
+            finally:
+                await conn.execute(text("DROP SCHEMA qa_shadow CASCADE"))
+
+    _with_migration_connection(expected_database, check)
 
 
 @pytest.mark.parametrize("scenario", ["existing", "shadow", "conflict"])
