@@ -306,6 +306,20 @@ without relying on `search_path`: the table must be an ordinary or partitioned u
 `ix_upload_requests_status_created_id (status, created_at, id)` must belong to the same table OID.
 The managed index must have the full `(created_at, id)` ascending/default-null-order signature.
 
+Two database layouts can therefore report revision `0009_db_integrity`. The historical 0009
+created an unmarked `ix_upload_requests_created_id`; the current 0009 leaves its creation to
+0010. A direct `0009_db_integrity` to `0008_telegram_outbox` downgrade succeeds for the current
+layout when that index is absent. If an index with that name is attached to the fingerprinted
+application table, the downgrade stops transactionally before removing any other 0009 object:
+neither an absent marker nor a matching shape proves that the historical migration owns it.
+
+For a compatible historical index, run `alembic upgrade 0011_upload_index_ownership`, repeat the
+ownership query above and require the exact managed marker, then run
+`alembic downgrade 0008_telegram_outbox`. Reconciliation in 0010/0011 validates the target and
+complete index signature before adoption; a conflicting definition or a foreign comment is an
+explicit failure and must be investigated rather than overwritten. `alembic stamp` is not a
+repair: it only changes the recorded revision and neither validates nor removes schema objects.
+
 For a database already at an old, unmarked `0010_upload_created_index`, **first run**
 `alembic upgrade head`, verify the current revision and exact ownership comment above, and only
 then perform a rollback. A direct downgrade from an unmarked `0010` intentionally fails safely;
