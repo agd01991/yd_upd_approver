@@ -280,6 +280,17 @@ async def _revision(conn: AsyncConnection) -> str | None:
     ).scalar_one_or_none()
 
 
+async def _cleanup_test_upload_ordering_index(conn: AsyncConnection) -> str | None:
+    """Reconcile a test-owned ordering index with the recorded revision."""
+    revision = await _revision(conn)
+    await conn.execute(text("DROP INDEX IF EXISTS public.ix_upload_requests_created_id"))
+    if revision in {"0010_upload_created_index", CURRENT_HEAD_REVISION}:
+        await _restore_managed_upload_index(conn)
+    elif revision not in {None, TELEGRAM_OUTBOX_REVISION, "0009_db_integrity"}:
+        raise AssertionError(f"unexpected revision during test index cleanup: {revision}")
+    return revision
+
+
 async def _seed_legacy_0004(conn: AsyncConnection) -> None:
     await conn.execute(
         text("""
@@ -718,7 +729,7 @@ def test_0009_downgrade_refuses_conflicting_application_index(migration_db, comm
     finally:
 
         async def drop_conflict(conn: AsyncConnection) -> None:
-            await conn.execute(text("DROP INDEX IF EXISTS public.ix_upload_requests_created_id"))
+            await _cleanup_test_upload_ordering_index(conn)
 
         _with_migration_connection(expected_database, drop_conflict)
 
@@ -787,9 +798,67 @@ def test_0010_rejects_conflicting_preexisting_upload_ordering_index(
     finally:
 
         async def drop_conflict(conn: AsyncConnection) -> None:
-            await conn.execute(text("DROP INDEX IF EXISTS public.ix_upload_requests_created_id"))
+            await _cleanup_test_upload_ordering_index(conn)
 
         _with_migration_connection(expected_database, drop_conflict)
+
+
+@pytest.mark.parametrize(
+    "target_revision",
+    ["0009_db_integrity", "0010_upload_created_index", CURRENT_HEAD_REVISION],
+)
+def test_test_owned_ordering_index_cleanup_follows_recorded_revision(
+    migration_db, target_revision: str
+):
+    cfg, expected_database = migration_db
+    command.upgrade(cfg, target_revision)
+
+    async def create_incompatible_index(conn: AsyncConnection) -> None:
+        await conn.execute(text("DROP INDEX IF EXISTS public.ix_upload_requests_created_id"))
+        await conn.execute(
+            text(
+                "CREATE INDEX ix_upload_requests_created_id "
+                "ON public.upload_requests (id, created_at)"
+            )
+        )
+
+    _with_migration_connection(expected_database, create_incompatible_index)
+
+    with pytest.raises(AssertionError, match="original test failure"):
+        try:
+            raise AssertionError("original test failure")
+        finally:
+            cleaned_revision = _with_migration_connection(
+                expected_database, _cleanup_test_upload_ordering_index
+            )
+
+    assert cleaned_revision == target_revision
+
+    async def check_cleanup(conn: AsyncConnection) -> None:
+        assert await _revision(conn) == target_revision
+        row = (
+            await conn.execute(
+                text(
+                    "SELECT pg_get_indexdef(i.oid), obj_description(i.oid, 'pg_class') "
+                    "FROM pg_class i JOIN pg_namespace n ON n.oid=i.relnamespace "
+                    "WHERE n.nspname='public' AND i.relname='ix_upload_requests_created_id'"
+                )
+            )
+        ).one_or_none()
+        if target_revision == "0009_db_integrity":
+            assert row is None
+        else:
+            assert row is not None
+            assert row[0].endswith("USING btree (created_at, id)")
+            assert row[1] == INDEX_OWNERSHIP_MARKER
+
+    _with_migration_connection(expected_database, check_cleanup)
+    command.downgrade(cfg, "base")
+
+    async def check_base(conn: AsyncConnection) -> None:
+        assert await _revision(conn) is None
+
+    _with_migration_connection(expected_database, check_base)
 
 
 def test_manual_qa_upload_index_query_ignores_shadow_search_path(migration_db):
@@ -1314,7 +1383,7 @@ def test_0010_upgrade_rejects_existing_index_with_wrong_order(migration_db, orde
     finally:
 
         async def drop_conflict(conn: AsyncConnection) -> None:
-            await conn.execute(text("DROP INDEX IF EXISTS public.ix_upload_requests_created_id"))
+            await _cleanup_test_upload_ordering_index(conn)
 
         _with_migration_connection(expected_database, drop_conflict)
 
@@ -1471,6 +1540,7 @@ def test_anchor_fingerprint_ignores_name_only_shadow_target(migration_db, execut
                 await conn.execute(text("SET search_path TO anchor_shadow, public"))
                 await conn.execute(text(migration_0010._offline_upgrade_sql()))
                 await conn.execute(text(migration_0011._offline_sql(backfill=True)))
+                assert await _revision(conn) == "0009_db_integrity"
 
             _with_migration_connection(expected_database, execute_offline)
 
@@ -1503,6 +1573,7 @@ def test_anchor_fingerprint_ignores_name_only_shadow_target(migration_db, execut
     finally:
 
         async def cleanup(conn: AsyncConnection) -> None:
+            await _cleanup_test_upload_ordering_index(conn)
             await conn.execute(text(f'ALTER DATABASE "{quoted_database}" RESET search_path'))
             await conn.execute(text("SET search_path TO public"))
             await conn.execute(text("DROP SCHEMA IF EXISTS anchor_shadow CASCADE"))
@@ -1648,7 +1719,7 @@ def test_0010_upgrade_refuses_foreign_index_comment(migration_db):
     finally:
 
         async def drop_conflict(conn: AsyncConnection) -> None:
-            await conn.execute(text("DROP INDEX IF EXISTS public.ix_upload_requests_created_id"))
+            await _cleanup_test_upload_ordering_index(conn)
 
         _with_migration_connection(expected_database, drop_conflict)
 
