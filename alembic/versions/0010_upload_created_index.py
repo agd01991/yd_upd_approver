@@ -48,21 +48,21 @@ def _expected_anchor_type_oids(columns: tuple[str, ...]) -> str:
     """
     labels = ",".join(f"'{label}'" for label in _UPLOAD_STATUS_LABELS)
     upload_status_oid = f"""(SELECT typ.oid
-             FROM pg_type typ
-             JOIN pg_namespace type_ns ON type_ns.oid = typ.typnamespace
+             FROM pg_catalog.pg_type typ
+             JOIN pg_catalog.pg_namespace type_ns ON type_ns.oid = typ.typnamespace
              WHERE typ.typname = 'uploadstatus' AND typ.typtype = 'e'
-               AND left(type_ns.nspname, 3) <> 'pg_'
-               AND type_ns.nspname <> 'information_schema'
-               AND (SELECT array_agg(enum.enumlabel::text ORDER BY enum.enumsortorder)
-                    FROM pg_enum enum WHERE enum.enumtypid = typ.oid)
-                   = ARRAY[{labels}]::text[])"""
+               AND pg_catalog.left(type_ns.nspname, 3)  OPERATOR(pg_catalog.<>)  'pg_'
+               AND type_ns.nspname  OPERATOR(pg_catalog.<>)  'information_schema'
+               AND (SELECT pg_catalog.array_agg(enum.enumlabel::pg_catalog.text ORDER BY enum.enumsortorder)
+                    FROM pg_catalog.pg_enum enum WHERE enum.enumtypid = typ.oid)
+                   = ARRAY[{labels}]::pg_catalog.text[])"""
     expected = {
-        "user_id": "'pg_catalog.int4'::regtype::oid",
+        "user_id": "'pg_catalog.int4'::pg_catalog.regtype::pg_catalog.oid",
         "status": upload_status_oid,
-        "created_at": "'pg_catalog.timestamptz'::regtype::oid",
-        "id": "'pg_catalog.int4'::regtype::oid",
+        "created_at": "'pg_catalog.timestamptz'::pg_catalog.regtype::pg_catalog.oid",
+        "id": "'pg_catalog.int4'::pg_catalog.regtype::pg_catalog.oid",
     }
-    return "ARRAY[" + ",".join(expected[column] for column in columns) + "]::oid[]"
+    return "ARRAY[" + ",".join(expected[column] for column in columns) + "]::pg_catalog.oid[]"
 
 
 def _anchor_predicate(index_alias: str, columns: tuple[str, ...]) -> str:
@@ -73,43 +73,43 @@ def _anchor_predicate(index_alias: str, columns: tuple[str, ...]) -> str:
       AND {index_alias}.indpred IS NULL AND {index_alias}.indexprs IS NULL
       AND NOT {index_alias}.indisexclusion
       AND {index_alias}.indisvalid AND {index_alias}.indisready
-      AND (SELECT array_agg(a.attname ORDER BY k.ordinality)
-           FROM unnest({index_alias}.indkey) WITH ORDINALITY k(attnum, ordinality)
-           JOIN pg_attribute a ON a.attrelid={index_alias}.indrelid AND a.attnum=k.attnum
+      AND (SELECT pg_catalog.array_agg(a.attname ORDER BY k.ordinality)
+           FROM pg_catalog.unnest({index_alias}.indkey) WITH ORDINALITY k(attnum, ordinality)
+           JOIN pg_catalog.pg_attribute a ON a.attrelid={index_alias}.indrelid AND a.attnum=k.attnum
            WHERE k.ordinality <= {index_alias}.indnkeyatts)
-          = ARRAY[{column_array}]::name[]
-      AND (SELECT array_agg(a.atttypid ORDER BY k.ordinality)
-           FROM unnest({index_alias}.indkey) WITH ORDINALITY k(attnum, ordinality)
-           JOIN pg_attribute a ON a.attrelid={index_alias}.indrelid AND a.attnum=k.attnum
+          = ARRAY[{column_array}]::pg_catalog.name[]
+      AND (SELECT pg_catalog.array_agg(a.atttypid ORDER BY k.ordinality)
+           FROM pg_catalog.unnest({index_alias}.indkey) WITH ORDINALITY k(attnum, ordinality)
+           JOIN pg_catalog.pg_attribute a ON a.attrelid={index_alias}.indrelid AND a.attnum=k.attnum
            WHERE k.ordinality <= {index_alias}.indnkeyatts)
           = {_expected_anchor_type_oids(columns)}
-      AND (SELECT array_agg(o.option ORDER BY o.ordinality)
-           FROM unnest({index_alias}.indoption) WITH ORDINALITY o(option, ordinality)
+      AND (SELECT pg_catalog.array_agg(o.option ORDER BY o.ordinality)
+           FROM pg_catalog.unnest({index_alias}.indoption) WITH ORDINALITY o(option, ordinality)
            WHERE o.ordinality <= {index_alias}.indnkeyatts)
-          = ARRAY[0,0,0]::smallint[]
-      AND (SELECT count(*) = {index_alias}.indnkeyatts
-                  AND COALESCE(bool_and((
+          = ARRAY[0,0,0]::pg_catalog.smallint[]
+      AND (SELECT pg_catalog.count(*) = {index_alias}.indnkeyatts
+                  AND COALESCE(pg_catalog.bool_and((
                         ic.opclass_oid IS NOT NULL AND a.attnum IS NOT NULL
                         AND typ.oid IS NOT NULL AND opc.oid IS NOT NULL
                         AND opc.opcmethod = am.oid AND opc.opcdefault
                         AND (opc.opcintype = a.atttypid OR
                              (typ.typtype = 'e' AND
-                              opc.opcintype = 'pg_catalog.anyenum'::regtype))
+                              opc.opcintype = 'pg_catalog.anyenum'::pg_catalog.regtype))
                       ) IS TRUE), false)
-           FROM unnest({index_alias}.indkey) WITH ORDINALITY k(attnum, ordinality)
-           LEFT JOIN unnest({index_alias}.indclass) WITH ORDINALITY
+           FROM pg_catalog.unnest({index_alias}.indkey) WITH ORDINALITY k(attnum, ordinality)
+           LEFT JOIN pg_catalog.unnest({index_alias}.indclass) WITH ORDINALITY
              ic(opclass_oid, ordinality) ON ic.ordinality = k.ordinality
-           LEFT JOIN pg_attribute a
+           LEFT JOIN pg_catalog.pg_attribute a
              ON a.attrelid={index_alias}.indrelid AND a.attnum=k.attnum
-           LEFT JOIN pg_type typ ON typ.oid = a.atttypid
-           LEFT JOIN pg_opclass opc ON opc.oid = ic.opclass_oid
+           LEFT JOIN pg_catalog.pg_type typ ON typ.oid = a.atttypid
+           LEFT JOIN pg_catalog.pg_opclass opc ON opc.oid = ic.opclass_oid
            WHERE k.ordinality <= {index_alias}.indnkeyatts)"""
 
 
 def _anchor_exists(table_alias: str, name: str, columns: tuple[str, ...]) -> str:
     return f"""EXISTS (
-            SELECT 1 FROM pg_class i JOIN pg_index x ON x.indexrelid=i.oid
-            JOIN pg_am am ON am.oid=i.relam
+            SELECT 1 FROM pg_catalog.pg_class i JOIN pg_catalog.pg_index x ON x.indexrelid=i.oid
+            JOIN pg_catalog.pg_am am ON am.oid=i.relam
             WHERE x.indrelid={table_alias}.oid AND i.relnamespace={table_alias}.relnamespace
               AND i.relname='{name}' AND {_anchor_predicate("x", columns)})"""
 
@@ -165,12 +165,12 @@ def _resolve_target_table() -> _TargetTable:
             text(f"""
         SELECT table_class.oid AS oid, table_namespace.oid AS schema_oid,
                table_namespace.nspname AS schema, table_class.relname AS name
-        FROM pg_class AS table_class
-        JOIN pg_namespace AS table_namespace ON table_namespace.oid = table_class.relnamespace
+        FROM pg_catalog.pg_class AS table_class
+        JOIN pg_catalog.pg_namespace AS table_namespace ON table_namespace.oid = table_class.relnamespace
         WHERE table_class.relname = 'upload_requests'
           AND table_class.relkind IN ('r', 'p')
-          AND left(table_namespace.nspname, 3) <> 'pg_'
-          AND table_namespace.nspname <> 'information_schema'
+          AND pg_catalog.left(table_namespace.nspname, 3)  OPERATOR(pg_catalog.<>)  'pg_'
+          AND table_namespace.nspname  OPERATOR(pg_catalog.<>)  'information_schema'
           AND {anchors}
     """)
         )
@@ -202,45 +202,45 @@ def _index_rows(
                index_namespace.nspname AS schema,
                index_definition.indrelid AS table_oid,
                table_namespace.nspname AS table_schema, table_class.relname AS table_name,
-               array_agg(attribute.attname ORDER BY key_attribute.ordinality)
+               pg_catalog.array_agg(attribute.attname ORDER BY key_attribute.ordinality)
                    FILTER (WHERE key_attribute.ordinality <= index_definition.indnkeyatts)
                    AS key_columns,
-               array_agg(key_option.option ORDER BY key_attribute.ordinality)
+               pg_catalog.array_agg(key_option.option ORDER BY key_attribute.ordinality)
                    FILTER (WHERE key_attribute.ordinality <= index_definition.indnkeyatts)
                    AS key_options,
-               array_agg(opclass.oid ORDER BY key_attribute.ordinality)
+               pg_catalog.array_agg(opclass.oid ORDER BY key_attribute.ordinality)
                    FILTER (WHERE key_attribute.ordinality <= index_definition.indnkeyatts)
                    AS key_opclasses,
-               array_agg(default_opclass.oid ORDER BY key_attribute.ordinality)
+               pg_catalog.array_agg(default_opclass.oid ORDER BY key_attribute.ordinality)
                    FILTER (WHERE key_attribute.ordinality <= index_definition.indnkeyatts)
                    AS expected_key_opclasses,
-               max(index_definition.indnkeyatts) AS key_column_count,
-               max(index_definition.indnatts) AS total_column_count, access_method.amname AS access_method,
-               bool_or(index_definition.indisunique) AS is_unique,
-               bool_or(index_definition.indpred IS NOT NULL) AS is_partial,
-               bool_or(index_definition.indexprs IS NOT NULL) AS is_expression,
-               bool_or(index_definition.indisexclusion) AS is_exclusion,
-               bool_or(index_definition.indisvalid) AS is_valid,
-               bool_or(index_definition.indisready) AS is_ready,
-               obj_description(index_class.oid, 'pg_class') AS ownership_comment
-        FROM pg_class AS index_class
-        JOIN pg_namespace AS index_namespace ON index_namespace.oid = index_class.relnamespace
-        JOIN pg_index AS index_definition ON index_definition.indexrelid = index_class.oid
-        JOIN pg_class AS table_class ON table_class.oid = index_definition.indrelid
-        JOIN pg_namespace AS table_namespace ON table_namespace.oid = table_class.relnamespace
-        JOIN pg_am AS access_method ON access_method.oid = index_class.relam
-        LEFT JOIN LATERAL unnest(index_definition.indkey)
+               pg_catalog.max(index_definition.indnkeyatts) AS key_column_count,
+               pg_catalog.max(index_definition.indnatts) AS total_column_count, access_method.amname AS access_method,
+               pg_catalog.bool_or(index_definition.indisunique) AS is_unique,
+               pg_catalog.bool_or(index_definition.indpred IS NOT NULL) AS is_partial,
+               pg_catalog.bool_or(index_definition.indexprs IS NOT NULL) AS is_expression,
+               pg_catalog.bool_or(index_definition.indisexclusion) AS is_exclusion,
+               pg_catalog.bool_or(index_definition.indisvalid) AS is_valid,
+               pg_catalog.bool_or(index_definition.indisready) AS is_ready,
+               pg_catalog.obj_description(index_class.oid, 'pg_class') AS ownership_comment
+        FROM pg_catalog.pg_class AS index_class
+        JOIN pg_catalog.pg_namespace AS index_namespace ON index_namespace.oid = index_class.relnamespace
+        JOIN pg_catalog.pg_index AS index_definition ON index_definition.indexrelid = index_class.oid
+        JOIN pg_catalog.pg_class AS table_class ON table_class.oid = index_definition.indrelid
+        JOIN pg_catalog.pg_namespace AS table_namespace ON table_namespace.oid = table_class.relnamespace
+        JOIN pg_catalog.pg_am AS access_method ON access_method.oid = index_class.relam
+        LEFT JOIN LATERAL pg_catalog.unnest(index_definition.indkey)
             WITH ORDINALITY AS key_attribute(attnum, ordinality) ON TRUE
-        LEFT JOIN LATERAL unnest(index_definition.indoption)
+        LEFT JOIN LATERAL pg_catalog.unnest(index_definition.indoption)
             WITH ORDINALITY AS key_option(option, ordinality)
             ON key_option.ordinality = key_attribute.ordinality
-        LEFT JOIN pg_attribute AS attribute ON attribute.attrelid = index_definition.indrelid
+        LEFT JOIN pg_catalog.pg_attribute AS attribute ON attribute.attrelid = index_definition.indrelid
             AND attribute.attnum = key_attribute.attnum
-        LEFT JOIN LATERAL unnest(index_definition.indclass)
+        LEFT JOIN LATERAL pg_catalog.unnest(index_definition.indclass)
             WITH ORDINALITY AS index_opclass(opclass_oid, ordinality)
             ON index_opclass.ordinality = key_attribute.ordinality
-        LEFT JOIN pg_opclass AS opclass ON opclass.oid = index_opclass.opclass_oid
-        LEFT JOIN pg_opclass AS default_opclass ON default_opclass.opcmethod = index_class.relam
+        LEFT JOIN pg_catalog.pg_opclass AS opclass ON opclass.oid = index_opclass.opclass_oid
+        LEFT JOIN pg_catalog.pg_opclass AS default_opclass ON default_opclass.opcmethod = index_class.relam
             AND default_opclass.opcintype = attribute.atttypid AND default_opclass.opcdefault
         WHERE {name_predicate}{where}
         GROUP BY index_class.oid, index_namespace.oid, index_namespace.nspname,
@@ -322,19 +322,19 @@ def _validate_existing_index(index: _IndexSignature | None, target: _TargetTable
     )
 
 
-def _downgrade_candidates() -> list[_IndexSignature]:
+def _downgrade_candidates(target: _TargetTable | None = None) -> list[_IndexSignature]:
+    """Return only fully validated marker-owned indexes for the resolved target."""
     return [
         index
         for index in _index_rows(
-            "index_namespace.oid = table_namespace.oid "
-            "AND table_class.relname = 'upload_requests' "
-            "AND table_class.relkind IN ('r', 'p') "
-            "AND left(index_namespace.nspname, 3) <> 'pg_' "
-            "AND index_namespace.nspname <> 'information_schema'"
+            "pg_catalog.obj_description(index_class.oid, 'pg_class') = :marker",
+            {"marker": _INDEX_OWNERSHIP_MARKER},
         )
-        if index.key_columns == _EXPECTED_KEY_COLUMNS
+        if (target is None or _matches_expected_index(index, target))
+        and index.key_columns == _EXPECTED_KEY_COLUMNS
         and index.key_options == _EXPECTED_KEY_OPTIONS
         and index.key_opclasses == index.expected_key_opclasses
+        and len(index.key_opclasses) == 2
         and index.key_column_count == 2
         and index.total_column_count == 2
         and index.access_method == "btree"
@@ -401,34 +401,34 @@ DO $$
 DECLARE target_oid oid; target_schema text; index_oid oid; existing_comment text;
         named_count integer; valid_count integer; target_count integer; temporary_name text;
 BEGIN
-  SELECT count(*),min(c.oid),min(n.nspname) INTO target_count,target_oid,target_schema FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE c.relname='upload_requests' AND c.relkind IN ('r','p') AND left(n.nspname,3)<>'pg_' AND n.nspname<>'information_schema' AND {anchors};
+  SELECT pg_catalog.count(*),pg_catalog.min(c.oid),pg_catalog.min(n.nspname) INTO target_count,target_oid,target_schema FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace WHERE c.relname='upload_requests' AND c.relkind IN ('r','p') AND pg_catalog.left(n.nspname,3) OPERATOR(pg_catalog.<>) 'pg_' AND n.nspname OPERATOR(pg_catalog.<>) 'information_schema' AND {anchors};
   IF target_count=0 THEN RAISE EXCEPTION 'Cannot apply 0010_upload_created_index: target table upload_requests was not found'; END IF;
   IF target_count>1 THEN RAISE EXCEPTION 'Cannot apply 0010_upload_created_index: application target is ambiguous'; END IF;
-  SELECT count(*) INTO named_count FROM pg_class i JOIN pg_namespace n ON n.oid = i.relnamespace WHERE n.nspname = target_schema AND i.relname = 'ix_upload_requests_created_id';
-  IF named_count = 0 THEN EXECUTE format('CREATE INDEX IF NOT EXISTS %I ON %I.%I (created_at, id)', 'ix_upload_requests_created_id', target_schema, 'upload_requests'); END IF;
-  SELECT count(*) INTO valid_count FROM pg_class i JOIN pg_namespace ins ON ins.oid = i.relnamespace JOIN pg_index x ON x.indexrelid = i.oid JOIN pg_class t ON t.oid = x.indrelid JOIN pg_namespace tns ON tns.oid = t.relnamespace JOIN pg_am am ON am.oid = i.relam WHERE i.relname = 'ix_upload_requests_created_id' AND ins.nspname = target_schema AND x.indrelid = target_oid AND ins.oid = tns.oid AND t.relname = 'upload_requests' AND x.indnkeyatts = 2 AND x.indnatts = 2 AND am.amname = 'btree' AND NOT x.indisunique AND NOT x.indisexclusion AND x.indpred IS NULL AND x.indexprs IS NULL AND x.indisvalid AND x.indisready AND (SELECT array_agg(a.attname ORDER BY k.ordinality) FROM unnest(x.indkey) WITH ORDINALITY AS k(attnum, ordinality) JOIN pg_attribute a ON a.attrelid = x.indrelid AND a.attnum = k.attnum WHERE k.ordinality <= x.indnkeyatts) = ARRAY['created_at', 'id']::name[] AND (SELECT array_agg(o.option ORDER BY o.ordinality) FROM unnest(x.indoption) WITH ORDINALITY AS o(option, ordinality) WHERE o.ordinality <= x.indnkeyatts) = ARRAY[0, 0]::smallint[] AND (SELECT array_agg(ic.opclass_oid ORDER BY ic.ordinality) FROM unnest(x.indclass) WITH ORDINALITY AS ic(opclass_oid, ordinality) WHERE ic.ordinality <= x.indnkeyatts) = (SELECT array_agg(opc.oid ORDER BY k.ordinality) FROM unnest(x.indkey) WITH ORDINALITY AS k(attnum, ordinality) JOIN pg_attribute a ON a.attrelid=x.indrelid AND a.attnum=k.attnum JOIN pg_opclass opc ON opc.opcmethod=(SELECT oid FROM pg_am WHERE amname='btree') AND opc.opcintype=a.atttypid AND opc.opcdefault WHERE k.ordinality <= x.indnkeyatts);
+  SELECT pg_catalog.count(*) INTO named_count FROM pg_catalog.pg_class i JOIN pg_catalog.pg_namespace n ON n.oid = i.relnamespace WHERE n.nspname = target_schema AND i.relname = 'ix_upload_requests_created_id';
+  IF named_count = 0 THEN EXECUTE pg_catalog.format('CREATE INDEX IF NOT EXISTS %I ON %I.%I (created_at, id)', 'ix_upload_requests_created_id', target_schema, 'upload_requests'); END IF;
+  SELECT pg_catalog.count(*) INTO valid_count FROM pg_catalog.pg_class i JOIN pg_catalog.pg_namespace ins ON ins.oid = i.relnamespace JOIN pg_catalog.pg_index x ON x.indexrelid = i.oid JOIN pg_catalog.pg_class t ON t.oid = x.indrelid JOIN pg_catalog.pg_namespace tns ON tns.oid = t.relnamespace JOIN pg_catalog.pg_am am ON am.oid = i.relam WHERE i.relname = 'ix_upload_requests_created_id' AND ins.nspname = target_schema AND x.indrelid = target_oid AND ins.oid = tns.oid AND t.relname = 'upload_requests' AND x.indnkeyatts = 2 AND x.indnatts = 2 AND am.amname = 'btree' AND NOT x.indisunique AND NOT x.indisexclusion AND x.indpred IS NULL AND x.indexprs IS NULL AND x.indisvalid AND x.indisready AND (SELECT pg_catalog.array_agg(a.attname ORDER BY k.ordinality) FROM pg_catalog.unnest(x.indkey) WITH ORDINALITY AS k(attnum, ordinality) JOIN pg_catalog.pg_attribute a ON a.attrelid = x.indrelid AND a.attnum = k.attnum WHERE k.ordinality <= x.indnkeyatts) = ARRAY['created_at', 'id']::pg_catalog.name[] AND (SELECT pg_catalog.array_agg(o.option ORDER BY o.ordinality) FROM pg_catalog.unnest(x.indoption) WITH ORDINALITY AS o(option, ordinality) WHERE o.ordinality <= x.indnkeyatts) = ARRAY[0, 0]::pg_catalog.smallint[] AND (SELECT pg_catalog.array_agg(ic.opclass_oid ORDER BY ic.ordinality) FROM pg_catalog.unnest(x.indclass) WITH ORDINALITY AS ic(opclass_oid, ordinality) WHERE ic.ordinality <= x.indnkeyatts) = (SELECT pg_catalog.array_agg(opc.oid ORDER BY k.ordinality) FROM pg_catalog.unnest(x.indkey) WITH ORDINALITY AS k(attnum, ordinality) JOIN pg_catalog.pg_attribute a ON a.attrelid=x.indrelid AND a.attnum=k.attnum JOIN pg_catalog.pg_opclass opc ON opc.opcmethod=(SELECT oid FROM pg_catalog.pg_am WHERE amname='btree') AND opc.opcintype=a.atttypid AND opc.opcdefault WHERE k.ordinality <= x.indnkeyatts);
   IF valid_count = 0 THEN
     IF named_count = 0 THEN RAISE EXCEPTION 'Cannot apply 0010_upload_created_index: index ix_upload_requests_created_id was not found after creation'; END IF;
     RAISE EXCEPTION 'Cannot apply 0010_upload_created_index: index ix_upload_requests_created_id has an incompatible signature';
   END IF;
-  SELECT i.oid, obj_description(i.oid, 'pg_class') INTO STRICT index_oid, existing_comment
-    FROM pg_class i JOIN pg_namespace n ON n.oid = i.relnamespace
+  SELECT i.oid, pg_catalog.obj_description(i.oid, 'pg_class') INTO STRICT index_oid, existing_comment
+    FROM pg_catalog.pg_class i JOIN pg_catalog.pg_namespace n ON n.oid = i.relnamespace
     WHERE n.nspname = target_schema AND i.relname = 'ix_upload_requests_created_id';
-  IF existing_comment IS NOT NULL AND existing_comment <> '{_INDEX_OWNERSHIP_MARKER}' THEN
+  IF existing_comment IS NOT NULL AND existing_comment  OPERATOR(pg_catalog.<>)  '{_INDEX_OWNERSHIP_MARKER}' THEN
     RAISE EXCEPTION 'Cannot apply 0010_upload_created_index: ownership conflict for index ix_upload_requests_created_id; its existing comment belongs to another owner';
   END IF;
   IF existing_comment IS NULL THEN
-    temporary_name := '__yd_0010_adopt_' || index_oid::text;
-    EXECUTE format('ALTER INDEX %I.%I RENAME TO %I', target_schema,
+    temporary_name := '__yd_0010_adopt_' || index_oid::pg_catalog.text;
+    EXECUTE pg_catalog.format('ALTER INDEX %I.%I RENAME TO %I', target_schema,
                    'ix_upload_requests_created_id', temporary_name);
-    SELECT count(*) INTO valid_count FROM pg_class i JOIN pg_namespace ins ON ins.oid=i.relnamespace JOIN pg_index x ON x.indexrelid=i.oid JOIN pg_class t ON t.oid=x.indrelid JOIN pg_namespace tns ON tns.oid=t.relnamespace JOIN pg_am am ON am.oid=i.relam WHERE i.oid=index_oid AND ins.nspname=target_schema AND x.indrelid=target_oid AND ins.oid=tns.oid AND t.relname='upload_requests' AND obj_description(i.oid,'pg_class') IS NULL AND x.indnkeyatts=2 AND x.indnatts=2 AND am.amname='btree' AND NOT x.indisunique AND NOT x.indisexclusion AND x.indpred IS NULL AND x.indexprs IS NULL AND x.indisvalid AND x.indisready AND (SELECT array_agg(a.attname ORDER BY k.ordinality) FROM unnest(x.indkey) WITH ORDINALITY k(attnum,ordinality) JOIN pg_attribute a ON a.attrelid=x.indrelid AND a.attnum=k.attnum WHERE k.ordinality<=x.indnkeyatts)=ARRAY['created_at','id']::name[] AND (SELECT array_agg(o.option ORDER BY o.ordinality) FROM unnest(x.indoption) WITH ORDINALITY o(option,ordinality) WHERE o.ordinality<=x.indnkeyatts)=ARRAY[0,0]::smallint[] AND (SELECT array_agg(ic.opclass_oid ORDER BY ic.ordinality) FROM unnest(x.indclass) WITH ORDINALITY ic(opclass_oid,ordinality) WHERE ic.ordinality<=x.indnkeyatts)=(SELECT array_agg(opc.oid ORDER BY k.ordinality) FROM unnest(x.indkey) WITH ORDINALITY k(attnum,ordinality) JOIN pg_attribute a ON a.attrelid=x.indrelid AND a.attnum=k.attnum JOIN pg_opclass opc ON opc.opcmethod=(SELECT oid FROM pg_am WHERE amname='btree') AND opc.opcintype=a.atttypid AND opc.opcdefault WHERE k.ordinality<=x.indnkeyatts);
-    IF valid_count <> 1 THEN RAISE EXCEPTION 'Cannot apply 0010_upload_created_index: locked index validation failure'; END IF;
-    EXECUTE format('COMMENT ON INDEX %I.%I IS %L', target_schema,
+    SELECT pg_catalog.count(*) INTO valid_count FROM pg_catalog.pg_class i JOIN pg_catalog.pg_namespace ins ON ins.oid=i.relnamespace JOIN pg_catalog.pg_index x ON x.indexrelid=i.oid JOIN pg_catalog.pg_class t ON t.oid=x.indrelid JOIN pg_catalog.pg_namespace tns ON tns.oid=t.relnamespace JOIN pg_catalog.pg_am am ON am.oid=i.relam WHERE i.oid=index_oid AND ins.nspname=target_schema AND x.indrelid=target_oid AND ins.oid=tns.oid AND t.relname='upload_requests' AND pg_catalog.obj_description(i.oid,'pg_class') IS NULL AND x.indnkeyatts=2 AND x.indnatts=2 AND am.amname='btree' AND NOT x.indisunique AND NOT x.indisexclusion AND x.indpred IS NULL AND x.indexprs IS NULL AND x.indisvalid AND x.indisready AND (SELECT pg_catalog.array_agg(a.attname ORDER BY k.ordinality) FROM pg_catalog.unnest(x.indkey) WITH ORDINALITY k(attnum,ordinality) JOIN pg_catalog.pg_attribute a ON a.attrelid=x.indrelid AND a.attnum=k.attnum WHERE k.ordinality<=x.indnkeyatts)=ARRAY['created_at','id']::pg_catalog.name[] AND (SELECT pg_catalog.array_agg(o.option ORDER BY o.ordinality) FROM pg_catalog.unnest(x.indoption) WITH ORDINALITY o(option,ordinality) WHERE o.ordinality<=x.indnkeyatts)=ARRAY[0,0]::pg_catalog.smallint[] AND (SELECT pg_catalog.array_agg(ic.opclass_oid ORDER BY ic.ordinality) FROM pg_catalog.unnest(x.indclass) WITH ORDINALITY ic(opclass_oid,ordinality) WHERE ic.ordinality<=x.indnkeyatts)=(SELECT pg_catalog.array_agg(opc.oid ORDER BY k.ordinality) FROM pg_catalog.unnest(x.indkey) WITH ORDINALITY k(attnum,ordinality) JOIN pg_catalog.pg_attribute a ON a.attrelid=x.indrelid AND a.attnum=k.attnum JOIN pg_catalog.pg_opclass opc ON opc.opcmethod=(SELECT oid FROM pg_catalog.pg_am WHERE amname='btree') AND opc.opcintype=a.atttypid AND opc.opcdefault WHERE k.ordinality<=x.indnkeyatts);
+    IF valid_count  OPERATOR(pg_catalog.<>)  1 THEN RAISE EXCEPTION 'Cannot apply 0010_upload_created_index: locked index validation failure'; END IF;
+    EXECUTE pg_catalog.format('COMMENT ON INDEX %I.%I IS %L', target_schema,
                    temporary_name, '{_INDEX_OWNERSHIP_MARKER}');
-    EXECUTE format('ALTER INDEX %I.%I RENAME TO %I', target_schema,
+    EXECUTE pg_catalog.format('ALTER INDEX %I.%I RENAME TO %I', target_schema,
                    temporary_name, 'ix_upload_requests_created_id');
   END IF;
-  IF obj_description(index_oid, 'pg_class') IS DISTINCT FROM '{_INDEX_OWNERSHIP_MARKER}' THEN
+  IF pg_catalog.obj_description(index_oid, 'pg_class') IS DISTINCT FROM '{_INDEX_OWNERSHIP_MARKER}' THEN
     RAISE EXCEPTION 'Cannot apply 0010_upload_created_index: ownership marker was not stored for index ix_upload_requests_created_id';
   END IF;
 END $$;
@@ -438,12 +438,22 @@ END $$;
 def _offline_downgrade_sql() -> str:
     return """
 DO $$
-DECLARE candidate_count integer; candidate_schema text; candidate_schemas text;
+DECLARE candidate_count pg_catalog.integer; candidate_schema pg_catalog.text; candidate_schemas pg_catalog.text; candidate_oid pg_catalog.oid; temporary_name pg_catalog.text;
 BEGIN
-  SELECT count(*), min(ins.nspname), string_agg(format('%I', ins.nspname), ', ' ORDER BY ins.nspname) INTO candidate_count, candidate_schema, candidate_schemas FROM pg_class i JOIN pg_namespace ins ON ins.oid = i.relnamespace JOIN pg_index x ON x.indexrelid = i.oid JOIN pg_class t ON t.oid = x.indrelid JOIN pg_namespace tns ON tns.oid = t.relnamespace JOIN pg_am am ON am.oid = i.relam WHERE i.relname = 'ix_upload_requests_created_id' AND ins.oid = tns.oid AND t.relname = 'upload_requests' AND t.relkind IN ('r', 'p') AND left(ins.nspname, 3) <> 'pg_' AND ins.nspname <> 'information_schema' AND obj_description(i.oid, 'pg_class') = 'yd_upd_approver:alembic:0010_upload_created_index' AND x.indnkeyatts = 2 AND x.indnatts = 2 AND am.amname = 'btree' AND NOT x.indisunique AND NOT x.indisexclusion AND x.indpred IS NULL AND x.indexprs IS NULL AND x.indisvalid AND x.indisready AND (SELECT array_agg(a.attname ORDER BY k.ordinality) FROM unnest(x.indkey) WITH ORDINALITY AS k(attnum, ordinality) JOIN pg_attribute a ON a.attrelid = x.indrelid AND a.attnum = k.attnum WHERE k.ordinality <= x.indnkeyatts) = ARRAY['created_at', 'id']::name[] AND (SELECT array_agg(o.option ORDER BY o.ordinality) FROM unnest(x.indoption) WITH ORDINALITY AS o(option, ordinality) WHERE o.ordinality <= x.indnkeyatts) = ARRAY[0, 0]::smallint[] AND (SELECT array_agg(ic.opclass_oid ORDER BY ic.ordinality) FROM unnest(x.indclass) WITH ORDINALITY AS ic(opclass_oid, ordinality) WHERE ic.ordinality <= x.indnkeyatts) = (SELECT array_agg(opc.oid ORDER BY k.ordinality) FROM unnest(x.indkey) WITH ORDINALITY AS k(attnum, ordinality) JOIN pg_attribute a ON a.attrelid=x.indrelid AND a.attnum=k.attnum JOIN pg_opclass opc ON opc.opcmethod=(SELECT oid FROM pg_am WHERE amname='btree') AND opc.opcintype=a.atttypid AND opc.opcdefault WHERE k.ordinality <= x.indnkeyatts);
+  SELECT pg_catalog.count(*), pg_catalog.min(ins.nspname), pg_catalog.string_agg(pg_catalog.format('%I', ins.nspname), ', ' ORDER BY ins.nspname) INTO candidate_count, candidate_schema, candidate_schemas FROM pg_catalog.pg_class i JOIN pg_catalog.pg_namespace ins ON ins.oid = i.relnamespace JOIN pg_catalog.pg_index x ON x.indexrelid = i.oid JOIN pg_catalog.pg_class t ON t.oid = x.indrelid JOIN pg_catalog.pg_namespace tns ON tns.oid = t.relnamespace JOIN pg_catalog.pg_am am ON am.oid = i.relam WHERE i.relname = 'ix_upload_requests_created_id' AND ins.oid = tns.oid AND t.relname = 'upload_requests' AND t.relkind IN ('r', 'p') AND pg_catalog.left(ins.nspname, 3)  OPERATOR(pg_catalog.<>)  'pg_' AND ins.nspname  OPERATOR(pg_catalog.<>)  'information_schema' AND pg_catalog.obj_description(i.oid, 'pg_class') = 'yd_upd_approver:alembic:0010_upload_created_index' AND x.indnkeyatts = 2 AND x.indnatts = 2 AND am.amname = 'btree' AND NOT x.indisunique AND NOT x.indisexclusion AND x.indpred IS NULL AND x.indexprs IS NULL AND x.indisvalid AND x.indisready AND (SELECT pg_catalog.array_agg(a.attname ORDER BY k.ordinality) FROM pg_catalog.unnest(x.indkey) WITH ORDINALITY AS k(attnum, ordinality) JOIN pg_catalog.pg_attribute a ON a.attrelid = x.indrelid AND a.attnum = k.attnum WHERE k.ordinality <= x.indnkeyatts) = ARRAY['created_at', 'id']::pg_catalog.name[] AND (SELECT pg_catalog.array_agg(o.option ORDER BY o.ordinality) FROM pg_catalog.unnest(x.indoption) WITH ORDINALITY AS o(option, ordinality) WHERE o.ordinality <= x.indnkeyatts) = ARRAY[0, 0]::pg_catalog.smallint[] AND (SELECT pg_catalog.array_agg(ic.opclass_oid ORDER BY ic.ordinality) FROM pg_catalog.unnest(x.indclass) WITH ORDINALITY AS ic(opclass_oid, ordinality) WHERE ic.ordinality <= x.indnkeyatts) = (SELECT pg_catalog.array_agg(opc.oid ORDER BY k.ordinality) FROM pg_catalog.unnest(x.indkey) WITH ORDINALITY AS k(attnum, ordinality) JOIN pg_catalog.pg_attribute a ON a.attrelid=x.indrelid AND a.attnum=k.attnum JOIN pg_catalog.pg_opclass opc ON opc.opcmethod=(SELECT oid FROM pg_catalog.pg_am WHERE amname='btree') AND opc.opcintype=a.atttypid AND opc.opcdefault WHERE k.ordinality <= x.indnkeyatts);
   IF candidate_count = 0 THEN RAISE EXCEPTION 'Cannot downgrade 0010_upload_created_index: no compatible managed index was found'; END IF;
   IF candidate_count > 1 THEN RAISE EXCEPTION 'Cannot downgrade 0010_upload_created_index: ambiguous compatible indexes in schemas: %', candidate_schemas; END IF;
-  EXECUTE format('DROP INDEX %I.%I', candidate_schema, 'ix_upload_requests_created_id');
+  SELECT i.oid INTO STRICT candidate_oid FROM pg_catalog.pg_class i
+    JOIN pg_catalog.pg_namespace n ON n.oid = i.relnamespace
+    WHERE n.nspname = candidate_schema AND i.relname = 'ix_upload_requests_created_id';
+  temporary_name := '__yd_0010_drop_' || candidate_oid::pg_catalog.text;
+  EXECUTE pg_catalog.format('ALTER INDEX %I.%I RENAME TO %I', candidate_schema,
+                            'ix_upload_requests_created_id', temporary_name);
+  IF pg_catalog.obj_description(candidate_oid, 'pg_class') IS DISTINCT FROM
+       'yd_upd_approver:alembic:0010_upload_created_index' THEN
+    RAISE EXCEPTION 'Cannot downgrade 0010_upload_created_index: locked index validation failure';
+  END IF;
+  EXECUTE pg_catalog.format('DROP INDEX %I.%I', candidate_schema, temporary_name);
 END $$;
 """
 
@@ -480,4 +490,23 @@ def downgrade() -> None:
             f"Cannot downgrade {revision}: ambiguous compatible indexes in schemas: {schemas}."
         )
     candidate = candidates[0]
-    op.drop_index(_INDEX_NAME, table_name=candidate.table_name, schema=candidate.schema)
+    target = _resolve_target_table()
+    if not _matches_expected_index(candidate, target):
+        raise RuntimeError(f"Cannot downgrade {revision}: incompatible managed index target.")
+    # Rename locks this exact relation until the migration transaction ends.  Re-read
+    # by OID after lock acquisition so a concurrent DROP/recreate or COMMENT cannot
+    # make us remove a different object merely reusing the managed name.
+    temporary_name = f"__yd_0010_drop_{candidate.index_oid}"
+    qualified = f"{_quote_identifier(candidate.schema)}.{_quote_identifier(_INDEX_NAME)}"
+    temporary = f"{_quote_identifier(candidate.schema)}.{_quote_identifier(temporary_name)}"
+    op.execute(text(f"ALTER INDEX {qualified} RENAME TO {_quote_identifier(temporary_name)}"))
+    locked_rows = _index_rows(
+        "index_class.oid = :index_oid", {"index_oid": candidate.index_oid}, require_name=False
+    )
+    if (
+        len(locked_rows) != 1
+        or not _matches_expected_index(locked_rows[0], target)
+        or locked_rows[0].ownership_comment != _INDEX_OWNERSHIP_MARKER
+    ):
+        raise RuntimeError(f"Cannot downgrade {revision}: locked index validation failure.")
+    op.execute(text(f"DROP INDEX {temporary}"))

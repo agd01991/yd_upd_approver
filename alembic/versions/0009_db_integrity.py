@@ -25,6 +25,18 @@ BEGIN
                pg_catalog.array_agg(a.attname::pg_catalog.text ORDER BY k.ordinality)
                    FILTER (WHERE k.ordinality OPERATOR(pg_catalog.<=)
                                  x.indnkeyatts::pg_catalog.int8) AS key_columns,
+               pg_catalog.array_agg(a.atttypid ORDER BY k.ordinality)
+                   FILTER (WHERE k.ordinality OPERATOR(pg_catalog.<=)
+                                 x.indnkeyatts::pg_catalog.int8) AS key_type_oids,
+               pg_catalog.array_agg(o.option ORDER BY k.ordinality)
+                   FILTER (WHERE k.ordinality OPERATOR(pg_catalog.<=)
+                                 x.indnkeyatts::pg_catalog.int8) AS key_options,
+               pg_catalog.array_agg(opc.oid ORDER BY k.ordinality)
+                   FILTER (WHERE k.ordinality OPERATOR(pg_catalog.<=)
+                                 x.indnkeyatts::pg_catalog.int8) AS key_opclasses,
+               pg_catalog.array_agg(default_opc.oid ORDER BY k.ordinality)
+                   FILTER (WHERE k.ordinality OPERATOR(pg_catalog.<=)
+                                 x.indnkeyatts::pg_catalog.int8) AS default_opclasses,
                pg_catalog.bool_or(x.indisunique) AS is_unique,
                pg_catalog.bool_or(x.indpred IS NOT NULL) AS is_partial,
                pg_catalog.bool_or(x.indexprs IS NOT NULL) AS is_expression,
@@ -40,6 +52,15 @@ BEGIN
         JOIN pg_catalog.pg_attribute AS a
           ON a.attrelid OPERATOR(pg_catalog.=) x.indrelid
          AND a.attnum OPERATOR(pg_catalog.=) k.attnum
+        JOIN LATERAL pg_catalog.unnest(x.indoption) WITH ORDINALITY AS o(option, ordinality)
+          ON o.ordinality OPERATOR(pg_catalog.=) k.ordinality
+        JOIN LATERAL pg_catalog.unnest(x.indclass) WITH ORDINALITY AS ic(opclass_oid, ordinality)
+          ON ic.ordinality OPERATOR(pg_catalog.=) k.ordinality
+        JOIN pg_catalog.pg_opclass AS opc ON opc.oid OPERATOR(pg_catalog.=) ic.opclass_oid
+        JOIN pg_catalog.pg_opclass AS default_opc
+          ON default_opc.opcmethod OPERATOR(pg_catalog.=) am.oid
+         AND default_opc.opcintype OPERATOR(pg_catalog.=) a.atttypid
+         AND default_opc.opcdefault
         WHERE i.relname OPERATOR(pg_catalog.=) ANY (
             ARRAY['ix_upload_requests_user_created_id',
                   'ix_upload_requests_status_created_id']::pg_catalog.name[])
@@ -60,6 +81,13 @@ BEGIN
                     'ix_upload_requests_user_created_id'::pg_catalog.name
                 AND anchor.key_columns OPERATOR(pg_catalog.=)
                     ARRAY['user_id', 'created_at', 'id']::pg_catalog.text[]
+                AND anchor.key_type_oids OPERATOR(pg_catalog.=)
+                    ARRAY['pg_catalog.int4'::pg_catalog.regtype::pg_catalog.oid,
+                          'pg_catalog.timestamptz'::pg_catalog.regtype::pg_catalog.oid,
+                          'pg_catalog.int4'::pg_catalog.regtype::pg_catalog.oid]::pg_catalog.oid[]
+                AND anchor.key_options OPERATOR(pg_catalog.=)
+                    ARRAY[0, 0, 0]::pg_catalog.int2[]
+                AND anchor.key_opclasses OPERATOR(pg_catalog.=) anchor.default_opclasses
                 AND anchor.key_count OPERATOR(pg_catalog.=) 3
                 AND anchor.total_count OPERATOR(pg_catalog.=) 3
                 AND anchor.amname OPERATOR(pg_catalog.=) 'btree'::pg_catalog.name
@@ -74,6 +102,26 @@ BEGIN
                     'ix_upload_requests_status_created_id'::pg_catalog.name
                 AND anchor.key_columns OPERATOR(pg_catalog.=)
                     ARRAY['status', 'created_at', 'id']::pg_catalog.text[]
+                AND anchor.key_type_oids OPERATOR(pg_catalog.=)
+                    ARRAY[(SELECT typ.oid FROM pg_catalog.pg_type AS typ
+                           JOIN pg_catalog.pg_namespace AS enum_ns
+                             ON enum_ns.oid OPERATOR(pg_catalog.=) typ.typnamespace
+                           WHERE typ.typname OPERATOR(pg_catalog.=) 'uploadstatus'::pg_catalog.name
+                             AND typ.typtype OPERATOR(pg_catalog.=) 'e'::pg_catalog."char"
+                             AND pg_catalog.left(enum_ns.nspname::pg_catalog.text, 3)
+                                   OPERATOR(pg_catalog.<>) 'pg_'
+                             AND enum_ns.nspname OPERATOR(pg_catalog.<>)
+                                   'information_schema'::pg_catalog.name
+                             AND (SELECT pg_catalog.array_agg(e.enumlabel::pg_catalog.text
+                                                            ORDER BY e.enumsortorder)
+                                  FROM pg_catalog.pg_enum AS e
+                                  WHERE e.enumtypid OPERATOR(pg_catalog.=) typ.oid)
+                                   OPERATOR(pg_catalog.=) ARRAY['new','stored','pending_approval','approved','uploading','uploaded','rejected','failed','cancelled','deleted_temp']::pg_catalog.text[]),
+                          'pg_catalog.timestamptz'::pg_catalog.regtype::pg_catalog.oid,
+                          'pg_catalog.int4'::pg_catalog.regtype::pg_catalog.oid]::pg_catalog.oid[]
+                AND anchor.key_options OPERATOR(pg_catalog.=)
+                    ARRAY[0, 0, 0]::pg_catalog.int2[]
+                AND anchor.key_opclasses OPERATOR(pg_catalog.=) anchor.default_opclasses
                 AND anchor.key_count OPERATOR(pg_catalog.=) 3
                 AND anchor.total_count OPERATOR(pg_catalog.=) 3
                 AND anchor.amname OPERATOR(pg_catalog.=) 'btree'::pg_catalog.name

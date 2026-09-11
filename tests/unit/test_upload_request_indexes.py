@@ -14,71 +14,24 @@ from app.db.models import UploadRequest
 
 def test_manual_qa_upload_index_query_uses_explicit_application_schema() -> None:
     manual_qa = Path("docs/MANUAL_QA.md").read_text()
-    first_placeholder = manual_qa.index("REPLACE_WITH_APPLICATION_SCHEMA")
-    placeholder_offset = manual_qa.index("REPLACE_WITH_APPLICATION_SCHEMA", first_placeholder + 1)
-    query_start = manual_qa.rindex("```sql", 0, placeholder_offset) + len("```sql")
-    query = manual_qa[query_start : manual_qa.index("```", placeholder_offset)]
+    block_start = manual_qa.index("<!-- upload-index-managed-signature-sql:start -->")
+    block_end = manual_qa.index("<!-- upload-index-managed-signature-sql:end -->", block_start)
+    query_start = manual_qa.index("```sql", block_start, block_end) + len("```sql")
+    query_end = manual_qa.index("```", query_start, block_end)
+    query = manual_qa[query_start:query_end]
 
-    assert "to_regclass('upload_requests')" not in query
-    assert "upload_requests'::regclass" not in query
     assert "REPLACE_WITH_APPLICATION_SCHEMA" in query
-    assert "JOIN pg_catalog.pg_namespace AS table_namespace" in query
-    assert "JOIN pg_catalog.pg_class AS table_class" in query
-    assert "JOIN pg_catalog.pg_index AS index_definition" in query
-    assert "JOIN pg_catalog.pg_class AS index_class" in query
-    assert "JOIN pg_catalog.pg_attribute AS attribute" in query
-    assert "pg_catalog.array_agg" in query
-    assert "pg_catalog.unnest" in query
-    assert "pg_catalog.pg_get_indexdef" in query
-    assert "pg_catalog.obj_description" in query
-    for catalog_relation in ("pg_namespace", "pg_class", "pg_index", "pg_attribute"):
-        assert not re.search(
-            rf"\bJOIN\s+(?!pg_catalog\.){catalog_relation}\b", query, re.IGNORECASE
-        )
-    for catalog_function in ("array_agg", "unnest", "pg_get_indexdef", "obj_description"):
-        assert not re.search(rf"(?<!pg_catalog\.)\b{catalog_function}\s*\(", query, re.IGNORECASE)
-    equality_predicates = (
-        "table_namespace.nspname OPERATOR(pg_catalog.=) qa_parameters.application_schema",
-        "table_class.relnamespace OPERATOR(pg_catalog.=) table_namespace.oid",
-        "table_class.relname OPERATOR(pg_catalog.=) 'upload_requests'::pg_catalog.name",
-        "table_class.relkind OPERATOR(pg_catalog.=) 'r'::pg_catalog.\"char\"",
-        "table_class.relkind OPERATOR(pg_catalog.=) 'p'::pg_catalog.\"char\"",
-        "index_definition.indrelid OPERATOR(pg_catalog.=) target_table.oid",
-        "index_class.oid OPERATOR(pg_catalog.=) index_definition.indexrelid",
-        "index_class.relnamespace OPERATOR(pg_catalog.=) target_table.relnamespace",
-        "attribute.attrelid OPERATOR(pg_catalog.=) target_table.oid",
-        "attribute.attnum OPERATOR(pg_catalog.=) key.attnum",
-        "index_class.relname OPERATOR(pg_catalog.=)",
-    )
-    for predicate in equality_predicates:
-        assert predicate in query
-    assert query.count("OPERATOR(pg_catalog.=)") == 11
-    assert query.count("OPERATOR(pg_catalog.<=)") == 1
-    assert (
-        "key.ordinality OPERATOR(pg_catalog.<=) index_definition.indnkeyatts::pg_catalog.int8"
-    ) in query
-    operators_removed = query.replace("OPERATOR(pg_catalog.=)", "").replace(
-        "OPERATOR(pg_catalog.<=)", ""
-    )
-    assert not re.search(r"(?<![<>=!])=(?!=)", operators_removed)
-    assert not re.search(r"(?<!<)<=(?!=)", operators_removed)
-    assert not re.search(r"\brelkind\s+IN\s*\(", query, re.IGNORECASE)
-    assert "'REPLACE_WITH_APPLICATION_SCHEMA'::pg_catalog.name" in query
-    assert "'ix_upload_requests_created_id'::pg_catalog.name" in query
-    assert '::pg_catalog."char"' in query
-    assert "::pg_catalog.int8" in query
-    assert "target_table.nspname::pg_catalog.text AS application_schema" in query
-    assert "index_class.relname::pg_catalog.text AS index_name" in query
-    key_columns_aggregate = re.search(
-        r"pg_catalog\.array_agg\(\s*"
-        r"attribute\.attname::pg_catalog\.text\s+"
-        r"ORDER BY key\.ordinality\s*\) AS key_columns",
-        query,
-    )
-    assert key_columns_aggregate is not None
-    assert "array_agg(attribute.attname ORDER BY key.ordinality)" not in query
-    assert "pg_catalog.obj_description(index_class.oid, 'pg_class') AS ownership_comment" in query
-    assert "yd_upd_approver:alembic:0010_upload_created_index" in manual_qa
+    assert "to_regclass('upload_requests')" not in query
+    for relation in ("pg_namespace", "pg_class", "pg_index", "pg_attribute", "pg_opclass"):
+        assert not re.search(rf"\bJOIN\s+(?!pg_catalog\.){relation}\b", query, re.IGNORECASE)
+    for function in ("array_agg", "unnest", "pg_get_indexdef", "obj_description"):
+        assert not re.search(rf"(?<!pg_catalog\.)\b{function}\s*\(", query, re.IGNORECASE)
+    assert "AS qa_pass" in query
+    assert "actual_opclasses OPERATOR(pg_catalog.=) default_opclasses" in query
+    assert "joined_key_count OPERATOR(pg_catalog.=) 2" in query
+    assert "ARRAY['created_at','id']::pg_catalog.text[]" in query
+    assert "ARRAY[0,0]::pg_catalog.int2[]" in query
+    assert "yd_upd_approver:alembic:0010_upload_created_index" in query
 
 
 @pytest.fixture(autouse=True)
@@ -122,20 +75,20 @@ def test_anchor_opclasses_are_validated_from_ordered_catalog_oids() -> None:
 
     assert "unnest(x.indclass) WITH ORDINALITY" in sql
     assert "ic.ordinality = k.ordinality" in sql
-    assert "LEFT JOIN pg_opclass opc ON opc.oid = ic.opclass_oid" in sql
+    assert "LEFT JOIN pg_catalog.pg_opclass opc ON opc.oid = ic.opclass_oid" in sql
     assert "opc.opcmethod = am.oid AND opc.opcdefault" in sql
     assert "opc.opcintype = a.atttypid" in sql
     assert "typ.typtype = 'e'" in sql
-    assert "opc.opcintype = 'pg_catalog.anyenum'::regtype" in sql
+    assert "opc.opcintype = 'pg_catalog.anyenum'::pg_catalog.regtype" in sql
     assert "count(*) = x.indnkeyatts" in sql
-    assert "COALESCE(bool_and" in sql
+    assert "COALESCE(pg_catalog.bool_and" in sql
     assert "enum_ops" not in sql
     assert "array_agg(a.atttypid ORDER BY k.ordinality)" in sql
-    assert "'pg_catalog.int4'::regtype::oid" in sql
-    assert "'pg_catalog.timestamptz'::regtype::oid" in sql
+    assert "'pg_catalog.int4'::pg_catalog.regtype::pg_catalog.oid" in sql
+    assert "'pg_catalog.timestamptz'::pg_catalog.regtype::pg_catalog.oid" in sql
     assert "typ.typname = 'uploadstatus'" in sql
     assert "pg_enum enum" in sql and "enum.enumsortorder" in sql
-    assert "array_agg(enum.enumlabel::text ORDER BY enum.enumsortorder)" in sql
+    assert "array_agg(enum.enumlabel::pg_catalog.text ORDER BY enum.enumsortorder)" in sql
     assert "min(typ.oid)" not in sql
     assert "to_regtype('uploadstatus')" not in sql
 
@@ -164,7 +117,7 @@ def test_0010_and_0011_share_independent_ordered_anchor_type_identity() -> None:
     status_sql = migration_0010._expected_anchor_type_oids(("status", "created_at", "id"))
     assert "a.atttypid" not in status_sql
     assert "ARRAY['new','stored','pending_approval'" in status_sql
-    assert "array_agg(enum.enumlabel::text ORDER BY enum.enumsortorder)" in status_sql
+    assert "array_agg(enum.enumlabel::pg_catalog.text ORDER BY enum.enumsortorder)" in status_sql
 
 
 def test_upload_ordering_index_migration_creates_and_validates_global_ordering_index(
@@ -177,7 +130,11 @@ def test_upload_ordering_index_migration_creates_and_validates_global_ordering_i
     lookups = iter((None, _expected_index(migration), _expected_index(migration)))
     monkeypatch.setattr(migration, "_resolve_target_table", lambda: target)
     monkeypatch.setattr(migration, "_find_existing_index", lambda actual_target: next(lookups))
-    monkeypatch.setattr(migration, "_downgrade_candidates", lambda: [_expected_index(migration)])
+    candidate = _expected_index(migration)
+    monkeypatch.setattr(migration, "_downgrade_candidates", lambda: [candidate])
+    monkeypatch.setattr(migration, "_resolve_target_table", lambda: target)
+    monkeypatch.setattr(migration, "_quote_identifier", lambda value: value)
+    monkeypatch.setattr(migration, "_index_rows", lambda *args, **kwargs: [candidate])
 
     migration.upgrade()
     migration.downgrade()
@@ -190,13 +147,12 @@ def test_upload_ordering_index_migration_creates_and_validates_global_ordering_i
             {"schema": "public", "if_not_exists": True},
         )
     ]
-    assert operations.dropped_indexes == [
-        (
-            "ix_upload_requests_created_id",
-            "upload_requests",
-            {"schema": "public"},
-        )
-    ]
+    assert operations.dropped_indexes == []
+    assert any(
+        "ALTER INDEX public.ix_upload_requests_created_id RENAME TO" in str(sql)
+        for sql in operations.executed
+    )
+    assert any("DROP INDEX public.__yd_0010_drop_" in str(sql) for sql in operations.executed)
 
 
 @pytest.mark.parametrize(
@@ -228,19 +184,21 @@ def test_0010_generates_safe_offline_sql_without_database(
     for value in required:
         assert value in result.stdout
     assert "unnest(x.indoption) WITH ORDINALITY" in result.stdout
-    assert "ARRAY[0, 0]::smallint[]" in result.stdout
+    assert "ARRAY[0, 0]::pg_catalog.smallint[]" in result.stdout
     if command[0] == "downgrade":
         assert "t.relkind IN ('r', 'p')" in result.stdout
-        assert "left(ins.nspname, 3) <> 'pg_'" in result.stdout
+        assert (
+            "pg_catalog.left(ins.nspname, 3)  OPERATOR(pg_catalog.<>)  'pg_'" in result.stdout
+        )
         assert "NOT LIKE 'pg_%'" not in result.stdout
         assert (
-            "obj_description(i.oid, 'pg_class') = "
+            "pg_catalog.obj_description(i.oid, 'pg_class') = "
             "'yd_upd_approver:alembic:0010_upload_created_index'"
         ) in result.stdout
     else:
         for columns in (
-            "ARRAY['user_id','created_at','id']::name[]",
-            "ARRAY['status','created_at','id']::name[]",
+            "ARRAY['user_id','created_at','id']::pg_catalog.name[]",
+            "ARRAY['status','created_at','id']::pg_catalog.name[]",
         ):
             assert columns in result.stdout
         for predicate in (
@@ -253,7 +211,7 @@ def test_0010_generates_safe_offline_sql_without_database(
             "NOT x.indisexclusion",
             "x.indisvalid",
             "x.indisready",
-            "ARRAY[0,0,0]::smallint[]",
+            "ARRAY[0,0,0]::pg_catalog.smallint[]",
             "unnest(x.indclass)",
             "opc.opcdefault",
             "i.relnamespace=c.relnamespace",
