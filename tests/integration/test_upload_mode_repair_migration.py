@@ -39,9 +39,10 @@ INDEX_OWNERSHIP_MARKER = "yd_upd_approver:alembic:0010_upload_created_index"
 
 def _manual_qa_upload_index_sql(application_schema: str) -> str:
     manual_qa = Path("docs/MANUAL_QA.md").read_text()
-    first_placeholder = manual_qa.index("REPLACE_WITH_APPLICATION_SCHEMA")
-    placeholder_offset = manual_qa.index("REPLACE_WITH_APPLICATION_SCHEMA", first_placeholder + 1)
-    query_start = manual_qa.rindex("```sql", 0, placeholder_offset) + len("```sql")
+    block_start = manual_qa.index("<!-- upload-index-managed-signature-sql:start -->")
+    block_end = manual_qa.index("<!-- upload-index-managed-signature-sql:end -->", block_start)
+    query_start = manual_qa.index("```sql", block_start, block_end) + len("```sql")
+    placeholder_offset = manual_qa.index("REPLACE_WITH_APPLICATION_SCHEMA", query_start, block_end)
     query_end = manual_qa.index("```", placeholder_offset)
     return manual_qa[query_start:query_end].replace(
         "REPLACE_WITH_APPLICATION_SCHEMA", application_schema
@@ -1006,6 +1007,8 @@ def test_manual_qa_upload_index_query_ignores_shadow_search_path(migration_db):
             assert row.index_oid != shadow_index_oid
             assert row.index_name == "ix_upload_requests_created_id"
             assert list(row.key_columns) == ["created_at", "id"]
+            assert list(row.key_options) == ["0", "0"]
+            assert row.qa_pass is True
             assert "CREATE INDEX ix_upload_requests_created_id" in row.index_definition
             assert "shadow index definition" not in row.index_definition
             assert row.ownership_comment == INDEX_OWNERSHIP_MARKER

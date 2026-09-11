@@ -20,20 +20,20 @@ def test_anchor_opclasses_are_validated_from_ordered_catalog_oids() -> None:
 
     assert "unnest(x.indclass) WITH ORDINALITY" in sql
     assert "ic.ordinality = k.ordinality" in sql
-    assert "LEFT JOIN pg_opclass opc ON opc.oid = ic.opclass_oid" in sql
+    assert "LEFT JOIN pg_catalog.pg_opclass opc ON opc.oid = ic.opclass_oid" in sql
     assert "opc.opcmethod = am.oid AND opc.opcdefault" in sql
     assert "opc.opcintype = a.atttypid" in sql
     assert "typ.typtype = 'e'" in sql
-    assert "opc.opcintype = 'pg_catalog.anyenum'::regtype" in sql
+    assert "opc.opcintype = 'pg_catalog.anyenum'::pg_catalog.regtype" in sql
     assert "count(*) = x.indnkeyatts" in sql
-    assert "COALESCE(bool_and" in sql
+    assert "COALESCE(pg_catalog.bool_and" in sql
     assert "enum_ops" not in sql
     assert "array_agg(a.atttypid ORDER BY k.ordinality)" in sql
-    assert "'pg_catalog.int4'::regtype::oid" in sql
-    assert "'pg_catalog.timestamptz'::regtype::oid" in sql
+    assert "'pg_catalog.int4'::pg_catalog.regtype::pg_catalog.oid" in sql
+    assert "'pg_catalog.timestamptz'::pg_catalog.regtype::pg_catalog.oid" in sql
     assert "typ.typname = 'uploadstatus'" in sql
     assert "pg_enum enum" in sql and "enum.enumsortorder" in sql
-    assert "array_agg(enum.enumlabel::text ORDER BY enum.enumsortorder)" in sql
+    assert "array_agg(enum.enumlabel::pg_catalog.text ORDER BY enum.enumsortorder)" in sql
     assert "min(typ.oid)" not in sql
     assert "to_regtype('uploadstatus')" not in sql
 
@@ -78,6 +78,30 @@ class Operations:
         self.executed.append(str(statement))
 
 
+def test_rows_formats_sql_and_executes_it(monkeypatch) -> None:  # noqa: ANN001
+    migration = _migration()
+    calls = []
+
+    class Result:
+        def mappings(self):
+            return self
+
+        def all(self):
+            return []
+
+    class Bind:
+        def execute(self, statement, parameters):  # noqa: ANN001
+            calls.append((str(statement), parameters))
+            return Result()
+
+    monkeypatch.setattr(migration.op, "get_bind", lambda: Bind())
+
+    assert migration._rows("i.oid = :index_oid", {"index_oid": 84}) == []
+    assert len(calls) == 1
+    assert "WHERE i.oid = :index_oid" in calls[0][0]
+    assert calls[0][1] == {"index_oid": 84}
+
+
 def test_marker_matches_revision_0010() -> None:
     migration = _migration()
     old = (
@@ -90,7 +114,7 @@ def test_marker_matches_revision_0010() -> None:
 
 def test_online_catalog_query_casts_table_relkind_to_text() -> None:
     migration = _migration()
-    assert "t.relkind::text AS table_kind" in migration._INDEX_SELECT
+    assert "t.relkind::pg_catalog.text AS table_kind" in migration._INDEX_SELECT
     assert "t.relkind AS table_kind" not in migration._INDEX_SELECT
 
 
@@ -279,14 +303,14 @@ def test_offline_runtime_sql_has_safe_semantics(command: list[str], is_downgrade
     )
     assert result.returncode == 0, result.stderr
     sql = result.stdout
-    assert "ARRAY[0,0]::smallint[]" in sql
+    assert "ARRAY[0,0]::pg_catalog.int2[]" in sql
     assert "unnest(x.indclass)" in sql
     assert "pg_opclass" in sql and "opc.opcdefault" in sql
     assert "NOT x.indisexclusion" in sql
     assert "pg_description" not in sql
     assert "unnest(x.indoption)" in sql and "WITH ORDINALITY" in sql
     assert "t.relkind IN ('r','p')" in sql
-    assert "left(n.nspname,3)<>'pg_'" in sql
+    assert "pg_catalog.left(n.nspname,3) OPERATOR(pg_catalog.<>) 'pg_'" in sql
     assert "NOT LIKE 'pg_%'" not in sql
     assert "yd_upd_approver:alembic:0010_upload_created_index" in sql
     for name, columns in migration._ANCHOR_SIGNATURES:

@@ -250,53 +250,100 @@ PostgreSQL is the source of truth for durable Telegram notifications. Redis is n
    `REPLACE_WITH_APPLICATION_SCHEMA` with the trusted name of the schema that contains the
    application table (do not infer it from `search_path`):
 
+<!-- upload-index-managed-signature-sql:start -->
 ```sql
 WITH qa_parameters(application_schema) AS (
     VALUES ('REPLACE_WITH_APPLICATION_SCHEMA'::pg_catalog.name)
-),
-target_table AS (
-    SELECT table_class.oid, table_class.relnamespace, table_namespace.nspname
-    FROM qa_parameters
-    JOIN pg_catalog.pg_namespace AS table_namespace
-      ON table_namespace.nspname OPERATOR(pg_catalog.=) qa_parameters.application_schema
-    JOIN pg_catalog.pg_class AS table_class
-      ON table_class.relnamespace OPERATOR(pg_catalog.=) table_namespace.oid
-     AND table_class.relname OPERATOR(pg_catalog.=) 'upload_requests'::pg_catalog.name
-     AND (table_class.relkind OPERATOR(pg_catalog.=) 'r'::pg_catalog."char"
-          OR table_class.relkind OPERATOR(pg_catalog.=) 'p'::pg_catalog."char")
+), target_table AS (
+    SELECT t.oid, t.relnamespace, n.nspname
+    FROM qa_parameters AS q
+    JOIN pg_catalog.pg_namespace AS n
+      ON n.nspname OPERATOR(pg_catalog.=) q.application_schema
+    JOIN pg_catalog.pg_class AS t
+      ON t.relnamespace OPERATOR(pg_catalog.=) n.oid
+     AND t.relname OPERATOR(pg_catalog.=) 'upload_requests'::pg_catalog.name
+     AND (t.relkind OPERATOR(pg_catalog.=) 'r'::pg_catalog."char"
+       OR t.relkind OPERATOR(pg_catalog.=) 'p'::pg_catalog."char")
+), managed_index AS (
+    SELECT t.nspname, t.oid AS table_oid, i.oid AS index_oid,
+           i.relname::pg_catalog.text AS index_name,
+           i.relnamespace AS index_schema_oid, x.indnkeyatts, x.indnatts,
+           am.amname::pg_catalog.text AS access_method,
+           x.indisunique, x.indisexclusion, x.indpred, x.indexprs,
+           x.indisvalid, x.indisready,
+           pg_catalog.pg_get_indexdef(i.oid) AS index_definition,
+           pg_catalog.obj_description(i.oid, 'pg_class') AS ownership_comment,
+           pg_catalog.array_agg(a.attname::pg_catalog.text ORDER BY k.ordinality)
+             FILTER (WHERE k.ordinality OPERATOR(pg_catalog.<=) x.indnkeyatts::pg_catalog.int8)
+             AS key_columns,
+           pg_catalog.array_agg(o.option ORDER BY k.ordinality)
+             FILTER (WHERE k.ordinality OPERATOR(pg_catalog.<=) x.indnkeyatts::pg_catalog.int8)
+             AS key_options,
+           pg_catalog.array_agg(opc.oid ORDER BY k.ordinality)
+             FILTER (WHERE k.ordinality OPERATOR(pg_catalog.<=) x.indnkeyatts::pg_catalog.int8)
+             AS actual_opclasses,
+           pg_catalog.array_agg(default_opc.oid ORDER BY k.ordinality)
+             FILTER (WHERE k.ordinality OPERATOR(pg_catalog.<=) x.indnkeyatts::pg_catalog.int8)
+             AS default_opclasses,
+           pg_catalog.count(*) FILTER
+             (WHERE k.ordinality OPERATOR(pg_catalog.<=) x.indnkeyatts::pg_catalog.int8)
+             AS joined_key_count
+    FROM target_table AS t
+    JOIN pg_catalog.pg_index AS x ON x.indrelid OPERATOR(pg_catalog.=) t.oid
+    JOIN pg_catalog.pg_class AS i
+      ON i.oid OPERATOR(pg_catalog.=) x.indexrelid
+     AND i.relnamespace OPERATOR(pg_catalog.=) t.relnamespace
+     AND i.relname OPERATOR(pg_catalog.=) 'ix_upload_requests_created_id'::pg_catalog.name
+    JOIN pg_catalog.pg_am AS am ON am.oid OPERATOR(pg_catalog.=) i.relam
+    LEFT JOIN LATERAL pg_catalog.unnest(x.indkey) WITH ORDINALITY AS k(attnum, ordinality) ON true
+    LEFT JOIN LATERAL pg_catalog.unnest(x.indoption) WITH ORDINALITY AS o(option, ordinality)
+      ON o.ordinality OPERATOR(pg_catalog.=) k.ordinality
+    LEFT JOIN pg_catalog.pg_attribute AS a
+      ON a.attrelid OPERATOR(pg_catalog.=) x.indrelid
+     AND a.attnum OPERATOR(pg_catalog.=) k.attnum
+    LEFT JOIN LATERAL pg_catalog.unnest(x.indclass) WITH ORDINALITY AS ic(opclass_oid, ordinality)
+      ON ic.ordinality OPERATOR(pg_catalog.=) k.ordinality
+    LEFT JOIN pg_catalog.pg_opclass AS opc ON opc.oid OPERATOR(pg_catalog.=) ic.opclass_oid
+    LEFT JOIN pg_catalog.pg_opclass AS default_opc
+      ON default_opc.opcmethod OPERATOR(pg_catalog.=) am.oid
+     AND default_opc.opcintype OPERATOR(pg_catalog.=) a.atttypid
+     AND default_opc.opcdefault
+    GROUP BY t.nspname, t.oid, i.oid, i.relname, i.relnamespace, x.indnkeyatts,
+             x.indnatts, am.amname, x.indisunique, x.indisexclusion, x.indpred,
+             x.indexprs, x.indisvalid, x.indisready
 )
-SELECT target_table.nspname::pg_catalog.text AS application_schema,
-       target_table.oid AS table_oid,
-       index_class.oid AS index_oid,
-       index_class.relname::pg_catalog.text AS index_name,
-       pg_catalog.array_agg(
-           attribute.attname::pg_catalog.text
-           ORDER BY key.ordinality
-       ) AS key_columns,
-       pg_catalog.pg_get_indexdef(index_class.oid) AS index_definition,
-       pg_catalog.obj_description(index_class.oid, 'pg_class') AS ownership_comment
-FROM target_table
-JOIN pg_catalog.pg_index AS index_definition
-  ON index_definition.indrelid OPERATOR(pg_catalog.=) target_table.oid
-JOIN pg_catalog.pg_class AS index_class
-  ON index_class.oid OPERATOR(pg_catalog.=) index_definition.indexrelid
- AND index_class.relnamespace OPERATOR(pg_catalog.=) target_table.relnamespace
-JOIN LATERAL pg_catalog.unnest(index_definition.indkey)
-  WITH ORDINALITY AS key(attnum, ordinality)
-  ON key.ordinality OPERATOR(pg_catalog.<=) index_definition.indnkeyatts::pg_catalog.int8
-JOIN pg_catalog.pg_attribute AS attribute
-  ON attribute.attrelid OPERATOR(pg_catalog.=) target_table.oid
- AND attribute.attnum OPERATOR(pg_catalog.=) key.attnum
-WHERE index_class.relname OPERATOR(pg_catalog.=)
-      'ix_upload_requests_created_id'::pg_catalog.name
-GROUP BY target_table.nspname, target_table.oid, index_class.oid, index_class.relname;
+SELECT nspname::pg_catalog.text AS application_schema, table_oid, index_oid, index_name,
+       index_definition, ownership_comment, key_columns,
+       key_options::pg_catalog.text[] AS key_options,
+       actual_opclasses, default_opclasses, access_method, indnkeyatts AS key_count,
+       indnatts AS total_column_count, indisunique, indisexclusion,
+       (indpred IS NULL) AS is_not_partial, (indexprs IS NULL) AS is_not_expression,
+       indisvalid, indisready,
+       (index_schema_oid OPERATOR(pg_catalog.=)
+          (SELECT relnamespace FROM target_table)
+        AND joined_key_count OPERATOR(pg_catalog.=) 2
+        AND indnkeyatts OPERATOR(pg_catalog.=) 2
+        AND indnatts OPERATOR(pg_catalog.=) 2
+        AND key_columns OPERATOR(pg_catalog.=) ARRAY['created_at','id']::pg_catalog.text[]
+        AND key_options OPERATOR(pg_catalog.=) ARRAY[0,0]::pg_catalog.int2[]
+        AND actual_opclasses OPERATOR(pg_catalog.=) default_opclasses
+        AND pg_catalog.cardinality(actual_opclasses) OPERATOR(pg_catalog.=) 2
+        AND access_method OPERATOR(pg_catalog.=) 'btree'::pg_catalog.text
+        AND NOT indisunique AND NOT indisexclusion
+        AND indpred IS NULL AND indexprs IS NULL AND indisvalid AND indisready
+        AND ownership_comment OPERATOR(pg_catalog.=)
+          'yd_upd_approver:alembic:0010_upload_created_index'::pg_catalog.text) AS qa_pass
+FROM managed_index;
 ```
+<!-- upload-index-managed-signature-sql:end -->
 
-The correct result is exactly one row. Confirm that `application_schema` equals the trusted
-schema supplied above, `key_columns` is exactly `(created_at, id)`, and `ownership_comment` is
-exactly `yd_upd_approver:alembic:0010_upload_created_index`. Zero rows, multiple rows, or any
-mismatch is a QA failure: do not proceed with the downgrade. A matching definition without this
-marker is not owned by revision 0010 and will not be removed by its downgrade.
+The correct result is exactly one row whose `application_schema` equals the trusted schema and
+whose `qa_pass` is SQL `TRUE`; every diagnostic field must also match the displayed structural
+contract. Zero or multiple rows, `FALSE`, SQL `NULL`, or any mismatch is a QA failure: do not
+proceed with the downgrade. The query validates the current state of this explicitly named index;
+it neither replaces the migrations' global target/ownership checks nor prevents the object from
+changing between this query and downgrade. A matching definition without the exact marker is not
+owned by revision 0010 and will not be removed by its downgrade.
 
 Revision `0011_upload_index_ownership` is a forward-only ownership backfill for databases that
 had already applied the original, unmarked revision `0010`. It identifies the application table
