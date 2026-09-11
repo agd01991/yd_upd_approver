@@ -78,6 +78,30 @@ class Operations:
         self.executed.append(str(statement))
 
 
+def test_rows_formats_sql_and_executes_it(monkeypatch) -> None:  # noqa: ANN001
+    migration = _migration()
+    calls = []
+
+    class Result:
+        def mappings(self):
+            return self
+
+        def all(self):
+            return []
+
+    class Bind:
+        def execute(self, statement, parameters):  # noqa: ANN001
+            calls.append((str(statement), parameters))
+            return Result()
+
+    monkeypatch.setattr(migration.op, "get_bind", lambda: Bind())
+
+    assert migration._rows("i.oid = :index_oid", {"index_oid": 84}) == []
+    assert len(calls) == 1
+    assert "WHERE i.oid = :index_oid" in calls[0][0]
+    assert calls[0][1] == {"index_oid": 84}
+
+
 def test_marker_matches_revision_0010() -> None:
     migration = _migration()
     old = (
@@ -279,7 +303,7 @@ def test_offline_runtime_sql_has_safe_semantics(command: list[str], is_downgrade
     )
     assert result.returncode == 0, result.stderr
     sql = result.stdout
-    assert "ARRAY[0,0]::pg_catalog.smallint[]" in sql
+    assert "ARRAY[0,0]::pg_catalog.int2[]" in sql
     assert "unnest(x.indclass)" in sql
     assert "pg_opclass" in sql and "opc.opcdefault" in sql
     assert "NOT x.indisexclusion" in sql

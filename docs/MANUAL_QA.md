@@ -313,7 +313,8 @@ WITH qa_parameters(application_schema) AS (
              x.indexprs, x.indisvalid, x.indisready
 )
 SELECT nspname::pg_catalog.text AS application_schema, table_oid, index_oid, index_name,
-       index_definition, ownership_comment, key_columns, key_options,
+       index_definition, ownership_comment, key_columns,
+       key_options::pg_catalog.text[] AS key_options,
        actual_opclasses, default_opclasses, access_method, indnkeyatts AS key_count,
        indnatts AS total_column_count, indisunique, indisexclusion,
        (indpred IS NULL) AS is_not_partial, (indexprs IS NULL) AS is_not_expression,

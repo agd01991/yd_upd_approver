@@ -134,7 +134,11 @@ def test_upload_ordering_index_migration_creates_and_validates_global_ordering_i
     monkeypatch.setattr(migration, "_downgrade_candidates", lambda: [candidate])
     monkeypatch.setattr(migration, "_resolve_target_table", lambda: target)
     monkeypatch.setattr(migration, "_quote_identifier", lambda value: value)
-    monkeypatch.setattr(migration, "_index_rows", lambda *args, **kwargs: [candidate])
+    monkeypatch.setattr(
+        migration,
+        "_index_rows",
+        lambda *args, **kwargs: [_expected_index(migration, index_name="__yd_0010_drop_84")],
+    )
 
     migration.upgrade()
     migration.downgrade()
@@ -184,12 +188,10 @@ def test_0010_generates_safe_offline_sql_without_database(
     for value in required:
         assert value in result.stdout
     assert "unnest(x.indoption) WITH ORDINALITY" in result.stdout
-    assert "ARRAY[0, 0]::pg_catalog.smallint[]" in result.stdout
+    assert "ARRAY[0, 0]::pg_catalog.int2[]" in result.stdout
     if command[0] == "downgrade":
         assert "t.relkind IN ('r', 'p')" in result.stdout
-        assert (
-            "pg_catalog.left(ins.nspname, 3)  OPERATOR(pg_catalog.<>)  'pg_'" in result.stdout
-        )
+        assert "pg_catalog.left(ins.nspname, 3)  OPERATOR(pg_catalog.<>)  'pg_'" in result.stdout
         assert "NOT LIKE 'pg_%'" not in result.stdout
         assert (
             "pg_catalog.obj_description(i.oid, 'pg_class') = "
@@ -211,7 +213,7 @@ def test_0010_generates_safe_offline_sql_without_database(
             "NOT x.indisexclusion",
             "x.indisvalid",
             "x.indisready",
-            "ARRAY[0,0,0]::pg_catalog.smallint[]",
+            "ARRAY[0,0,0]::pg_catalog.int2[]",
             "unnest(x.indclass)",
             "opc.opcdefault",
             "i.relnamespace=c.relnamespace",
@@ -279,7 +281,7 @@ def test_upgrade_adopts_uncommented_compatible_index(monkeypatch) -> None:  # no
     target = _target(migration)
     unowned = _expected_index(migration, ownership_comment=None)
     lookups = iter((unowned, _expected_index(migration)))
-    locked = _expected_index(migration, ownership_comment=None)
+    locked = _expected_index(migration, index_name="__yd_0010_adopt_84", ownership_comment=None)
     marked = _expected_index(migration)
     oid_lookups = iter(([locked], [marked]))
     monkeypatch.setattr(migration, "_resolve_target_table", lambda: target)
@@ -292,6 +294,45 @@ def test_upgrade_adopts_uncommented_compatible_index(monkeypatch) -> None:  # no
     statement = str(operations.executed[1])
     assert 'COMMENT ON INDEX "public"."__yd_0010_adopt_84"' in statement
     assert migration._INDEX_OWNERSHIP_MARKER in statement
+
+
+def test_upgrade_rejects_rename_replacement_while_original_oid_survives(monkeypatch) -> None:
+    migration = _migration_module()
+    operations = RecordingOperations()
+    monkeypatch.setattr(migration, "op", operations)
+    monkeypatch.setattr(migration, "_quote_identifier", lambda value: f'"{value}"')
+    target = _target(migration)
+    original = _expected_index(migration, ownership_comment=None)
+    # The selected OID still has the complete expected signature and comment state,
+    # but a concurrent transaction renamed it elsewhere and put B under the old name.
+    surviving_a = _expected_index(
+        migration, index_name="concurrent_saved_a", ownership_comment=None
+    )
+    monkeypatch.setattr(migration, "_index_rows", lambda *_args, **_kwargs: [surviving_a])
+
+    with pytest.raises(RuntimeError, match="locked index validation failure"):
+        migration._mark_owned_index(original, target)
+
+    assert len(operations.executed) == 1
+    assert "COMMENT ON INDEX" not in str(operations.executed[0])
+
+
+def test_downgrade_rejects_rename_replacement_while_original_oid_survives(monkeypatch) -> None:
+    migration = _migration_module()
+    operations = RecordingOperations()
+    monkeypatch.setattr(migration, "op", operations)
+    monkeypatch.setattr(migration, "_quote_identifier", lambda value: f'"{value}"')
+    candidate = _expected_index(migration)
+    surviving_a = _expected_index(migration, index_name="concurrent_saved_a")
+    monkeypatch.setattr(migration, "_downgrade_candidates", lambda: [candidate])
+    monkeypatch.setattr(migration, "_resolve_target_table", lambda: _target(migration))
+    monkeypatch.setattr(migration, "_index_rows", lambda *_args, **_kwargs: [surviving_a])
+
+    with pytest.raises(RuntimeError, match="locked index validation failure"):
+        migration.downgrade()
+
+    assert len(operations.executed) == 1
+    assert "DROP INDEX" not in str(operations.executed[0])
 
 
 def test_upgrade_refuses_foreign_comment_without_overwriting_it(monkeypatch) -> None:  # noqa: ANN001
@@ -320,7 +361,9 @@ def test_upgrade_fails_when_ownership_marker_is_not_persisted(monkeypatch) -> No
     unowned = _expected_index(migration, ownership_comment=None)
     monkeypatch.setattr(migration, "_resolve_target_table", lambda: target)
     monkeypatch.setattr(migration, "_find_existing_index", lambda _target: unowned)
-    monkeypatch.setattr(migration, "_index_rows", lambda *_args, **_kwargs: [unowned])
+    locked = _expected_index(migration, index_name="__yd_0010_adopt_84", ownership_comment=None)
+    oid_lookups = iter(([locked], [locked]))
+    monkeypatch.setattr(migration, "_index_rows", lambda *_args, **_kwargs: next(oid_lookups))
 
     with pytest.raises(RuntimeError, match="ownership marker was not stored"):
         migration.upgrade()
@@ -386,6 +429,7 @@ def _expected_index(migration, **changes: Any):  # noqa: ANN001
         "index_oid": 84,
         "index_schema_oid": 2200,
         "schema": "public",
+        "index_name": "ix_upload_requests_created_id",
         "table_oid": 42,
         "table_schema": "public",
         "table_name": "upload_requests",
