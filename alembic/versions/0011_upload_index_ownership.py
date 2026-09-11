@@ -81,7 +81,7 @@ def _anchor_predicate(alias: str, columns: tuple[str, ...]) -> str:
           = {_expected_anchor_type_oids(columns)}
       AND (SELECT pg_catalog.array_agg(o.option ORDER BY o.ordinality) FROM pg_catalog.unnest({alias}.indoption)
            WITH ORDINALITY o(option, ordinality) WHERE o.ordinality <= {alias}.indnkeyatts)
-          = ARRAY[0,0,0]::pg_catalog.smallint[]
+          = ARRAY[0,0,0]::pg_catalog.int2[]
       AND (SELECT pg_catalog.count(*) = {alias}.indnkeyatts
                   AND COALESCE(pg_catalog.bool_and((
                         ic.opclass_oid IS NOT NULL AND a.attnum IS NOT NULL
@@ -190,7 +190,7 @@ def _is_user_schema(schema: str) -> bool:
 
 
 def _rows(where: str, parameters: dict[str, object]) -> list[_IndexSignature]:
-    result = op.get_bind().execute(text(_INDEX_SELECT.pg_catalog.format(where=where)), parameters)
+    result = op.get_bind().execute(text(_INDEX_SELECT.format(where=where)), parameters)
     return [
         _IndexSignature(
             **{
@@ -354,7 +354,7 @@ def _signature_predicate(alias: str = "x") -> str:
       WHERE k.ordinality <= {alias}.indnkeyatts) = ARRAY['created_at','id']::pg_catalog.name[]
  AND (SELECT pg_catalog.array_agg(o.option ORDER BY o.ordinality) FROM pg_catalog.unnest({alias}.indoption)
       WITH ORDINALITY o(option, ordinality) WHERE o.ordinality <= {alias}.indnkeyatts)
-      = ARRAY[0,0]::pg_catalog.smallint[]
+      = ARRAY[0,0]::pg_catalog.int2[]
  AND (SELECT pg_catalog.array_agg(ic.opclass_oid ORDER BY ic.ordinality)
       FROM pg_catalog.unnest({alias}.indclass) WITH ORDINALITY ic(opclass_oid, ordinality)
       WHERE ic.ordinality <= {alias}.indnkeyatts)

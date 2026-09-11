@@ -48,18 +48,22 @@ BEGIN
         FROM pg_catalog.pg_index AS x
         JOIN pg_catalog.pg_class AS i ON i.oid OPERATOR(pg_catalog.=) x.indexrelid
         JOIN pg_catalog.pg_am AS am ON am.oid OPERATOR(pg_catalog.=) i.relam
-        JOIN LATERAL pg_catalog.unnest(x.indkey) WITH ORDINALITY AS k(attnum, ordinality) ON true
-        JOIN pg_catalog.pg_attribute AS a
+        LEFT JOIN LATERAL pg_catalog.unnest(x.indkey) WITH ORDINALITY AS k(attnum, ordinality) ON true
+        LEFT JOIN pg_catalog.pg_attribute AS a
           ON a.attrelid OPERATOR(pg_catalog.=) x.indrelid
          AND a.attnum OPERATOR(pg_catalog.=) k.attnum
-        JOIN LATERAL pg_catalog.unnest(x.indoption) WITH ORDINALITY AS o(option, ordinality)
+        LEFT JOIN LATERAL pg_catalog.unnest(x.indoption) WITH ORDINALITY AS o(option, ordinality)
           ON o.ordinality OPERATOR(pg_catalog.=) k.ordinality
-        JOIN LATERAL pg_catalog.unnest(x.indclass) WITH ORDINALITY AS ic(opclass_oid, ordinality)
+        LEFT JOIN LATERAL pg_catalog.unnest(x.indclass) WITH ORDINALITY AS ic(opclass_oid, ordinality)
           ON ic.ordinality OPERATOR(pg_catalog.=) k.ordinality
-        JOIN pg_catalog.pg_opclass AS opc ON opc.oid OPERATOR(pg_catalog.=) ic.opclass_oid
-        JOIN pg_catalog.pg_opclass AS default_opc
+        LEFT JOIN pg_catalog.pg_opclass AS opc ON opc.oid OPERATOR(pg_catalog.=) ic.opclass_oid
+        LEFT JOIN pg_catalog.pg_type AS typ ON typ.oid OPERATOR(pg_catalog.=) a.atttypid
+        LEFT JOIN pg_catalog.pg_opclass AS default_opc
           ON default_opc.opcmethod OPERATOR(pg_catalog.=) am.oid
-         AND default_opc.opcintype OPERATOR(pg_catalog.=) a.atttypid
+         AND (default_opc.opcintype OPERATOR(pg_catalog.=) a.atttypid
+              OR (typ.typtype OPERATOR(pg_catalog.=) 'e'::pg_catalog."char"
+                  AND default_opc.opcintype OPERATOR(pg_catalog.=)
+                      'pg_catalog.anyenum'::pg_catalog.regtype))
          AND default_opc.opcdefault
         WHERE i.relname OPERATOR(pg_catalog.=) ANY (
             ARRAY['ix_upload_requests_user_created_id',

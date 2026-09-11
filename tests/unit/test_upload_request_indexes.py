@@ -184,12 +184,10 @@ def test_0010_generates_safe_offline_sql_without_database(
     for value in required:
         assert value in result.stdout
     assert "unnest(x.indoption) WITH ORDINALITY" in result.stdout
-    assert "ARRAY[0, 0]::pg_catalog.smallint[]" in result.stdout
+    assert "ARRAY[0, 0]::pg_catalog.int2[]" in result.stdout
     if command[0] == "downgrade":
         assert "t.relkind IN ('r', 'p')" in result.stdout
-        assert (
-            "pg_catalog.left(ins.nspname, 3)  OPERATOR(pg_catalog.<>)  'pg_'" in result.stdout
-        )
+        assert "pg_catalog.left(ins.nspname, 3)  OPERATOR(pg_catalog.<>)  'pg_'" in result.stdout
         assert "NOT LIKE 'pg_%'" not in result.stdout
         assert (
             "pg_catalog.obj_description(i.oid, 'pg_class') = "
@@ -211,7 +209,7 @@ def test_0010_generates_safe_offline_sql_without_database(
             "NOT x.indisexclusion",
             "x.indisvalid",
             "x.indisready",
-            "ARRAY[0,0,0]::pg_catalog.smallint[]",
+            "ARRAY[0,0,0]::pg_catalog.int2[]",
             "unnest(x.indclass)",
             "opc.opcdefault",
             "i.relnamespace=c.relnamespace",

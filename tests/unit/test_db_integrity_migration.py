@@ -55,3 +55,17 @@ def test_0009_offline_downgrade_contains_legacy_guard_before_schema_changes() ->
     assert "pg_catalog.pg_index" in sql
     assert "0011_upload_index_ownership" in sql
     assert "0008_telegram_outbox" in sql
+
+
+def test_legacy_guard_resolves_enum_default_opclass_without_hiding_missing_metadata() -> None:
+    sql = _migration()._LEGACY_UPLOAD_INDEX_GUARD_SQL
+
+    assert "LEFT JOIN pg_catalog.pg_attribute AS a" in sql
+    assert "LEFT JOIN pg_catalog.pg_type AS typ" in sql
+    assert "LEFT JOIN pg_catalog.pg_opclass AS default_opc" in sql
+    assert "default_opc.opcintype OPERATOR(pg_catalog.=) a.atttypid" in sql
+    assert "typ.typtype OPERATOR(pg_catalog.=) 'e'::pg_catalog.\"char\"" in sql
+    assert (
+        "default_opc.opcintype OPERATOR(pg_catalog.=)\n"
+        "                      'pg_catalog.anyenum'::pg_catalog.regtype"
+    ) in sql
