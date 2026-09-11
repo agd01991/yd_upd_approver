@@ -1400,67 +1400,158 @@ def test_0010_online_and_offline_downgrade_target_regressions(
 ):
     """Online and generated offline downgrade make identical target-safe decisions."""
     cfg, expected_database = migration_db
-    command.upgrade(cfg, "0009_db_integrity")
     quoted_database = expected_database.replace('"', '""')
+    created_schemas: set[str] = set()
+    application_table_moved = False
 
     async def prepare(conn: AsyncConnection) -> None:
+        nonlocal application_table_moved
         if scenario == "F":
             await conn.execute(text("CREATE SCHEMA pgapp"))
+            created_schemas.add("pgapp")
             await conn.execute(text("ALTER TABLE public.upload_requests SET SCHEMA pgapp"))
+            application_table_moved = True
             await conn.execute(
                 text(f'ALTER DATABASE "{quoted_database}" SET search_path TO pgapp, public')
             )
         command_schema = "pgapp" if scenario == "F" else "public"
-        # The migration itself is run after schema preparation by the synchronous caller.
         assert await _revision(conn) == "0009_db_integrity"
         assert (
             await conn.execute(text(f"SELECT to_regclass('{command_schema}.upload_requests')"))
         ).scalar_one()
 
-    _with_migration_connection(expected_database, prepare)
-    command.upgrade(cfg, "0010_upload_created_index")
-
     async def arrange(conn: AsyncConnection) -> list[tuple[object, ...]]:
         if scenario in "ABCD":
             await conn.execute(text("CREATE SCHEMA foreign_target"))
+            created_schemas.add("foreign_target")
             await conn.execute(
                 text(
-                    "CREATE TABLE foreign_target.upload_requests (id integer NOT NULL, created_at timestamptz NOT NULL)"
+                    "CREATE TABLE foreign_target.upload_requests ("
+                    "id integer NOT NULL, created_at timestamptz NOT NULL)"
                 )
             )
             await conn.execute(
                 text(
-                    "CREATE INDEX ix_upload_requests_created_id ON foreign_target.upload_requests (created_at, id)"
+                    "CREATE INDEX ix_upload_requests_created_id "
+                    "ON foreign_target.upload_requests (created_at, id)"
                 )
             )
             if scenario in "BCD":
                 await conn.execute(
                     text(
-                        "COMMENT ON INDEX foreign_target.ix_upload_requests_created_id IS :marker"
-                    ),
-                    {"marker": INDEX_OWNERSHIP_MARKER},
+                        "COMMENT ON INDEX foreign_target.ix_upload_requests_created_id IS "
+                        "'yd_upd_approver:alembic:0010_upload_created_index'"
+                    )
                 )
+                assert (
+                    await conn.execute(
+                        text(
+                            "SELECT pg_catalog.obj_description("
+                            "'foreign_target.ix_upload_requests_created_id'::regclass, "
+                            "'pg_class')"
+                        )
+                    )
+                ).scalar_one() == INDEX_OWNERSHIP_MARKER
             if scenario == "B":
                 await conn.execute(text("DROP INDEX public.ix_upload_requests_created_id"))
             elif scenario == "C":
                 await conn.execute(
                     text(
-                        "ALTER INDEX public.ix_upload_requests_created_id RENAME TO preserved_managed_index"
+                        "ALTER INDEX public.ix_upload_requests_created_id "
+                        "RENAME TO preserved_managed_index"
                     )
                 )
         elif scenario == "E":
             await conn.execute(text("CREATE SCHEMA ambiguous_target"))
+            created_schemas.add("ambiguous_target")
             await conn.execute(
                 text(
-                    "CREATE TABLE ambiguous_target.upload_requests (LIKE public.upload_requests INCLUDING ALL)"
+                    "CREATE TABLE ambiguous_target.upload_requests "
+                    "(LIKE public.upload_requests INCLUDING ALL EXCLUDING INDEXES)"
                 )
             )
-            await conn.execute(text("DROP INDEX ambiguous_target.ix_upload_requests_created_id"))
+            await conn.execute(
+                text(
+                    "CREATE INDEX ix_upload_requests_user_created_id "
+                    "ON ambiguous_target.upload_requests (user_id, created_at, id)"
+                )
+            )
+            await conn.execute(
+                text(
+                    "CREATE INDEX ix_upload_requests_status_created_id "
+                    "ON ambiguous_target.upload_requests (status, created_at, id)"
+                )
+            )
+            migration = (
+                ScriptDirectory.from_config(cfg).get_revision("0010_upload_created_index").module
+            )
+            anchors = migration._target_anchor_predicates("target_table")
+            target_query = f"""
+                        SELECT target_namespace.nspname, target_table.oid
+                        FROM pg_catalog.pg_class AS target_table
+                        JOIN pg_catalog.pg_namespace AS target_namespace
+                          ON target_namespace.oid = target_table.relnamespace
+                        WHERE target_table.relname = 'upload_requests'
+                          AND target_table.relkind IN ('r', 'p')
+                          AND {anchors}
+                        ORDER BY target_namespace.nspname
+                    """  # noqa: S608
+            targets = (await conn.execute(text(target_query))).all()
+            assert [row[0] for row in targets] == ["ambiguous_target", "public"]
         return await _index_state(conn)
 
-    before = _with_migration_connection(expected_database, arrange)
-    should_fail = scenario in "BCDE"
+    async def cleanup(conn: AsyncConnection) -> None:
+        nonlocal application_table_moved
+        # Every statement is idempotent because setup may have stopped at any point.
+        await conn.execute(text("ROLLBACK"))
+        await conn.execute(text(f'ALTER DATABASE "{quoted_database}" RESET search_path'))
+        await conn.execute(text("SET SESSION search_path TO public"))
+        for schema in ("foreign_target", "ambiguous_target"):
+            if schema in created_schemas:
+                await conn.execute(text(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE'))
+        if application_table_moved:
+            moved_table = (
+                await conn.execute(text("SELECT to_regclass('pgapp.upload_requests')"))
+            ).scalar_one()
+            if moved_table is not None:
+                await conn.execute(text("ALTER TABLE pgapp.upload_requests SET SCHEMA public"))
+            application_table_moved = False
+        if "pgapp" in created_schemas:
+            await conn.execute(text("DROP SCHEMA IF EXISTS pgapp CASCADE"))
+        revision = await _revision(conn)
+        if revision == "0010_upload_created_index":
+            preserved = (
+                await conn.execute(text("SELECT to_regclass('public.preserved_managed_index')"))
+            ).scalar_one()
+            managed = (
+                await conn.execute(
+                    text("SELECT to_regclass('public.ix_upload_requests_created_id')")
+                )
+            ).scalar_one()
+            if preserved is not None and managed is None:
+                await conn.execute(
+                    text(
+                        "ALTER INDEX public.preserved_managed_index "
+                        "RENAME TO ix_upload_requests_created_id"
+                    )
+                )
+            await _restore_managed_upload_index(conn)
+        elif revision != "0009_db_integrity":
+            raise AssertionError(f"unexpected revision during scenario cleanup: {revision}")
+
     try:
+        command.upgrade(cfg, "0009_db_integrity")
+        _with_migration_connection(expected_database, prepare)
+        command.upgrade(cfg, "0010_upload_created_index")
+        before = _with_migration_connection(expected_database, arrange)
+        should_fail = scenario in "BCDE"
+        expected_reason = {
+            "B": "incompatible managed index target",
+            "C": "incompatible managed index target",
+            "D": "ambiguous compatible indexes",
+            "E": "application target is ambiguous",
+        }.get(scenario)
+
         if execution == "online":
 
             def operation() -> None:
@@ -1479,8 +1570,16 @@ def test_0010_online_and_offline_downgrade_target_regressions(
                 _with_migration_connection(expected_database, execute)
 
         if should_fail:
-            with pytest.raises((RuntimeError, SQLAlchemyError, PostgresError)):
+            assert expected_reason is not None
+            with pytest.raises(
+                (RuntimeError, SQLAlchemyError, PostgresError), match=expected_reason
+            ) as caught:
                 operation()
+            assert "SyntaxError" not in type(caught.value).__name__
+            assert "UndefinedObject" not in type(caught.value).__name__
+            if execution == "offline":
+                original = getattr(caught.value, "orig", caught.value)
+                assert getattr(original, "sqlstate", None) == "P0001"
         else:
             operation()
 
@@ -1500,32 +1599,14 @@ def test_0010_online_and_offline_downgrade_target_regressions(
 
         _with_migration_connection(expected_database, verify)
     finally:
-
-        async def cleanup(conn: AsyncConnection) -> None:
-            await conn.execute(text(f'ALTER DATABASE "{quoted_database}" RESET search_path'))
-            await conn.execute(text("SET search_path TO public"))
-            await conn.execute(text("DROP SCHEMA IF EXISTS foreign_target CASCADE"))
-            await conn.execute(text("DROP SCHEMA IF EXISTS ambiguous_target CASCADE"))
-            if (
-                scenario == "F"
-                and (
-                    await conn.execute(text("SELECT to_regclass('pgapp.upload_requests')"))
-                ).scalar_one()
-            ):
-                await conn.execute(text("ALTER TABLE pgapp.upload_requests SET SCHEMA public"))
-            await conn.execute(text("DROP SCHEMA IF EXISTS pgapp CASCADE"))
-            if await _revision(conn) == "0010_upload_created_index":
-                if (
-                    await conn.execute(text("SELECT to_regclass('public.preserved_managed_index')"))
-                ).scalar_one():
-                    await conn.execute(
-                        text(
-                            "ALTER INDEX public.preserved_managed_index RENAME TO ix_upload_requests_created_id"
-                        )
-                    )
-                await _restore_managed_upload_index(conn)
-
-        _with_migration_connection(expected_database, cleanup)
+        # Do not let cleanup obscure the exception which caused setup or execution to fail.
+        active_error = sys.exception()
+        try:
+            _with_migration_connection(expected_database, cleanup)
+        except Exception:
+            if active_error is None:
+                raise
+            logging.getLogger(__name__).exception("scenario cleanup also failed")
 
 
 @pytest.mark.parametrize(
