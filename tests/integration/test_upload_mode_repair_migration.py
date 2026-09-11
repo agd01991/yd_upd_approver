@@ -4,6 +4,8 @@ import asyncio
 import json
 import logging
 import os
+import subprocess
+import sys
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from pathlib import Path
@@ -12,9 +14,10 @@ from typing import TypeVar
 import pytest
 from alembic.config import Config
 from alembic.script import ScriptDirectory
+from asyncpg import PostgresError
 from sqlalchemy import text
 from sqlalchemy.engine import make_url
-from sqlalchemy.exc import OperationalError
+from sqlalchemy.exc import OperationalError, SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncConnection, create_async_engine
 from sqlalchemy.pool import NullPool
 
@@ -137,6 +140,44 @@ def _with_migration_connection[T](
     return _run_async(
         _run_with_migration_engine(MIGRATION_DATABASE_URL, expected_database, callback)
     )
+
+
+def _generated_0010_downgrade_sql() -> str:
+    result = subprocess.run(  # noqa: S603 -- fixed local Alembic command under test
+        [
+            sys.executable,
+            "-m",
+            "alembic",
+            "downgrade",
+            "0010_upload_created_index:0009_db_integrity",
+            "--sql",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    return result.stdout
+
+
+async def _execute_complete_offline_script(conn: AsyncConnection, sql: str) -> None:
+    raw = await conn.get_raw_connection()
+    await raw.driver_connection.execute(sql)
+
+
+async def _index_state(conn: AsyncConnection) -> list[tuple[object, ...]]:
+    return (
+        await conn.execute(
+            text(
+                "SELECT i.oid, n.oid, n.nspname, i.relname, "
+                "pg_get_indexdef(i.oid), obj_description(i.oid, 'pg_class') "
+                "FROM pg_class i JOIN pg_namespace n ON n.oid=i.relnamespace "
+                "JOIN pg_index x ON x.indexrelid=i.oid "
+                "WHERE i.relname IN ('ix_upload_requests_created_id', 'preserved_managed_index') "
+                "OR i.relname LIKE '__yd_0010_%' ORDER BY i.oid"
+            )
+        )
+    ).all()
 
 
 @pytest.fixture()
@@ -1350,6 +1391,222 @@ def test_0010_downgrade_finds_only_the_managed_index_across_schemas(migration_db
                 await _restore_managed_upload_index(conn)
 
         _with_migration_connection(expected_database, cleanup)
+
+
+@pytest.mark.parametrize("execution", ["online", "offline"], ids=["online", "offline-full-sql"])
+@pytest.mark.parametrize("scenario", list("ABCDEF"))
+def test_0010_online_and_offline_downgrade_target_regressions(
+    migration_db, execution: str, scenario: str
+):
+    """Online and generated offline downgrade make identical target-safe decisions."""
+    cfg, expected_database = migration_db
+    quoted_database = expected_database.replace('"', '""')
+    created_schemas: set[str] = set()
+    application_table_moved = False
+
+    async def prepare(conn: AsyncConnection) -> None:
+        nonlocal application_table_moved
+        if scenario == "F":
+            await conn.execute(text("CREATE SCHEMA pgapp"))
+            created_schemas.add("pgapp")
+            await conn.execute(text("ALTER TABLE public.upload_requests SET SCHEMA pgapp"))
+            application_table_moved = True
+            await conn.execute(
+                text(f'ALTER DATABASE "{quoted_database}" SET search_path TO pgapp, public')
+            )
+        command_schema = "pgapp" if scenario == "F" else "public"
+        assert await _revision(conn) == "0009_db_integrity"
+        assert (
+            await conn.execute(text(f"SELECT to_regclass('{command_schema}.upload_requests')"))
+        ).scalar_one()
+
+    async def arrange(conn: AsyncConnection) -> list[tuple[object, ...]]:
+        if scenario in "ABCD":
+            await conn.execute(text("CREATE SCHEMA foreign_target"))
+            created_schemas.add("foreign_target")
+            await conn.execute(
+                text(
+                    "CREATE TABLE foreign_target.upload_requests ("
+                    "id integer NOT NULL, created_at timestamptz NOT NULL)"
+                )
+            )
+            await conn.execute(
+                text(
+                    "CREATE INDEX ix_upload_requests_created_id "
+                    "ON foreign_target.upload_requests (created_at, id)"
+                )
+            )
+            if scenario in "BCD":
+                await conn.execute(
+                    text(
+                        "COMMENT ON INDEX foreign_target.ix_upload_requests_created_id IS "
+                        "'yd_upd_approver:alembic:0010_upload_created_index'"
+                    )
+                )
+                assert (
+                    await conn.execute(
+                        text(
+                            "SELECT pg_catalog.obj_description("
+                            "'foreign_target.ix_upload_requests_created_id'::regclass, "
+                            "'pg_class')"
+                        )
+                    )
+                ).scalar_one() == INDEX_OWNERSHIP_MARKER
+            if scenario == "B":
+                await conn.execute(text("DROP INDEX public.ix_upload_requests_created_id"))
+            elif scenario == "C":
+                await conn.execute(
+                    text(
+                        "ALTER INDEX public.ix_upload_requests_created_id "
+                        "RENAME TO preserved_managed_index"
+                    )
+                )
+        elif scenario == "E":
+            await conn.execute(text("CREATE SCHEMA ambiguous_target"))
+            created_schemas.add("ambiguous_target")
+            await conn.execute(
+                text(
+                    "CREATE TABLE ambiguous_target.upload_requests "
+                    "(LIKE public.upload_requests INCLUDING ALL EXCLUDING INDEXES)"
+                )
+            )
+            await conn.execute(
+                text(
+                    "CREATE INDEX ix_upload_requests_user_created_id "
+                    "ON ambiguous_target.upload_requests (user_id, created_at, id)"
+                )
+            )
+            await conn.execute(
+                text(
+                    "CREATE INDEX ix_upload_requests_status_created_id "
+                    "ON ambiguous_target.upload_requests (status, created_at, id)"
+                )
+            )
+            migration = (
+                ScriptDirectory.from_config(cfg).get_revision("0010_upload_created_index").module
+            )
+            anchors = migration._target_anchor_predicates("target_table")
+            target_query = f"""
+                        SELECT target_namespace.nspname, target_table.oid
+                        FROM pg_catalog.pg_class AS target_table
+                        JOIN pg_catalog.pg_namespace AS target_namespace
+                          ON target_namespace.oid = target_table.relnamespace
+                        WHERE target_table.relname = 'upload_requests'
+                          AND target_table.relkind IN ('r', 'p')
+                          AND {anchors}
+                        ORDER BY target_namespace.nspname
+                    """  # noqa: S608
+            targets = (await conn.execute(text(target_query))).all()
+            assert [row[0] for row in targets] == ["ambiguous_target", "public"]
+        return await _index_state(conn)
+
+    async def cleanup(conn: AsyncConnection) -> None:
+        nonlocal application_table_moved
+        # Every statement is idempotent because setup may have stopped at any point.
+        await conn.execute(text("ROLLBACK"))
+        await conn.execute(text(f'ALTER DATABASE "{quoted_database}" RESET search_path'))
+        await conn.execute(text("SET SESSION search_path TO public"))
+        for schema in ("foreign_target", "ambiguous_target"):
+            if schema in created_schemas:
+                await conn.execute(text(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE'))
+        if application_table_moved:
+            moved_table = (
+                await conn.execute(text("SELECT to_regclass('pgapp.upload_requests')"))
+            ).scalar_one()
+            if moved_table is not None:
+                await conn.execute(text("ALTER TABLE pgapp.upload_requests SET SCHEMA public"))
+            application_table_moved = False
+        if "pgapp" in created_schemas:
+            await conn.execute(text("DROP SCHEMA IF EXISTS pgapp CASCADE"))
+        revision = await _revision(conn)
+        if revision == "0010_upload_created_index":
+            preserved = (
+                await conn.execute(text("SELECT to_regclass('public.preserved_managed_index')"))
+            ).scalar_one()
+            managed = (
+                await conn.execute(
+                    text("SELECT to_regclass('public.ix_upload_requests_created_id')")
+                )
+            ).scalar_one()
+            if preserved is not None and managed is None:
+                await conn.execute(
+                    text(
+                        "ALTER INDEX public.preserved_managed_index "
+                        "RENAME TO ix_upload_requests_created_id"
+                    )
+                )
+            await _restore_managed_upload_index(conn)
+        elif revision != "0009_db_integrity":
+            raise AssertionError(f"unexpected revision during scenario cleanup: {revision}")
+
+    try:
+        command.upgrade(cfg, "0009_db_integrity")
+        _with_migration_connection(expected_database, prepare)
+        command.upgrade(cfg, "0010_upload_created_index")
+        before = _with_migration_connection(expected_database, arrange)
+        should_fail = scenario in "BCDE"
+        expected_reason = {
+            "B": "incompatible managed index target",
+            "C": "incompatible managed index target",
+            "D": "ambiguous compatible indexes",
+            "E": "application target is ambiguous",
+        }.get(scenario)
+
+        if execution == "online":
+
+            def operation() -> None:
+                command.downgrade(cfg, "0009_db_integrity")
+        else:
+            sql = _generated_0010_downgrade_sql()
+
+            def operation() -> None:
+                async def execute(conn: AsyncConnection) -> None:
+                    try:
+                        await _execute_complete_offline_script(conn, sql)
+                    except Exception:
+                        await conn.execute(text("ROLLBACK"))
+                        raise
+
+                _with_migration_connection(expected_database, execute)
+
+        if should_fail:
+            assert expected_reason is not None
+            with pytest.raises(
+                (RuntimeError, SQLAlchemyError, PostgresError), match=expected_reason
+            ) as caught:
+                operation()
+            assert "SyntaxError" not in type(caught.value).__name__
+            assert "UndefinedObject" not in type(caught.value).__name__
+            if execution == "offline":
+                original = getattr(caught.value, "orig", caught.value)
+                assert getattr(original, "sqlstate", None) == "P0001"
+        else:
+            operation()
+
+        async def verify(conn: AsyncConnection) -> None:
+            assert await _revision(conn) == (
+                "0010_upload_created_index" if should_fail else "0009_db_integrity"
+            )
+            after = await _index_state(conn)
+            if should_fail:
+                assert after == before
+            elif scenario == "A":
+                assert len(after) == 1
+                assert after[0][2:4] == ("foreign_target", "ix_upload_requests_created_id")
+                assert after[0][5] is None
+            else:
+                assert after == []
+
+        _with_migration_connection(expected_database, verify)
+    finally:
+        # Do not let cleanup obscure the exception which caused setup or execution to fail.
+        active_error = sys.exception()
+        try:
+            _with_migration_connection(expected_database, cleanup)
+        except Exception:
+            if active_error is None:
+                raise
+            logging.getLogger(__name__).exception("scenario cleanup also failed")
 
 
 @pytest.mark.parametrize(

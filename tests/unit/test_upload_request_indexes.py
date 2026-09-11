@@ -515,11 +515,12 @@ def test_0010_online_and_offline_target_lookups_share_complete_anchor_fingerprin
     with pytest.raises(RuntimeError, match="does not resolve"):
         migration._resolve_target_table()
     online = statements[0]
-    offline = migration._offline_upgrade_sql()
+    offline_upgrade = migration._offline_upgrade_sql()
+    offline_downgrade = migration._offline_downgrade_sql()
     for name, columns in migration._ANCHOR_SIGNATURES:
         expected = migration._anchor_predicate("x", columns)
-        assert name in online and name in offline
-        assert expected in online and expected in offline
+        assert name in online and name in offline_upgrade and name in offline_downgrade
+        assert expected in online and expected in offline_upgrade and expected in offline_downgrade
 
 
 def test_upload_ordering_index_migration_accepts_correct_intermediate_index(monkeypatch) -> None:  # noqa: ANN001
