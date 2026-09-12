@@ -299,6 +299,18 @@ def _validate_oid(
     return rows[0]
 
 
+def _validate_adoption_ownership(
+    index_oid: int, target: _TargetTable, *, expected_name: str
+) -> _IndexSignature:
+    """Require the adoption candidate to be the sole global marker owner."""
+    owned = _owned_indexes()
+    if len(owned) != 1 or owned[0].index_oid != index_oid:
+        raise RuntimeError(f"Cannot apply {revision}: ambiguous owned indexes.")
+    if not _matches(owned[0], target, expected_name=expected_name):
+        raise RuntimeError(f"Cannot apply {revision}: incompatible index signature.")
+    return owned[0]
+
+
 def _adopt(candidate: _IndexSignature, target: _TargetTable) -> None:
     """Serialize adoption using the index relation's transaction-held DDL lock."""
     temporary_name = f"__yd_0011_adopt_{candidate.index_oid}"
@@ -310,6 +322,11 @@ def _adopt(candidate: _IndexSignature, target: _TargetTable) -> None:
     locked = _validate_oid(candidate.index_oid, target, comment=None, expected_name=temporary_name)
     if locked.index_name != temporary_name:
         raise RuntimeError(f"Cannot apply {revision}: locked index identity changed.")
+    # The rename supplies the candidate-specific DDL lock.  Re-scan globally only
+    # after acquiring it so a marker committed while the rename waited cannot be
+    # missed by the initial scan in _online_upgrade().
+    if _owned_indexes():
+        raise RuntimeError(f"Cannot apply {revision}: ownership conflict.")
     marker = _INDEX_OWNERSHIP_MARKER.replace("'", "''")
     op.execute(text(f"COMMENT ON INDEX {temporary} IS '{marker}'"))
     marked = _validate_oid(
@@ -320,10 +337,12 @@ def _adopt(candidate: _IndexSignature, target: _TargetTable) -> None:
     )
     if marked.index_name != temporary_name:
         raise RuntimeError(f"Cannot apply {revision}: marker identity changed.")
+    _validate_adoption_ownership(candidate.index_oid, target, expected_name=temporary_name)
     op.execute(text(f"ALTER INDEX {temporary} RENAME TO {_quote(_INDEX_NAME)}"))
     final = _validate_oid(candidate.index_oid, target, comment=_INDEX_OWNERSHIP_MARKER)
     if final.index_name != _INDEX_NAME:
         raise RuntimeError(f"Cannot apply {revision}: marker post-validation failure.")
+    _validate_adoption_ownership(candidate.index_oid, target, expected_name=_INDEX_NAME)
 
 
 def _online_upgrade() -> None:
@@ -381,17 +400,23 @@ def _offline_sql(*, backfill: bool) -> str:
     temporary_name := '__yd_0011_adopt_' || index_oid::pg_catalog.text;
     EXECUTE pg_catalog.format('ALTER INDEX %I.%I RENAME TO %I',target_schema,'{_INDEX_NAME}',temporary_name);
     IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_class i JOIN pg_catalog.pg_index x ON x.indexrelid=i.oid JOIN pg_catalog.pg_class t ON t.oid=x.indrelid JOIN pg_catalog.pg_namespace n ON n.oid=i.relnamespace JOIN pg_catalog.pg_am am ON am.oid=i.relam WHERE i.oid=index_oid AND i.relname=temporary_name AND x.indrelid=target_oid AND i.relnamespace=target_schema_oid AND pg_catalog.obj_description(i.oid,'pg_class') IS NULL AND {_signature_predicate()}) THEN RAISE EXCEPTION 'Cannot apply {revision}: locked index validation failure'; END IF;
+    SELECT pg_catalog.count(*) INTO owned_count FROM pg_catalog.pg_class i JOIN pg_catalog.pg_index x ON x.indexrelid=i.oid WHERE pg_catalog.obj_description(i.oid,'pg_class')='{_INDEX_OWNERSHIP_MARKER}';
+    IF owned_count OPERATOR(pg_catalog.<>) 0 THEN RAISE EXCEPTION 'Cannot apply {revision}: ownership conflict'; END IF;
     EXECUTE pg_catalog.format('COMMENT ON INDEX %I.%I IS %L',target_schema,temporary_name,'{_INDEX_OWNERSHIP_MARKER}');
-    IF pg_catalog.obj_description(index_oid,'pg_class') IS DISTINCT FROM '{_INDEX_OWNERSHIP_MARKER}' THEN RAISE EXCEPTION 'Cannot apply {revision}: marker post-validation failure'; END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_class i JOIN pg_catalog.pg_index x ON x.indexrelid=i.oid JOIN pg_catalog.pg_class t ON t.oid=x.indrelid JOIN pg_catalog.pg_namespace n ON n.oid=i.relnamespace JOIN pg_catalog.pg_am am ON am.oid=i.relam WHERE i.oid=index_oid AND i.relname=temporary_name AND x.indrelid=target_oid AND i.relnamespace=target_schema_oid AND pg_catalog.obj_description(i.oid,'pg_class')='{_INDEX_OWNERSHIP_MARKER}' AND {_signature_predicate()}) THEN RAISE EXCEPTION 'Cannot apply {revision}: marker post-validation failure'; END IF;
+    SELECT pg_catalog.count(*),pg_catalog.min(i.oid) INTO owned_count,owned_oid FROM pg_catalog.pg_class i JOIN pg_catalog.pg_index x ON x.indexrelid=i.oid WHERE pg_catalog.obj_description(i.oid,'pg_class')='{_INDEX_OWNERSHIP_MARKER}';
+    IF owned_count OPERATOR(pg_catalog.<>) 1 OR owned_oid OPERATOR(pg_catalog.<>) index_oid THEN RAISE EXCEPTION 'Cannot apply {revision}: ambiguous owned indexes'; END IF;
     EXECUTE pg_catalog.format('ALTER INDEX %I.%I RENAME TO %I',target_schema,temporary_name,'{_INDEX_NAME}');
     IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_class i JOIN pg_catalog.pg_index x ON x.indexrelid=i.oid JOIN pg_catalog.pg_class t ON t.oid=x.indrelid JOIN pg_catalog.pg_namespace n ON n.oid=i.relnamespace JOIN pg_catalog.pg_am am ON am.oid=i.relam WHERE i.oid=index_oid AND i.relname='{_INDEX_NAME}' AND x.indrelid=target_oid AND i.relnamespace=target_schema_oid AND pg_catalog.obj_description(i.oid,'pg_class')='{_INDEX_OWNERSHIP_MARKER}' AND {_signature_predicate()}) THEN RAISE EXCEPTION 'Cannot apply {revision}: marker post-validation failure'; END IF;
+    SELECT pg_catalog.count(*),pg_catalog.min(i.oid) INTO owned_count,owned_oid FROM pg_catalog.pg_class i JOIN pg_catalog.pg_index x ON x.indexrelid=i.oid WHERE pg_catalog.obj_description(i.oid,'pg_class')='{_INDEX_OWNERSHIP_MARKER}';
+    IF owned_count OPERATOR(pg_catalog.<>) 1 OR owned_oid OPERATOR(pg_catalog.<>) index_oid THEN RAISE EXCEPTION 'Cannot apply {revision}: ambiguous owned indexes'; END IF;
   END IF;"""
     )
     return f"""
 DO $$
 DECLARE owned_count integer; compatible_owned_count integer; target_count integer;
  target_oid oid; target_schema_oid oid; target_schema text; candidate_count integer;
- index_oid oid; existing_comment text; temporary_name text;
+ index_oid oid; owned_oid oid; existing_comment text; temporary_name text;
 BEGIN
  SELECT pg_catalog.count(*),pg_catalog.min(t.oid),pg_catalog.min(n.oid),pg_catalog.min(n.nspname) INTO target_count,target_oid,target_schema_oid,target_schema
  FROM pg_catalog.pg_class t JOIN pg_catalog.pg_namespace n ON n.oid=t.relnamespace

@@ -2447,6 +2447,189 @@ def test_0011_backfills_legacy_0010_and_preserves_index_oid(migration_db):
     command.downgrade(cfg, "0009_db_integrity")
 
 
+@pytest.mark.parametrize("execution", ["online", "offline"], ids=["online", "offline-full-sql"])
+def test_0011_adoption_rechecks_global_owner_after_waiting_for_index_lock(
+    migration_db, execution: str
+):
+    cfg, expected_database = migration_db
+    command.upgrade(cfg, "0010_upload_created_index")
+
+    async def regression() -> None:
+        assert MIGRATION_DATABASE_URL is not None
+        blocker_engine = create_async_engine(MIGRATION_DATABASE_URL, poolclass=NullPool)
+        monitor_engine = create_async_engine(
+            MIGRATION_DATABASE_URL, isolation_level="AUTOCOMMIT", poolclass=NullPool
+        )
+        runner_engine = create_async_engine(
+            MIGRATION_DATABASE_URL, isolation_level="AUTOCOMMIT", poolclass=NullPool
+        )
+        blocker = monitor = runner = None
+        runner_task = None
+        original = None
+        foreign_oid = None
+        try:
+            blocker = await blocker_engine.connect()
+            monitor = await monitor_engine.connect()
+            await blocker.begin()
+            await _assert_connected_to_expected_database(blocker, expected_database)
+            await _assert_connected_to_expected_database(monitor, expected_database)
+            await blocker.execute(text("CREATE SCHEMA adoption_race"))
+            await blocker.execute(text("CREATE TABLE adoption_race.foreign_table (id integer)"))
+            await blocker.execute(
+                text("CREATE INDEX foreign_index ON adoption_race.foreign_table (id)")
+            )
+            # This no-op COMMENT takes and retains the same relation lock that
+            # conflicts with ALTER INDEX RENAME, without changing the candidate.
+            await blocker.execute(
+                text("COMMENT ON INDEX public.ix_upload_requests_created_id IS NULL")
+            )
+            blocker_pid = (
+                await blocker.execute(text("SELECT pg_catalog.pg_backend_pid()"))
+            ).scalar_one()
+            original = (
+                await blocker.execute(
+                    text(
+                        "SELECT i.oid,i.relname,pg_catalog.pg_get_indexdef(i.oid),"
+                        "pg_catalog.obj_description(i.oid,'pg_class') "
+                        "FROM pg_catalog.pg_class i WHERE i.oid="
+                        "'public.ix_upload_requests_created_id'::pg_catalog.regclass"
+                    )
+                )
+            ).one()
+            foreign_oid = (
+                await blocker.execute(
+                    text(
+                        "SELECT 'adoption_race.foreign_index'::pg_catalog.regclass::pg_catalog.oid"
+                    )
+                )
+            ).scalar_one()
+            held_modes = (
+                (
+                    await blocker.execute(
+                        text(
+                            "SELECT mode FROM pg_catalog.pg_locks WHERE pid=:pid AND relation=:oid "
+                            "AND granted ORDER BY mode"
+                        ),
+                        {"pid": blocker_pid, "oid": original.oid},
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            assert "ShareUpdateExclusiveLock" in held_modes
+
+            if execution == "online":
+                runner_task = asyncio.create_task(
+                    asyncio.to_thread(command.upgrade, cfg, CURRENT_HEAD_REVISION)
+                )
+            else:
+                offline_config = _migration_config()
+                offline_config.output_buffer = io.StringIO()
+                command.upgrade(
+                    offline_config,
+                    "0010_upload_created_index:0011_upload_index_ownership",
+                    sql=True,
+                )
+                sql = offline_config.output_buffer.getvalue()
+                assert "BEGIN;" in sql and "UPDATE alembic_version" in sql and "COMMIT;" in sql
+                runner = await runner_engine.connect()
+
+                async def run_offline() -> None:
+                    await _execute_complete_offline_script(runner, sql)
+
+                runner_task = asyncio.create_task(run_offline())
+
+            async def blocked_runner_pid() -> int:
+                while True:
+                    row = (
+                        await monitor.execute(
+                            text(
+                                "SELECT pid FROM pg_catalog.pg_stat_activity "
+                                "WHERE pid OPERATOR(pg_catalog.<>) pg_catalog.pg_backend_pid() "
+                                "AND :blocker = ANY(pg_catalog.pg_blocking_pids(pid)) "
+                                "ORDER BY pid LIMIT 1"
+                            ),
+                            {"blocker": blocker_pid},
+                        )
+                    ).first()
+                    if row is not None:
+                        return row.pid
+                    if runner_task.done():
+                        await runner_task
+                        raise AssertionError(
+                            "0011 runner completed before reaching the candidate lock"
+                        )
+                    await asyncio.sleep(0.02)
+
+            runner_pid = await asyncio.wait_for(blocked_runner_pid(), timeout=10)
+            blockers = (
+                await monitor.execute(
+                    text("SELECT pg_catalog.pg_blocking_pids(:pid)"), {"pid": runner_pid}
+                )
+            ).scalar_one()
+            assert blocker_pid in blockers
+
+            await blocker.execute(
+                text(
+                    "COMMENT ON INDEX adoption_race.foreign_index IS "
+                    "'yd_upd_approver:alembic:0010_upload_created_index'"
+                )
+            )
+            await blocker.commit()
+
+            with pytest.raises(Exception, match="ownership conflict"):
+                await asyncio.wait_for(runner_task, timeout=10)
+
+            state = (
+                await monitor.execute(
+                    text(
+                        "SELECT i.oid,i.relname,pg_catalog.pg_get_indexdef(i.oid),"
+                        "pg_catalog.obj_description(i.oid,'pg_class') "
+                        "FROM pg_catalog.pg_class i WHERE i.oid=:oid"
+                    ),
+                    {"oid": original.oid},
+                )
+            ).one()
+            assert state == original
+            assert await _revision(monitor) == "0010_upload_created_index"
+            assert (
+                await monitor.execute(
+                    text(
+                        "SELECT i.relname,pg_catalog.obj_description(i.oid,'pg_class') "
+                        "FROM pg_catalog.pg_class i WHERE i.oid=:oid"
+                    ),
+                    {"oid": foreign_oid},
+                )
+            ).one() == ("foreign_index", INDEX_OWNERSHIP_MARKER)
+            assert (
+                await monitor.execute(
+                    text("SELECT pg_catalog.to_regclass('public.__yd_0011_adopt_' || :oid)"),
+                    {"oid": original.oid},
+                )
+            ).scalar_one_or_none() is None
+        finally:
+            if blocker is not None and blocker.in_transaction():
+                await blocker.rollback()
+            if runner_task is not None and not runner_task.done():
+                runner_task.cancel()
+                await asyncio.gather(runner_task, return_exceptions=True)
+            if runner is not None:
+                await runner.close()
+            if blocker is not None:
+                await blocker.close()
+            if monitor is not None:
+                # Remove only the objects created by this regression, then put
+                # the test-owned application index in the state its revision requires.
+                await monitor.execute(text("DROP SCHEMA IF EXISTS adoption_race CASCADE"))
+                await _restore_managed_upload_index(monitor)
+                await monitor.close()
+            await runner_engine.dispose()
+            await blocker_engine.dispose()
+            await monitor_engine.dispose()
+
+    _run_async(regression())
+
+
 def test_0011_does_not_mark_foreign_only_candidate(migration_db):
     cfg, expected_database = migration_db
     command.upgrade(cfg, "0010_upload_created_index")
