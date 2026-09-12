@@ -542,7 +542,9 @@ Local checks:
 ruff format .
 ruff check .
 pytest
+# Frontend runtime checks require Node.js 22.x (CI uses actions/setup-node).
 node --check app/webapp/static/app.js
+node tests/js/frontend_pagination.test.cjs
 alembic heads
 alembic history
 ```
