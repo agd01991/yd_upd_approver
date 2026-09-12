@@ -10,6 +10,7 @@ from sqlalchemy import Select, and_, or_
 from app.api.errors import ApiError
 
 MAX_CURSOR_LENGTH = 512
+MAX_DATABASE_ID = 2_147_483_647
 
 
 def pagination_limit(limit: int = Query(default=25, ge=1, le=100)) -> int:
@@ -27,8 +28,18 @@ def decode_cursor(cursor: str | None) -> tuple[datetime, int] | None:
         if not isinstance(data, dict) or set(data) != {"created_at", "id"}:
             raise ValueError
         created_at = datetime.fromisoformat(data["created_at"])
-        row_id = int(data["id"])
-        if row_id < 1:
+        raw_id = data["id"]
+        # Numeric strings were emitted by an early client and remain supported;
+        # all other JSON types must be actual (non-boolean) integers.
+        if isinstance(raw_id, str):
+            if not raw_id.isascii() or not raw_id.isdecimal():
+                raise ValueError
+            row_id = int(raw_id)
+        elif isinstance(raw_id, int) and not isinstance(raw_id, bool):
+            row_id = raw_id
+        else:
+            raise ValueError
+        if not 1 <= row_id <= MAX_DATABASE_ID:
             raise ValueError
         return created_at, row_id
     except Exception as exc:

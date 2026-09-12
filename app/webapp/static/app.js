@@ -10,7 +10,8 @@ const adminContent = document.querySelector("#admin-content");
 
 let userUploads = [];
 const pagers = { userUploads: {}, adminUploads: {}, adminUsers: {}, audit: {}, renames: {} };
-let requestVersion = 0;
+const pagerGenerations = { userUploads: 0, adminUploads: 0, adminUsers: 0, audit: 0, renames: 0 };
+let adminView = { generation: 0, tab: null };
 let userStatusFilter = "all";
 let adminStatusFilter = "all";
 let adminUserQuery = "";
@@ -140,13 +141,47 @@ function showAdminError(message) {
   if (error) error.textContent = message; else alert(message);
 }
 
-function resetPager(name) { pagers[name] = { cursor: null, previous: [], page: 1, nextCursor: null, hasMore: false, loading: false }; }
+function resetPager(name) { const generation = ++pagerGenerations[name]; pagers[name] = { cursor: null, previous: [], page: 1, nextCursor: null, hasMore: false, loading: false, generation, operation: 0 }; }
 function pager(name) { if (!pagers[name].page) resetPager(name); return pagers[name]; }
-function pageParams(name, extra = {}) { const p = pager(name); const params = new URLSearchParams({ limit: "25" }); if (p.cursor) params.set("cursor", p.cursor); Object.entries(extra).forEach(([k, v]) => { if (v !== undefined && v !== null && v !== "") params.set(k, v); }); return params; }
+function pageParams(name, extra = {}, navigation = null) { const p = navigation || pager(name); const params = new URLSearchParams({ limit: "25" }); if (p.cursor) params.set("cursor", p.cursor); Object.entries(extra).forEach(([k, v]) => { if (v !== undefined && v !== null && v !== "") params.set(k, v); }); return params; }
 function pagerHtml(name) { const p = pager(name); return `<div class="pager"><button data-page-prev="${name}" ${p.loading || p.page <= 1 ? "disabled" : ""}>Назад</button><span>Страница ${p.page}</span><button data-page-next="${name}" ${p.loading || !p.hasMore ? "disabled" : ""}>${p.loading ? "Загрузка…" : "Далее"}</button></div>`; }
-function bindPager(name, renderFn) { const prev = document.querySelector(`[data-page-prev="${name}"]`); const next = document.querySelector(`[data-page-next="${name}"]`); if (prev) prev.onclick = () => { const p = pager(name); if (p.loading || p.page <= 1) return; p.cursor = p.previous.pop() || null; p.page = Math.max(1, p.page - 1); renderFn(); }; if (next) next.onclick = () => { const p = pager(name); if (p.loading || !p.hasMore) return; p.previous.push(p.cursor); p.cursor = p.nextCursor; p.page += 1; renderFn(); }; }
-function applyPage(name, page) { const p = pager(name); p.hasMore = Boolean(page.has_more); p.nextCursor = page.next_cursor || null; return page.items || []; }
-async function guardedPage(name, url) { const p = pager(name); if (p.loading) return null; const version = ++requestVersion; p.loading = true; try { const page = await api(url); if (version !== requestVersion) return null; return applyPage(name, page); } finally { p.loading = false; } }
+function bindPager(name, renderFn) {
+  const navigate = (direction) => {
+    const p = pager(name);
+    if (p.loading || (direction === "back" ? p.page <= 1 : !p.hasMore)) return;
+    const previous = [...p.previous];
+    const navigation = direction === "back"
+      ? { cursor: previous.pop() || null, previous, page: p.page - 1 }
+      : { cursor: p.nextCursor, previous: [...previous, p.cursor], page: p.page + 1 };
+    // The state is only proposed here; guardedPage commits it after success.
+    renderFn(navigation).catch((err) => showAdminError(safeErrorMessage(err)));
+  };
+  const prev = document.querySelector(`[data-page-prev="${name}"]`);
+  const next = document.querySelector(`[data-page-next="${name}"]`);
+  if (prev) prev.onclick = () => navigate("back");
+  if (next) next.onclick = () => navigate("next");
+}
+async function guardedPage(name, url, navigation = null) {
+  const p = pager(name);
+  if (p.loading) return null;
+  const generation = p.generation;
+  const operation = ++p.operation;
+  p.loading = true;
+  try {
+    const page = await api(url);
+    if (pagers[name] !== p || p.generation !== generation || p.operation !== operation) return null;
+    if (navigation) {
+      p.cursor = navigation.cursor;
+      p.previous = navigation.previous;
+      p.page = navigation.page;
+    }
+    p.hasMore = Boolean(page.has_more);
+    p.nextCursor = page.next_cursor || null;
+    return page.items || [];
+  } finally {
+    if (pagers[name] === p && p.generation === generation && p.operation === operation) p.loading = false;
+  }
+}
 
 async function renderUser(me) {
   if (me.status === "pending") {
@@ -299,10 +334,10 @@ async function loadUserLists() {
   await refreshFiles();
 }
 
-async function loadUserRequests() {
+async function loadUserRequests(navigation = null) {
   const extra = {};
   if (userStatusFilter !== "all") extra.status = userStatusFilter;
-  const rows = await guardedPage("userUploads", `/api/uploads?${pageParams("userUploads", extra)}`);
+  const rows = await guardedPage("userUploads", `/api/uploads?${pageParams("userUploads", extra, navigation)}`, navigation);
   if (rows === null) return;
   userUploads = rows;
   renderUserRequests();
@@ -360,23 +395,25 @@ function renderUserRequests() {
 }
 
 async function loadAdmin(tab) {
+  const view = { generation: adminView.generation + 1, tab };
+  adminView = view;
   adminContent.innerHTML = '<div id="admin-error" class="muted"></div>';
   try {
-    if (tab === "users") return await renderAdminUsers();
-    if (tab === "renames") return await renderRenameRequests();
-    if (tab === "audit") return await renderAudit();
-    if (tab === "disk-root") return await renderDiskRootSettings();
-    await renderAdminUploads();
-  } catch (err) { showAdminError(safeErrorMessage(err)); }
+    if (tab === "users") return await renderAdminUsers(null, view);
+    if (tab === "renames") return await renderRenameRequests(null, view);
+    if (tab === "audit") return await renderAudit(null, view);
+    if (tab === "disk-root") return await renderDiskRootSettings(view);
+    await renderAdminUploads(null, view);
+  } catch (err) { if (adminView === view) showAdminError(safeErrorMessage(err)); }
 }
 
-async function renderAdminUploads() {
+async function renderAdminUploads(navigation = null, view = adminView) {
   const params = new URLSearchParams();
   if (adminStatusFilter !== "all") params.set("status", adminStatusFilter);
   if (adminUserQuery.trim()) params.set("user_query", adminUserQuery.trim());
-  const pageUrl = `/api/admin/uploads?${pageParams("adminUploads", Object.fromEntries(params))}`;
-  const rows = await guardedPage("adminUploads", pageUrl);
-  if (rows === null) return;
+  const pageUrl = `/api/admin/uploads?${pageParams("adminUploads", Object.fromEntries(params), navigation)}`;
+  const rows = await guardedPage("adminUploads", pageUrl, navigation);
+  if (rows === null || adminView !== view || view.tab !== "uploads") return;
   adminContent.innerHTML = `
     <div id="admin-error" class="muted"></div>
     <div class="admin-tools">${chipHtml(ADMIN_FILTERS, adminStatusFilter, "admin")}
@@ -422,9 +459,9 @@ function bindAdminUploadControls() {
   document.querySelector("#clear-search").onclick = () => { adminUserQuery = ""; resetPager("adminUploads"); renderAdminUploads(); }; bindPager("adminUploads", renderAdminUploads);
 }
 
-async function renderAdminUsers() {
-  const rows = await guardedPage("adminUsers", `/api/admin/users?${pageParams("adminUsers")}`);
-  if (rows === null) return;
+async function renderAdminUsers(navigation = null, view = adminView) {
+  const rows = await guardedPage("adminUsers", `/api/admin/users?${pageParams("adminUsers", {}, navigation)}`, navigation);
+  if (rows === null || adminView !== view || view.tab !== "users") return;
   adminContent.innerHTML = '<div id="admin-error" class="muted"></div>' + rows.map((u) => `
     <div class="card user-card"><div class="card-head"><b>${escapeHtml(u.full_name || "—")}</b><span class="badge">${escapeHtml(statusLabel(u.status))}</span></div>
       <div class="meta">@${escapeHtml(u.username || "—")} · ID Telegram: ${escapeHtml(u.telegram_id)}</div>
@@ -436,8 +473,9 @@ async function renderAdminUsers() {
 }
 
 
-async function renderDiskRootSettings() {
+async function renderDiskRootSettings(view = adminView) {
   const current = await api("/api/admin/disk-root");
+  if (adminView !== view || view.tab !== "disk-root") return;
   const source = current.source === "env" ? ".env" : "задано администратором";
   adminContent.innerHTML = `
     <div id="admin-error" class="muted"></div>
@@ -458,15 +496,16 @@ async function renderDiskRootSettings() {
     try {
       const root = document.querySelector("#disk-root-input").value;
       await api("/api/admin/disk-root", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ root }) });
+      if (adminView !== view || view.tab !== "disk-root") return;
       msg.textContent = "Корневая папка сохранена.";
-      await renderDiskRootSettings();
-    } catch (err) { showAdminError(safeErrorMessage(err)); }
+      await renderDiskRootSettings(view);
+    } catch (err) { if (adminView === view) showAdminError(safeErrorMessage(err)); }
   };
 }
 
-async function renderRenameRequests() {
-  const renameRows = await guardedPage("renames", `/api/admin/folder-rename-requests?${pageParams("renames", { status: "pending" })}`);
-  if (renameRows === null) return;
+async function renderRenameRequests(navigation = null, view = adminView) {
+  const renameRows = await guardedPage("renames", `/api/admin/folder-rename-requests?${pageParams("renames", { status: "pending" }, navigation)}`, navigation);
+  if (renameRows === null || adminView !== view || view.tab !== "renames") return;
   const requests = { items: renameRows };
   adminContent.innerHTML = `<div id="admin-error" class="muted"></div>
     <div class="card"><h3>Переименовать папку</h3>
@@ -558,9 +597,9 @@ async function renameSelectedUserFolder() {
 async function approveRenameRequest(id, userId) { try { const selected = await selectRenameUser({ id: userId }, { showErrors: false }); if (!selected) return; const source_folder = selectedRenameSourceFolder(); if (!source_folder) return showAdminError("Выберите актуальную папку пользователя из списка."); await api(`/api/admin/folder-rename-requests/${id}/approve`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ source_folder }) }); await renderRenameRequests(); } catch (err) { showAdminError(safeErrorMessage(err)); } }
 async function rejectRenameRequest(id) { try { const reason = prompt("Причина", "Отклонено администратором") || "Отклонено администратором"; await api(`/api/admin/folder-rename-requests/${id}/reject`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ reason }) }); await renderRenameRequests(); } catch (err) { showAdminError(safeErrorMessage(err)); } }
 
-async function renderAudit() {
-  const rows = await guardedPage("audit", `/api/admin/audit?${pageParams("audit")}`);
-  if (rows === null) return;
+async function renderAudit(navigation = null, view = adminView) {
+  const rows = await guardedPage("audit", `/api/admin/audit?${pageParams("audit", {}, navigation)}`, navigation);
+  if (rows === null || adminView !== view || view.tab !== "audit") return;
   adminContent.innerHTML = '<div id="admin-error" class="muted"></div>' + rows.map((a) => `
     <div class="card audit-card"><b>${escapeHtml(auditLabel(a.action))}</b><br>
       <span class="meta">Администратор: ${escapeHtml(a.actor_telegram_id)}; заявка: ${escapeHtml(a.request_id || "—")}</span>
@@ -594,9 +633,21 @@ async function load() {
     const title = escapeHtml(me.full_name || me.username || me.telegram_id);
     auth.innerHTML = `<div class="card-head"><b>${title}</b><span class="badge">${escapeHtml(statusLabel(me.status))}</span></div><div class="muted">Папка на Яндекс.Диске: ${escapeHtml(userFolderLabel(me))}</div>`;
     await renderUser(me);
-    if (me.is_admin) { adminEl.classList.remove("hidden"); await renderAdminUploads(); }
+    if (me.is_admin) { adminEl.classList.remove("hidden"); await loadAdmin("uploads"); }
   } catch (err) { auth.textContent = safeErrorMessage(err); }
 }
 
 document.querySelectorAll("nav button").forEach((button) => { button.onclick = () => loadAdmin(button.dataset.tab); });
-load();
+if (typeof module !== "undefined" && module.exports && globalThis.__PAGINATION_TEST__) {
+  module.exports = {
+    bindPager,
+    guardedPage,
+    pageParams,
+    pager,
+    resetPager,
+    setAdminView: (tab) => { adminView = { generation: adminView.generation + 1, tab }; return adminView; },
+    isAdminView: (view) => adminView === view,
+  };
+} else {
+  load();
+}
