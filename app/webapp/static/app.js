@@ -18,6 +18,7 @@ let adminUserQuery = "";
 let adminSearchTimer;
 let diskRootGetOperation = 0;
 const diskRootSave = { operation: 0, promise: null, status: "", error: "" };
+let diskRootForm = null;
 let selectedRenameUser = null;
 let renameFolderCandidates = [];
 let renameSelectionVersion = 0;
@@ -495,40 +496,72 @@ async function renderDiskRootSettings(view = adminView) {
       После изменения новые загрузки всех пользователей будут идти в папки внутри новой корневой папки.<br>
       Если папки пользователя там ещё нет, она будет создана повторно.<br>
       Старые файлы не переносятся.</p>
-      <label>Новая корневая папка<input id="disk-root-input" placeholder="disk:/Telegram Uploads" ${diskRootSave.promise ? "disabled" : ""}></label>
-      <button id="save-disk-root" ${diskRootSave.promise ? "disabled" : ""}>${diskRootSave.promise ? "Сохранение…" : "Сохранить корневую папку"}</button>
+      <label>Новая корневая папка<input id="disk-root-input" placeholder="disk:/Telegram Uploads" disabled></label>
+      <button id="save-disk-root" disabled>${diskRootSave.promise ? "Сохранение…" : "Сохранить корневую папку"}</button>
+      <button id="retry-disk-root" class="secondary" disabled>Повторить загрузку</button>
       <div id="disk-root-message" class="status-message">${escapeHtml(diskRootSave.status)}</div>
     </div>`;
   if (diskRootSave.error) showAdminError(diskRootSave.error);
-  bindDiskRootSave(view);
+  const form = {
+    view, getOperation, ready: false,
+    input: document.querySelector("#disk-root-input"),
+    button: document.querySelector("#save-disk-root"),
+    retry: document.querySelector("#retry-disk-root"),
+  };
+  diskRootForm = form;
+  bindDiskRootSave(form);
+  form.retry.onclick = () => {
+    if (!isCurrentDiskRootForm(form)) return;
+    return renderDiskRootSettings(view);
+  };
   let current;
   try { current = await api("/api/admin/disk-root"); }
   catch (err) {
-    if (adminView === view && view.tab === "disk-root" && getOperation === diskRootGetOperation) showAdminError(`${diskRootSave.status ? `${diskRootSave.status} ` : ""}${safeErrorMessage(err)}`);
+    if (isCurrentDiskRootForm(form)) {
+      showAdminError(`Не удалось загрузить корневую папку: ${safeErrorMessage(err)}`);
+      form.retry.disabled = false;
+      updateDiskRootControls(form);
+    }
     return;
   }
-  if (adminView !== view || view.tab !== "disk-root" || getOperation !== diskRootGetOperation) return;
+  if (!isCurrentDiskRootForm(form)) return;
   const source = current.source === "env" ? ".env" : "задано администратором";
   document.querySelector("#disk-root-current").innerHTML = `Текущая корневая папка: <b>${escapeHtml(current.value)}</b><div class="meta">Источник: ${escapeHtml(source)}</div>`;
-  const input = document.querySelector("#disk-root-input");
-  if (input && !input.value) input.value = current.value;
+  form.input.value = current.value;
+  form.ready = true;
+  form.retry.disabled = true;
+  showAdminError(diskRootSave.error);
+  updateDiskRootControls(form);
 }
 
-function bindDiskRootSave(view) {
-  const button = document.querySelector("#save-disk-root");
-  if (!button) return;
-  button.onclick = () => {
-    if (diskRootSave.promise || adminView !== view) return diskRootSave.promise;
-    const input = document.querySelector("#disk-root-input");
-    const root = input.value;
+function isCurrentDiskRootForm(form) {
+  return diskRootForm === form && adminView === form.view && form.view.tab === "disk-root"
+    && form.getOperation === diskRootGetOperation
+    && document.querySelector("#disk-root-input") === form.input
+    && document.querySelector("#save-disk-root") === form.button;
+}
+
+function updateDiskRootControls(form) {
+  if (!isCurrentDiskRootForm(form)) return;
+  const saving = Boolean(diskRootSave.promise);
+  form.input.disabled = !form.ready || saving;
+  form.button.disabled = !form.ready || !form.input.value.trim() || saving;
+  form.button.textContent = saving ? "Сохранение…" : "Сохранить корневую папку";
+}
+
+function bindDiskRootSave(form) {
+  form.input.oninput = () => updateDiskRootControls(form);
+  form.button.onclick = () => {
+    if (diskRootSave.promise) return diskRootSave.promise;
+    if (!isCurrentDiskRootForm(form) || !form.ready) return null;
+    const root = form.input.value.trim();
+    if (!root) { updateDiskRootControls(form); return null; }
     const operation = ++diskRootSave.operation;
-    input.disabled = true; button.disabled = true; button.textContent = "Сохранение…";
     diskRootSave.status = ""; diskRootSave.error = "";
-    diskRootSave.promise = api("/api/admin/disk-root", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ root }) })
-      .then(async () => {
+    const savePromise = api("/api/admin/disk-root", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ root }) })
+      .then(() => {
         if (operation !== diskRootSave.operation) return;
         diskRootSave.status = "Корневая папка сохранена.";
-        if (adminView.tab === "disk-root") await renderDiskRootSettings(adminView);
       })
       .catch((err) => {
         if (operation !== diskRootSave.operation) return;
@@ -536,16 +569,18 @@ function bindDiskRootSave(view) {
         if (adminView.tab === "disk-root") showAdminError(diskRootSave.error);
       })
       .finally(() => {
-        if (operation !== diskRootSave.operation) return;
+        if (operation !== diskRootSave.operation || diskRootSave.promise !== savePromise) return;
         diskRootSave.promise = null;
         if (adminView.tab === "disk-root") {
-          const currentButton = document.querySelector("#save-disk-root");
-          const currentInput = document.querySelector("#disk-root-input");
-          if (currentButton) { currentButton.disabled = false; currentButton.textContent = "Сохранить корневую папку"; }
-          if (currentInput) currentInput.disabled = false;
+          if (diskRootSave.error) updateDiskRootControls(diskRootForm);
+          else renderDiskRootSettings(adminView).catch((err) => {
+            if (adminView.tab === "disk-root") showAdminError(`Не удалось обновить корневую папку: ${safeErrorMessage(err)}`);
+          });
         }
       });
-    return diskRootSave.promise;
+    diskRootSave.promise = savePromise;
+    updateDiskRootControls(form);
+    return savePromise;
   };
 }
 
