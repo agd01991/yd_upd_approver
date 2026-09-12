@@ -75,7 +75,8 @@ class Operations:
         self.executed = []
 
     def execute(self, statement):  # noqa: ANN001
-        self.executed.append(str(statement))
+        if "pg_advisory_xact_lock" not in str(statement):
+            self.executed.append(str(statement))
 
 
 def test_rows_formats_sql_and_executes_it(monkeypatch) -> None:  # noqa: ANN001
@@ -132,14 +133,15 @@ def test_null_comment_is_backfilled_and_post_validated(monkeypatch) -> None:  # 
     migration = _migration()
     operations = Operations()
     candidate = _index(migration, ownership_comment=None)
-    monkeypatch.setattr(migration, "op", operations)
-    monkeypatch.setattr(migration, "_quote", lambda value: f'"{value}"')
-    monkeypatch.setattr(migration, "_owned_indexes", lambda: [])
-    monkeypatch.setattr(migration, "_resolve_application_target", lambda: _target(migration))
-    monkeypatch.setattr(migration, "_target_index", lambda _target: [candidate])
     temporary = _index(migration, index_name="__yd_0011_adopt_84", ownership_comment=None)
     marked = replace(temporary, ownership_comment=migration._INDEX_OWNERSHIP_MARKER)
     final = _index(migration)
+    monkeypatch.setattr(migration, "op", operations)
+    monkeypatch.setattr(migration, "_quote", lambda value: f'"{value}"')
+    owned = iter(([], [], [marked], [final]))
+    monkeypatch.setattr(migration, "_owned_indexes", lambda: next(owned))
+    monkeypatch.setattr(migration, "_resolve_application_target", lambda: _target(migration))
+    monkeypatch.setattr(migration, "_target_index", lambda _target: [candidate])
     rows = iter(([temporary], [marked], [final]))
     monkeypatch.setattr(migration, "_rows", lambda *_args, **_kwargs: next(rows))
     migration._online_upgrade()
@@ -148,6 +150,72 @@ def test_null_comment_is_backfilled_and_post_validated(monkeypatch) -> None:  # 
     assert str(operations.executed[0]).startswith("ALTER INDEX")
     assert "RENAME TO" in str(operations.executed[0])
     assert str(operations.executed[2]).endswith('RENAME TO "ix_upload_requests_created_id"')
+
+
+def test_owner_committed_while_candidate_lock_waited_aborts_adoption(monkeypatch) -> None:  # noqa: ANN001
+    migration = _migration()
+    operations = Operations()
+    candidate = _index(migration, ownership_comment=None)
+    temporary = replace(candidate, index_name="__yd_0011_adopt_84")
+    foreign = _index(migration, index_oid=85, ownership_comment=migration._INDEX_OWNERSHIP_MARKER)
+    owned = iter(([], [foreign]))
+    monkeypatch.setattr(migration, "op", operations)
+    monkeypatch.setattr(migration, "_quote", lambda value: f'"{value}"')
+    monkeypatch.setattr(migration, "_owned_indexes", lambda: next(owned))
+    monkeypatch.setattr(migration, "_resolve_application_target", lambda: _target(migration))
+    monkeypatch.setattr(migration, "_target_index", lambda _target: [candidate])
+    monkeypatch.setattr(migration, "_rows", lambda *_args, **_kwargs: [temporary])
+
+    with pytest.raises(RuntimeError, match="ownership conflict"):
+        migration._online_upgrade()
+
+    assert len(operations.executed) == 1
+    assert "RENAME TO" in operations.executed[0]
+
+
+def test_additional_owner_after_comment_aborts_adoption(monkeypatch) -> None:  # noqa: ANN001
+    migration = _migration()
+    operations = Operations()
+    candidate = _index(migration, ownership_comment=None)
+    temporary = replace(candidate, index_name="__yd_0011_adopt_84")
+    marked = replace(temporary, ownership_comment=migration._INDEX_OWNERSHIP_MARKER)
+    foreign = _index(migration, index_oid=85)
+    owned = iter(([], [], [marked, foreign]))
+    rows = iter(([temporary], [marked]))
+    monkeypatch.setattr(migration, "op", operations)
+    monkeypatch.setattr(migration, "_quote", lambda value: f'"{value}"')
+    monkeypatch.setattr(migration, "_owned_indexes", lambda: next(owned))
+    monkeypatch.setattr(migration, "_resolve_application_target", lambda: _target(migration))
+    monkeypatch.setattr(migration, "_target_index", lambda _target: [candidate])
+    monkeypatch.setattr(migration, "_rows", lambda *_args, **_kwargs: next(rows))
+
+    with pytest.raises(RuntimeError, match="ambiguous owned indexes"):
+        migration._online_upgrade()
+
+    assert len(operations.executed) == 2
+
+
+def test_adoption_owner_validation_accepts_temporary_name(monkeypatch) -> None:  # noqa: ANN001
+    migration = _migration()
+    temporary = _index(migration, index_name="__yd_0011_adopt_84")
+    monkeypatch.setattr(migration, "_owned_indexes", lambda: [temporary])
+
+    assert (
+        migration._validate_adoption_ownership(
+            84, _target(migration), expected_name="__yd_0011_adopt_84"
+        )
+        == temporary
+    )
+
+
+def test_adoption_owner_validation_rejects_different_oid(monkeypatch) -> None:  # noqa: ANN001
+    migration = _migration()
+    monkeypatch.setattr(migration, "_owned_indexes", lambda: [_index(migration, index_oid=85)])
+
+    with pytest.raises(RuntimeError, match="ambiguous owned indexes"):
+        migration._validate_adoption_ownership(
+            84, _target(migration), expected_name=migration._INDEX_NAME
+        )
 
 
 @pytest.mark.parametrize(
@@ -282,6 +350,7 @@ def test_downgrade_preserves_marker(monkeypatch) -> None:  # noqa: ANN001
 
 def test_downgrade_requires_marker(monkeypatch) -> None:  # noqa: ANN001
     migration = _migration()
+    monkeypatch.setattr(migration, "op", Operations())
     monkeypatch.setattr(migration.context, "is_offline_mode", lambda: False)
     monkeypatch.setattr(migration, "_owned_indexes", lambda: [])
     monkeypatch.setattr(migration, "_resolve_application_target", lambda: _target(migration))
@@ -327,3 +396,6 @@ def test_offline_runtime_sql_has_safe_semantics(command: list[str], is_downgrade
         assert "i.oid=index_oid" in sql
         assert "existing_comment IS NOT NULL" in sql
         assert "marker post-validation failure" in sql
+        assert sql.count("INTO owned_count") >= 3
+        assert "INTO owned_count,owned_oid" in sql
+        assert "owned_oid OPERATOR(pg_catalog.<>) index_oid" in sql
