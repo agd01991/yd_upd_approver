@@ -10,4 +10,8 @@ def test_alembic_revision_ids_are_valid_static() -> None:
     assert all(isinstance(revision, str) and revision for revision in revisions)
     assert all(len(revision) <= 32 for revision in revisions)
     assert len(revisions) == len(set(revisions))
-    assert script.get_heads() == ["0009_db_integrity"]
+    assert script.get_heads() == ["0011_upload_index_ownership"]
+    assert (
+        script.get_revision("0011_upload_index_ownership").down_revision
+        == "0010_upload_created_index"
+    )
