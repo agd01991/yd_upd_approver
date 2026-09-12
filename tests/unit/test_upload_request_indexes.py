@@ -132,16 +132,22 @@ def test_upload_ordering_index_migration_creates_and_validates_global_ordering_i
     monkeypatch.setattr(migration, "_find_existing_index", lambda actual_target: next(lookups))
     candidate = _expected_index(migration)
     monkeypatch.setattr(migration, "_downgrade_candidates", lambda: [candidate])
-    monkeypatch.setattr(migration, "_owned_index_oids", lambda: [candidate.index_oid])
+    owners = iter(([], [84], [84], [84], [84]))
+    monkeypatch.setattr(migration, "_owned_index_oids", lambda: next(owners))
     monkeypatch.setattr(migration, "_resolve_target_table", lambda: target)
     monkeypatch.setattr(migration, "_quote_identifier", lambda value: value)
     monkeypatch.setattr(
         migration,
         "_index_rows",
-        lambda *args, **kwargs: [_expected_index(migration, index_name="__yd_0010_drop_84")],
+        lambda *args, **kwargs: [_expected_index(migration, index_name="__yd_0010_adopt_84")],
     )
 
     migration.upgrade()
+    monkeypatch.setattr(
+        migration,
+        "_index_rows",
+        lambda *_args, **_kwargs: [_expected_index(migration, index_name="__yd_0010_drop_84")],
+    )
     migration.downgrade()
 
     assert operations.created_indexes == [
@@ -274,8 +280,85 @@ def test_downgrade_candidates_load_every_marker_owner_before_validation(monkeypa
     assert migration._downgrade_candidates() == [expected, wrong_name_and_order]
 
 
+@pytest.mark.parametrize("target_state", ["absent", "unmarked", "owned"])
+@pytest.mark.parametrize("foreign_oids", [[85], [85, 86]])
+def test_upgrade_rejects_global_marker_collisions_before_mutation(
+    monkeypatch, target_state: str, foreign_oids: list[int]
+) -> None:
+    migration = _migration_module()
+    operations = RecordingOperations()
+    existing = (
+        None
+        if target_state == "absent"
+        else _expected_index(
+            migration,
+            ownership_comment=migration._INDEX_OWNERSHIP_MARKER
+            if target_state == "owned"
+            else None,
+        )
+    )
+    owners = ([84] if target_state == "owned" else []) + foreign_oids
+    monkeypatch.setattr(migration, "op", operations)
+    monkeypatch.setattr(migration, "_resolve_target_table", lambda: _target(migration))
+    monkeypatch.setattr(migration, "_find_existing_index", lambda _target: existing)
+    monkeypatch.setattr(migration, "_owned_index_oids", lambda: owners)
+    adopted: list[int] = []
+    monkeypatch.setattr(
+        migration, "_mark_owned_index", lambda index, _target: adopted.append(index.index_oid)
+    )
+
+    with pytest.raises(RuntimeError, match="ownership (conflict|markers)"):
+        migration.upgrade()
+
+    assert operations.created_indexes == []
+    assert operations.executed == []
+    assert adopted == []
+
+
+@pytest.mark.parametrize("phase", ["after-lock", "after-comment"])
+def test_upgrade_rechecks_global_owners_during_adoption(monkeypatch, phase: str) -> None:
+    migration = _migration_module()
+    operations = RecordingOperations()
+    unowned = _expected_index(migration, ownership_comment=None)
+    locked = _expected_index(migration, index_name="__yd_0010_adopt_84", ownership_comment=None)
+    rows = iter(([locked], [_expected_index(migration, index_name="__yd_0010_adopt_84")]))
+    owners = iter(([], [85]) if phase == "after-lock" else ([], [], [84, 85]))
+    monkeypatch.setattr(migration, "op", operations)
+    monkeypatch.setattr(migration, "_quote_identifier", lambda value: value)
+    monkeypatch.setattr(migration, "_owned_index_oids", lambda: next(owners))
+    monkeypatch.setattr(migration, "_index_rows", lambda *_args, **_kwargs: next(rows))
+    monkeypatch.setattr(
+        migration, "_find_existing_index", lambda _target: _expected_index(migration)
+    )
+
+    with pytest.raises(RuntimeError, match="ownership (conflict|markers)"):
+        migration._mark_owned_index(unowned, _target(migration))
+
+    assert len(operations.executed) == (1 if phase == "after-lock" else 3)
+    if phase == "after-lock":
+        assert not any("COMMENT ON INDEX" in str(sql) for sql in operations.executed)
+
+
+def test_offline_upgrade_counts_the_same_unfiltered_owners_at_each_stage() -> None:
+    migration = _migration_module()
+    inventory = migration._owned_index_oids_sql()
+    assert "pg_catalog.pg_class" in inventory and "pg_catalog.pg_index" in inventory
+    assert "OPERATOR(pg_catalog.=)" in inventory
+    for filtered_field in ("relname", "relnamespace", "indrelid", "indisvalid", "indkey"):
+        assert filtered_field not in inventory
+    sql = migration._offline_upgrade_sql()
+    guard = migration._offline_upgrade_owners_sql()
+    assert inventory in guard
+    assert sql.index(guard) < sql.index("CREATE INDEX IF NOT EXISTS")
+    rename = sql.index("ALTER INDEX %I.%I RENAME TO %I")
+    assert rename < sql.index(guard, rename) < sql.index("COMMENT ON INDEX")
+    assert migration._offline_upgrade_owners_sql(require_owned=True) in sql
+
+
 def test_upgrade_adopts_uncommented_compatible_index(monkeypatch) -> None:  # noqa: ANN001
     migration = _migration_module()
+    owners = iter(([], [], [], [84]))
+    monkeypatch.setattr(migration, "_owned_index_oids", lambda: next(owners))
     operations = RecordingOperations()
     monkeypatch.setattr(migration, "op", operations)
     monkeypatch.setattr(migration, "_quote_identifier", lambda value: f'"{value}"')
@@ -297,17 +380,22 @@ def test_upgrade_adopts_uncommented_compatible_index(monkeypatch) -> None:  # no
     assert migration._INDEX_OWNERSHIP_MARKER in statement
 
 
-def test_upgrade_rejects_rename_replacement_while_original_oid_survives(monkeypatch) -> None:
+@pytest.mark.parametrize("already_owned", [False, True])
+def test_upgrade_rejects_rename_replacement_while_original_oid_survives(
+    monkeypatch, already_owned: bool
+) -> None:
     migration = _migration_module()
+    comment = migration._INDEX_OWNERSHIP_MARKER if already_owned else None
+    monkeypatch.setattr(migration, "_owned_index_oids", lambda: [84] if already_owned else [])
     operations = RecordingOperations()
     monkeypatch.setattr(migration, "op", operations)
     monkeypatch.setattr(migration, "_quote_identifier", lambda value: f'"{value}"')
     target = _target(migration)
-    original = _expected_index(migration, ownership_comment=None)
+    original = _expected_index(migration, ownership_comment=comment)
     # The selected OID still has the complete expected signature and comment state,
     # but a concurrent transaction renamed it elsewhere and put B under the old name.
     surviving_a = _expected_index(
-        migration, index_name="concurrent_saved_a", ownership_comment=None
+        migration, index_name="concurrent_saved_a", ownership_comment=comment
     )
     monkeypatch.setattr(migration, "_index_rows", lambda *_args, **_kwargs: [surviving_a])
 
@@ -339,6 +427,7 @@ def test_downgrade_rejects_rename_replacement_while_original_oid_survives(monkey
 
 def test_upgrade_refuses_foreign_comment_without_overwriting_it(monkeypatch) -> None:  # noqa: ANN001
     migration = _migration_module()
+    monkeypatch.setattr(migration, "_owned_index_oids", lambda: [])
     operations = RecordingOperations()
     monkeypatch.setattr(migration, "op", operations)
     monkeypatch.setattr(migration, "_resolve_target_table", lambda: _target(migration))
@@ -356,6 +445,8 @@ def test_upgrade_refuses_foreign_comment_without_overwriting_it(monkeypatch) -> 
 
 def test_upgrade_fails_when_ownership_marker_is_not_persisted(monkeypatch) -> None:  # noqa: ANN001
     migration = _migration_module()
+    owners = iter(([], [], [], [84]))
+    monkeypatch.setattr(migration, "_owned_index_oids", lambda: next(owners))
     operations = RecordingOperations()
     monkeypatch.setattr(migration, "op", operations)
     monkeypatch.setattr(migration, "_quote_identifier", lambda value: f'"{value}"')
@@ -375,6 +466,14 @@ def test_upgrade_fails_when_ownership_marker_is_not_persisted(monkeypatch) -> No
 
 def test_upload_ordering_index_migration_accepts_concurrently_created_index(monkeypatch) -> None:  # noqa: ANN001
     migration = _migration_module()
+    owners = iter(([], [84], [84], [84]))
+    monkeypatch.setattr(migration, "_owned_index_oids", lambda: next(owners))
+    monkeypatch.setattr(migration, "_quote_identifier", lambda value: value)
+    monkeypatch.setattr(
+        migration,
+        "_index_rows",
+        lambda *_args, **_kwargs: [_expected_index(migration, index_name="__yd_0010_adopt_84")],
+    )
     operations = RecordingOperations()
     monkeypatch.setattr(migration, "op", operations)
     target = _target(migration)
@@ -393,6 +492,7 @@ def test_upload_ordering_index_migration_rejects_conflict_created_during_race(
     monkeypatch,
 ) -> None:  # noqa: ANN001
     migration = _migration_module()
+    monkeypatch.setattr(migration, "_owned_index_oids", lambda: [])
     operations = RecordingOperations()
     monkeypatch.setattr(migration, "op", operations)
     target = _target(migration)
@@ -412,6 +512,7 @@ def test_upload_ordering_index_migration_rejects_missing_index_after_creation(
     monkeypatch,
 ) -> None:  # noqa: ANN001
     migration = _migration_module()
+    monkeypatch.setattr(migration, "_owned_index_oids", lambda: [])
     operations = RecordingOperations()
     monkeypatch.setattr(migration, "op", operations)
     target = _target(migration)
@@ -527,6 +628,14 @@ def test_0010_online_and_offline_target_lookups_share_complete_anchor_fingerprin
 
 def test_upload_ordering_index_migration_accepts_correct_intermediate_index(monkeypatch) -> None:  # noqa: ANN001
     migration = _migration_module()
+    owners = iter(([84], [84], [84], [84]))
+    monkeypatch.setattr(migration, "_owned_index_oids", lambda: next(owners))
+    monkeypatch.setattr(migration, "_quote_identifier", lambda value: value)
+    monkeypatch.setattr(
+        migration,
+        "_index_rows",
+        lambda *_args, **_kwargs: [_expected_index(migration, index_name="__yd_0010_adopt_84")],
+    )
     operations = RecordingOperations()
     monkeypatch.setattr(migration, "op", operations)
     target = _target(migration)
@@ -649,6 +758,14 @@ def test_upload_ordering_index_migration_rejects_incompatible_index_kind(
 
 def test_upload_ordering_index_migration_ignores_shadow_schema_index(monkeypatch) -> None:  # noqa: ANN001
     migration = _migration_module()
+    owners = iter(([], [84], [84], [84]))
+    monkeypatch.setattr(migration, "_owned_index_oids", lambda: next(owners))
+    monkeypatch.setattr(migration, "_quote_identifier", lambda value: value)
+    monkeypatch.setattr(
+        migration,
+        "_index_rows",
+        lambda *_args, **_kwargs: [_expected_index(migration, index_name="__yd_0010_adopt_84")],
+    )
     operations = RecordingOperations()
     monkeypatch.setattr(migration, "op", operations)
     target = _target(migration)
