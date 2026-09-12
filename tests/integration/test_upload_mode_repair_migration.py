@@ -2478,16 +2478,15 @@ def test_0011_adoption_rechecks_global_owner_after_waiting_for_index_lock(
             await blocker.execute(
                 text("CREATE INDEX foreign_index ON adoption_race.foreign_table (id)")
             )
-            # This no-op COMMENT takes and retains the same relation lock that
-            # conflicts with ALTER INDEX RENAME, without changing the candidate.
             await blocker.execute(
                 text("COMMENT ON INDEX public.ix_upload_requests_created_id IS NULL")
             )
-            blocker_pid = (
-                await blocker.execute(text("SELECT pg_catalog.pg_backend_pid()"))
-            ).scalar_one()
+            # Commit the legacy state before the blocker is opened.  Otherwise
+            # the runner can still see 0010's committed marker and legitimately
+            # take the already-owned path without touching the candidate lock.
+            await blocker.commit()
             original = (
-                await blocker.execute(
+                await monitor.execute(
                     text(
                         "SELECT i.oid,i.relname,pg_catalog.pg_get_indexdef(i.oid),"
                         "pg_catalog.obj_description(i.oid,'pg_class') "
@@ -2497,11 +2496,30 @@ def test_0011_adoption_rechecks_global_owner_after_waiting_for_index_lock(
                 )
             ).one()
             foreign_oid = (
-                await blocker.execute(
+                await monitor.execute(
                     text(
                         "SELECT 'adoption_race.foreign_index'::pg_catalog.regclass::pg_catalog.oid"
                     )
                 )
+            ).scalar_one()
+            assert await _revision(monitor) == "0010_upload_created_index"
+            assert original.relname == "ix_upload_requests_created_id"
+            assert original[3] is None
+            assert (
+                await monitor.execute(
+                    text("SELECT pg_catalog.obj_description(:oid, 'pg_class')"),
+                    {"oid": foreign_oid},
+                )
+            ).scalar_one_or_none() is None
+
+            await blocker.begin()
+            # This is now only a relation-lock operation; it does not prepare
+            # state on which the runner's migration decision depends.
+            await blocker.execute(
+                text("COMMENT ON INDEX public.ix_upload_requests_created_id IS NULL")
+            )
+            blocker_pid = (
+                await blocker.execute(text("SELECT pg_catalog.pg_backend_pid()"))
             ).scalar_one()
             held_modes = (
                 (

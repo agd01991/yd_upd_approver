@@ -532,6 +532,9 @@ Databases that ran the historical 0009 may also contain the unmarked
 before changing 0009 objects. Upgrade first through `0011_upload_index_ownership`, verify the
 managed ownership marker as described in `docs/MANUAL_QA.md`, and only then downgrade to
 `0008_telegram_outbox`; do not use `alembic stamp` as a substitute for schema reconciliation.
+Marker-changing maintenance must follow the transaction-level advisory-lock protocol documented
+there. The protocol covers repository migrations and participating manual writers; unrelated
+external `COMMENT`/DDL must be excluded with a maintenance window.
 
 Local checks:
 

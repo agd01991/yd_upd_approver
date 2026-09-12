@@ -19,6 +19,7 @@ _INDEX_NAME = "ix_upload_requests_created_id"
 _EXPECTED_KEY_COLUMNS = ("created_at", "id")
 _EXPECTED_KEY_OPTIONS = (0, 0)
 _INDEX_OWNERSHIP_MARKER = "yd_upd_approver:alembic:0010_upload_created_index"
+_OWNERSHIP_LOCK_KEY = 780984123042210011
 _ANCHOR_SIGNATURES = (
     ("ix_upload_requests_user_created_id", ("user_id", "created_at", "id")),
     ("ix_upload_requests_status_created_id", ("status", "created_at", "id")),
@@ -156,6 +157,21 @@ class _TargetTable:
 def _is_offline_mode() -> bool:
     """Use Alembic's mode flag before issuing catalog queries."""
     return context.is_offline_mode()
+
+
+def _acquire_ownership_lock() -> None:
+    """Enter the cooperative marker protocol before its first catalog read."""
+    op.execute(text(f"DO $$ BEGIN {_offline_ownership_lock_sql()} END $$"))
+
+
+def _offline_ownership_lock_sql() -> str:
+    return f"""
+  IF pg_catalog.current_setting('transaction_isolation') OPERATOR(pg_catalog.<>)
+     'read committed'::pg_catalog.text THEN
+    RAISE EXCEPTION 'Cannot apply {revision}: ownership protocol requires READ COMMITTED isolation';
+  END IF;
+  PERFORM pg_catalog.pg_advisory_xact_lock({_OWNERSHIP_LOCK_KEY}::pg_catalog.int8);
+"""
 
 
 def _resolve_target_table() -> _TargetTable:
@@ -466,6 +482,7 @@ DECLARE target_oid pg_catalog.oid; target_schema_oid pg_catalog.oid; target_sche
         named_count pg_catalog.int8; valid_count pg_catalog.int8; target_count pg_catalog.int8;
         owner_count pg_catalog.int8; owner_oid pg_catalog.oid;
 BEGIN
+  {_offline_ownership_lock_sql()}
   SELECT pg_catalog.count(*),pg_catalog.min(c.oid),pg_catalog.min(n.oid),pg_catalog.min(n.nspname) INTO target_count,target_oid,target_schema_oid,target_schema FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace WHERE c.relname='upload_requests' AND c.relkind IN ('r','p') AND pg_catalog.left(n.nspname,3) OPERATOR(pg_catalog.<>) 'pg_' AND n.nspname OPERATOR(pg_catalog.<>) 'information_schema' AND {anchors};
   IF target_count=0 THEN RAISE EXCEPTION 'Cannot apply 0010_upload_created_index: target table upload_requests was not found'; END IF;
   IF target_count>1 THEN RAISE EXCEPTION 'Cannot apply 0010_upload_created_index: application target is ambiguous'; END IF;
@@ -522,6 +539,7 @@ def _offline_downgrade_sql() -> str:
 DO $$
 DECLARE target_count pg_catalog.int8; target_oid pg_catalog.oid; target_schema_oid pg_catalog.oid; target_schema pg_catalog.name; candidate_count pg_catalog.int8; candidate_schema pg_catalog.name; candidate_schema_oid pg_catalog.oid; candidate_schemas pg_catalog.text; candidate_oid pg_catalog.oid; candidate_table_oid pg_catalog.oid; locked_owner_oid pg_catalog.oid; temporary_name pg_catalog.text;
 BEGIN
+  {_offline_ownership_lock_sql()}
   SELECT pg_catalog.count(*), pg_catalog.min(target_table.oid), pg_catalog.min(target_namespace.oid), pg_catalog.min(target_namespace.nspname)
     INTO target_count, target_oid, target_schema_oid, target_schema
     FROM pg_catalog.pg_class AS target_table
@@ -580,6 +598,7 @@ def upgrade() -> None:
     if _is_offline_mode():
         op.execute(_offline_upgrade_sql())
         return
+    _acquire_ownership_lock()
     target = _resolve_target_table()
     existing = _find_existing_index(target)
     if existing is not None:
@@ -601,6 +620,7 @@ def downgrade() -> None:
     if _is_offline_mode():
         op.execute(_offline_downgrade_sql())
         return
+    _acquire_ownership_lock()
     target = _resolve_target_table()
     candidates = _downgrade_candidates()
     if not candidates:

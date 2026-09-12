@@ -37,7 +37,22 @@ def test_manual_qa_upload_index_query_uses_explicit_application_schema() -> None
 @pytest.fixture(autouse=True)
 def _use_online_migration_mode(monkeypatch) -> None:  # noqa: ANN001
     """Unit tests exercise the online branch without an Alembic EnvironmentContext."""
-    monkeypatch.setattr(_migration_module().context, "is_offline_mode", lambda: False)
+    migration = _migration_module()
+    monkeypatch.setattr(migration.context, "is_offline_mode", lambda: False)
+
+
+def test_ownership_protocol_lock_is_stable_and_database_local() -> None:
+    migration = _migration_module()
+    backfill = (
+        ScriptDirectory.from_config(Config("alembic.ini"))
+        .get_revision("0011_upload_index_ownership")
+        .module
+    )
+    assert migration._OWNERSHIP_LOCK_KEY == backfill._OWNERSHIP_LOCK_KEY
+    sql = migration._offline_ownership_lock_sql()
+    assert "pg_catalog.pg_advisory_xact_lock" in sql
+    assert f"{migration._OWNERSHIP_LOCK_KEY}::pg_catalog.int8" in sql
+    assert "READ COMMITTED" in sql
 
 
 class RecordingOperations:
@@ -56,7 +71,8 @@ class RecordingOperations:
         self.dropped_indexes.append((name, table_name, kwargs))
 
     def execute(self, statement: Any) -> None:
-        self.executed.append(statement)
+        if "pg_advisory_xact_lock" not in str(statement):
+            self.executed.append(statement)
 
 
 def test_upload_request_metadata_has_global_ordering_index() -> None:
