@@ -142,6 +142,7 @@ class UploadRequest(Base):
         CheckConstraint("attempt_count >= 0", name="ck_upload_requests_attempt_count_non_negative"),
         Index("ix_upload_requests_user_created_id", "user_id", "created_at", "id"),
         Index("ix_upload_requests_status_created_id", "status", "created_at", "id"),
+        Index("ix_upload_requests_created_id", "created_at", "id"),
     )
 
     id: Mapped[int] = mapped_column(primary_key=True)
