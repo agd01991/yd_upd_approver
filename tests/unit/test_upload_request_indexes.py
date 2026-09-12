@@ -132,6 +132,7 @@ def test_upload_ordering_index_migration_creates_and_validates_global_ordering_i
     monkeypatch.setattr(migration, "_find_existing_index", lambda actual_target: next(lookups))
     candidate = _expected_index(migration)
     monkeypatch.setattr(migration, "_downgrade_candidates", lambda: [candidate])
+    monkeypatch.setattr(migration, "_owned_index_oids", lambda: [candidate.index_oid])
     monkeypatch.setattr(migration, "_resolve_target_table", lambda: target)
     monkeypatch.setattr(migration, "_quote_identifier", lambda value: value)
     monkeypatch.setattr(
@@ -228,13 +229,14 @@ def test_upload_ordering_index_downgrade_refuses_ambiguous_candidates(monkeypatc
     migration = _migration_module()
     operations = RecordingOperations()
     monkeypatch.setattr(migration, "op", operations)
+    monkeypatch.setattr(migration, "_resolve_target_table", lambda: _target(migration))
     monkeypatch.setattr(
         migration,
         "_downgrade_candidates",
         lambda: [_expected_index(migration), _expected_index(migration, schema="other")],
     )
 
-    with pytest.raises(RuntimeError, match="ambiguous compatible indexes"):
+    with pytest.raises(RuntimeError, match="duplicate ownership markers"):
         migration.downgrade()
 
     assert operations.dropped_indexes == []
@@ -244,33 +246,32 @@ def test_upload_ordering_index_downgrade_rejects_missing_candidate(monkeypatch) 
     migration = _migration_module()
     operations = RecordingOperations()
     monkeypatch.setattr(migration, "op", operations)
+    monkeypatch.setattr(migration, "_resolve_target_table", lambda: _target(migration))
     monkeypatch.setattr(migration, "_downgrade_candidates", lambda: [])
 
-    with pytest.raises(RuntimeError, match="no compatible managed index"):
+    with pytest.raises(RuntimeError, match="ownership marker was not found"):
         migration.downgrade()
 
     assert operations.dropped_indexes == []
 
 
-@pytest.mark.parametrize("comment", [None, "another-owner"])
-def test_downgrade_candidates_require_exact_ownership_marker(monkeypatch, comment) -> None:  # noqa: ANN001
+def test_downgrade_candidates_load_every_marker_owner_before_validation(monkeypatch) -> None:  # noqa: ANN001
     migration = _migration_module()
+    expected = _expected_index(migration)
+    wrong_name_and_order = _expected_index(
+        migration, index_oid=85, index_name="foreign_marker", schema="other", key_options=(1, 0)
+    )
+    monkeypatch.setattr(
+        migration, "_owned_index_oids", lambda: [expected.index_oid, wrong_name_and_order.index_oid]
+    )
+    rows = {expected.index_oid: [expected], wrong_name_and_order.index_oid: [wrong_name_and_order]}
     monkeypatch.setattr(
         migration,
         "_index_rows",
-        lambda *_args, **_kwargs: [_expected_index(migration, ownership_comment=comment)],
+        lambda _where, parameters, **_kwargs: rows[parameters["index_oid"]],
     )
 
-    assert migration._downgrade_candidates() == []
-
-
-def test_downgrade_candidates_select_owned_and_ignore_unowned(monkeypatch) -> None:  # noqa: ANN001
-    migration = _migration_module()
-    owned = _expected_index(migration)
-    unowned = _expected_index(migration, schema="other", ownership_comment=None)
-    monkeypatch.setattr(migration, "_index_rows", lambda *_args, **_kwargs: [owned, unowned])
-
-    assert migration._downgrade_candidates() == [owned]
+    assert migration._downgrade_candidates() == [expected, wrong_name_and_order]
 
 
 def test_upgrade_adopts_uncommented_compatible_index(monkeypatch) -> None:  # noqa: ANN001
@@ -327,6 +328,7 @@ def test_downgrade_rejects_rename_replacement_while_original_oid_survives(monkey
     monkeypatch.setattr(migration, "_downgrade_candidates", lambda: [candidate])
     monkeypatch.setattr(migration, "_resolve_target_table", lambda: _target(migration))
     monkeypatch.setattr(migration, "_index_rows", lambda *_args, **_kwargs: [surviving_a])
+    monkeypatch.setattr(migration, "_owned_index_oids", lambda: [candidate.index_oid])
 
     with pytest.raises(RuntimeError, match="locked index validation failure"):
         migration.downgrade()
@@ -560,28 +562,21 @@ def test_upload_ordering_index_migration_rejects_wrong_key_options(
     assert operations.dropped_indexes == []
 
 
-def test_downgrade_candidates_require_expected_key_options(monkeypatch) -> None:  # noqa: ANN001
-    migration = _migration_module()
-    expected = _expected_index(migration)
-    wrong_order = _expected_index(migration, schema="shadow", key_options=(1, 0))
-    monkeypatch.setattr(migration, "_index_rows", lambda *_args, **_kwargs: [expected, wrong_order])
-
-    assert migration._downgrade_candidates() == [expected]
-
-
-def test_downgrade_rejects_only_wrong_order_candidate(monkeypatch) -> None:  # noqa: ANN001
+def test_downgrade_rejects_single_marker_with_wrong_order_without_mutation(monkeypatch) -> None:  # noqa: ANN001
     migration = _migration_module()
     operations = RecordingOperations()
     monkeypatch.setattr(migration, "op", operations)
+    monkeypatch.setattr(migration, "_resolve_target_table", lambda: _target(migration))
     monkeypatch.setattr(
         migration,
-        "_index_rows",
-        lambda *_args, **_kwargs: [_expected_index(migration, key_options=(2, 0))],
+        "_downgrade_candidates",
+        lambda: [_expected_index(migration, key_options=(2, 0))],
     )
 
-    with pytest.raises(RuntimeError, match="no compatible managed index"):
+    with pytest.raises(RuntimeError, match="incompatible managed index target"):
         migration.downgrade()
 
+    assert operations.executed == []
     assert operations.dropped_indexes == []
 
 

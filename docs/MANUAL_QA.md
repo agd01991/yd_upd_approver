@@ -344,6 +344,9 @@ proceed with the downgrade. The query validates the current state of this explic
 it neither replaces the migrations' global target/ownership checks nor prevents the object from
 changing between this query and downgrade. A matching definition without the exact marker is not
 owned by revision 0010 and will not be removed by its downgrade.
+The 0010 downgrade additionally requires exactly one index object in the entire database to bear
+the exact marker. A second marker fails transactionally even when it is on another schema, table,
+name, or incompatible definition; the migration does not remove or repair either object.
 
 Revision `0011_upload_index_ownership` is a forward-only ownership backfill for databases that
 had already applied the original, unmarked revision `0010`. It identifies the application table
