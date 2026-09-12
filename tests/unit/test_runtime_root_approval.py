@@ -161,3 +161,63 @@ async def test_api_real_terminal_transition_writes_audit_and_outbox(
     assert result["status"] == target.value
     assert calls == {"audit": 1, "outbox": 1}
     assert session.committed is True
+
+
+@pytest.mark.parametrize(
+    ("candidate", "other_root", "other_allowed", "expected_conflict_id"),
+    [
+        ("disk:/Root/Alice/", "disk:/Root/Alice", [], 2),
+        ("disk:/Root/Alice/", None, ["disk:/Root/Alice"], 2),
+        ("disk:/Root/Alice/", "disk:/Root/Alice///", [], 2),
+        ("disk:/Root/Alice///", "disk:/Root/Alice", [], 2),
+        ("disk:/Root/Alice/", "disk:/Root/Bob", ["disk:/Root/Bob"], None),
+    ],
+)
+async def test_find_user_folder_conflict_canonicalizes_legacy_paths(
+    candidate, other_root, other_allowed, expected_conflict_id
+) -> None:
+    from app.db.repositories import find_user_folder_conflict
+
+    current = User(
+        id=1,
+        telegram_id=123,
+        username="user",
+        full_name="User",
+        status=UserStatus.active,
+        root_folder="disk:/Root/Alice/",
+        allowed_folders=["disk:/Root/Alice/"],
+    )
+    other = User(
+        id=2,
+        telegram_id=456,
+        username="other",
+        full_name="Other",
+        status=UserStatus.active,
+        root_folder=other_root,
+        allowed_folders=other_allowed,
+    )
+    conflict = await find_user_folder_conflict(
+        ConflictSession(current, [current, other]), candidate, exclude_user_id=1
+    )
+
+    assert (conflict.id if conflict else None) == expected_conflict_id
+
+
+async def test_find_user_folder_conflict_excludes_current_user() -> None:
+    from app.db.repositories import find_user_folder_conflict
+
+    current = User(
+        id=1,
+        telegram_id=123,
+        username="user",
+        full_name="User",
+        status=UserStatus.active,
+        root_folder="disk:/Root/Alice",
+        allowed_folders=["disk:/Root/Alice///"],
+    )
+
+    conflict = await find_user_folder_conflict(
+        ConflictSession(current, [current]), "disk:/Root/Alice/", exclude_user_id=1
+    )
+
+    assert conflict is None

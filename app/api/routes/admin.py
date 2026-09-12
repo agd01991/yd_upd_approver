@@ -8,6 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import admin_user_dep, get_db, settings_dep
 from app.api.errors import ApiError
+from app.api.pagination import apply_cursor, page_response, pagination_limit
 from app.api.schemas import (
     AdminRenameFolderBody,
     AllowedFoldersResponse,
@@ -118,13 +119,21 @@ def _folder_label(path: str) -> str:
 
 
 @router.get("/users")
-async def users(session: AsyncSession = Depends(get_db)) -> list[dict]:
-    return [
-        user_json(u)
-        for u in (
-            await session.scalars(select(User).order_by(User.created_at.desc()).limit(100))
-        ).all()
-    ]
+async def users(
+    status: str | None = None,
+    limit: int = Depends(pagination_limit),
+    cursor: str | None = None,
+    session: AsyncSession = Depends(get_db),
+) -> dict:
+    stmt = select(User)
+    if status and status != "all":
+        try:
+            stmt = stmt.where(User.status == UserStatus(status))
+        except ValueError as exc:
+            raise ApiError(400, "invalid_request", "Неизвестный статус пользователя") from exc
+    stmt = apply_cursor(stmt, User, cursor).order_by(User.created_at.desc(), User.id.desc())
+    rows = list((await session.scalars(stmt.limit(limit + 1))).all())
+    return page_response(rows, limit, user_json)
 
 
 @router.get("/users/search")
@@ -314,9 +323,17 @@ async def put_disk_root(
     return {"value": root, "is_default": False, "source": "database"}
 
 
-def _parse_upload_status(status: str | None) -> UploadStatus | None:
+NEEDS_ACTION_UPLOAD_STATUSES = {
+    UploadStatus.pending_approval,
+    UploadStatus.failed,
+}
+
+
+def _parse_upload_status(status: str | None) -> UploadStatus | str | None:
     if not status or status == "all":
         return None
+    if status == "needs_action":
+        return "needs_action"
     try:
         return UploadStatus(status)
     except ValueError as exc:
@@ -337,17 +354,24 @@ def _user_query_filter(user_query: str | None):
 async def uploads(
     status: str | None = None,
     user_query: str | None = None,
+    limit: int = Depends(pagination_limit),
+    cursor: str | None = None,
     session: AsyncSession = Depends(get_db),
-) -> list[dict]:
+) -> dict:
     upload_status = _parse_upload_status(status)
     stmt = select(UploadRequest, User).join(User, UploadRequest.user_id == User.id)
-    if upload_status:
+    if upload_status == "needs_action":
+        stmt = stmt.where(UploadRequest.status.in_(NEEDS_ACTION_UPLOAD_STATUSES))
+    elif upload_status:
         stmt = stmt.where(UploadRequest.status == upload_status)
     user_filter = _user_query_filter(user_query)
     if user_filter is not None:
         stmt = stmt.where(user_filter)
-    rows = (await session.execute(stmt.order_by(UploadRequest.created_at.desc()).limit(100))).all()
-    return [req_json(upload, user) for upload, user in rows]
+    stmt = apply_cursor(stmt, UploadRequest, cursor).order_by(
+        UploadRequest.created_at.desc(), UploadRequest.id.desc()
+    )
+    rows = (await session.execute(stmt.limit(limit + 1))).all()
+    return page_response(rows, limit, lambda row: req_json(row[0], row[1]))
 
 
 @router.get("/uploads/{request_id}")
@@ -559,14 +583,18 @@ async def patch_upload(
 
 
 @router.get("/audit")
-async def audit(session: AsyncSession = Depends(get_db), limit: int = 50) -> list[dict]:
-    rows = (
-        await session.scalars(
-            select(AuditLog).order_by(AuditLog.created_at.desc()).limit(min(limit, 100))
-        )
-    ).all()
-    return [
-        {
+async def audit(
+    limit: int = Depends(pagination_limit),
+    cursor: str | None = None,
+    session: AsyncSession = Depends(get_db),
+) -> dict:
+    stmt = apply_cursor(select(AuditLog), AuditLog, cursor).order_by(
+        AuditLog.created_at.desc(), AuditLog.id.desc()
+    )
+    rows = list((await session.scalars(stmt.limit(limit + 1))).all())
+
+    def item(a: AuditLog) -> dict:
+        return {
             "id": a.id,
             "actor_telegram_id": a.actor_telegram_id,
             "action": a.action,
@@ -576,23 +604,34 @@ async def audit(session: AsyncSession = Depends(get_db), limit: int = 50) -> lis
             "new_value": a.new_value,
             "created_at": a.created_at,
         }
-        for a in rows
-    ]
+
+    return page_response(rows, limit, item)
 
 
 @router.get("/folder-rename-requests")
 async def admin_folder_rename_requests(
-    status: str = "pending", session: AsyncSession = Depends(get_db)
+    status: str = "pending",
+    limit: int = Depends(pagination_limit),
+    cursor: str | None = None,
+    session: AsyncSession = Depends(get_db),
 ) -> dict:
-    query = select(FolderRenameRequest, User).join(User).order_by(FolderRenameRequest.created_at)
+    direction = "asc" if status == "pending" else "desc"
+    query = select(FolderRenameRequest, User).join(User)
     if status and status != "all":
         try:
             req_status = FolderRenameRequestStatus(status)
         except ValueError as exc:
             raise ApiError(400, "invalid_request", "Неизвестный статус заявки") from exc
         query = query.where(FolderRenameRequest.status == req_status)
-    rows = (await session.execute(query)).all()
-    return {"items": [rename_request_json(r, u) for r, u in rows]}
+    query = apply_cursor(query, FolderRenameRequest, cursor, direction)
+    if direction == "asc":
+        query = query.order_by(FolderRenameRequest.created_at.asc(), FolderRenameRequest.id.asc())
+    else:
+        query = query.order_by(FolderRenameRequest.created_at.desc(), FolderRenameRequest.id.desc())
+    rows = (await session.execute(query.limit(limit + 1))).all()
+    return page_response(
+        rows, limit, lambda row: rename_request_json(row[0], row[1]), direction=direction
+    )
 
 
 @router.post("/folder-rename-requests/{request_id}/approve")
