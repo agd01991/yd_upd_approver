@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import json
 import logging
 import os
@@ -163,6 +164,51 @@ def _generated_0010_downgrade_sql() -> str:
 async def _execute_complete_offline_script(conn: AsyncConnection, sql: str) -> None:
     raw = await conn.get_raw_connection()
     await raw.driver_connection.execute(sql)
+
+
+def _run_marker_migration_transition(
+    cfg: Config,
+    expected_database: str,
+    execution: str,
+    direction: str,
+    start: str,
+    destination: str,
+) -> None:
+    operation = command.upgrade if direction == "upgrade" else command.downgrade
+    if execution == "online":
+        operation(cfg, destination)
+        return
+    offline_config = _migration_config()
+    offline_config.output_buffer = io.StringIO()
+    operation(offline_config, f"{start}:{destination}", sql=True)
+    sql = offline_config.output_buffer.getvalue()
+    # Execute Alembic's transaction and version update too, without splitting DO blocks.
+    assert "BEGIN;" in sql and "COMMIT;" in sql and "UPDATE alembic_version" in sql
+
+    async def execute(conn: AsyncConnection) -> None:
+        try:
+            await _execute_complete_offline_script(conn, sql)
+        finally:
+            await conn.execute(text("ROLLBACK"))
+
+    _with_migration_connection(expected_database, execute)
+
+
+async def _user_index_snapshot(conn: AsyncConnection) -> list[dict[str, object]]:
+    rows = await conn.execute(
+        text("""
+            SELECT i.oid, n.oid AS schema_oid, n.nspname AS schema, i.relname AS name,
+                   x.indrelid AS table_oid, pg_catalog.pg_get_indexdef(i.oid) AS definition,
+                   pg_catalog.obj_description(i.oid, 'pg_class') AS comment
+            FROM pg_catalog.pg_class AS i
+            JOIN pg_catalog.pg_index AS x ON x.indexrelid OPERATOR(pg_catalog.=) i.oid
+            JOIN pg_catalog.pg_namespace AS n ON n.oid OPERATOR(pg_catalog.=) i.relnamespace
+            WHERE pg_catalog.left(n.nspname, 3) OPERATOR(pg_catalog.<>) 'pg_'
+              AND n.nspname OPERATOR(pg_catalog.<>) 'information_schema'
+            ORDER BY i.oid
+        """)
+    )
+    return [dict(row) for row in rows.mappings()]
 
 
 async def _index_state(conn: AsyncConnection) -> list[tuple[object, ...]]:
@@ -1713,6 +1759,202 @@ def test_0010_downgrade_rejects_duplicate_ownership_markers_globally(
         _with_migration_connection(expected_database, cleanup)
 
 
+@pytest.mark.parametrize("execution", ["online", "offline"])
+@pytest.mark.parametrize("target_state", ["absent", "unmarked", "owned"])
+@pytest.mark.parametrize(
+    "other_index",
+    ["none", "unmarked", "foreign-comment", "lookalike", "wrong-order", "same-table", "multiple"],
+)
+def test_0010_upgrade_checks_global_marker_ownership(
+    migration_db, execution: str, target_state: str, other_index: str
+):
+    cfg, expected_database = migration_db
+    schema_created = False
+    same_table_index_created = False
+    collision = other_index in {"lookalike", "wrong-order", "same-table", "multiple"}
+
+    async def arrange(conn: AsyncConnection) -> list[dict[str, object]]:
+        nonlocal schema_created, same_table_index_created
+        assert await _revision(conn) == "0009_db_integrity"
+        if target_state != "absent":
+            await conn.execute(
+                text(
+                    "CREATE INDEX ix_upload_requests_created_id ON public.upload_requests (created_at, id)"
+                )
+            )
+            if target_state == "owned":
+                await conn.execute(
+                    text(
+                        "COMMENT ON INDEX public.ix_upload_requests_created_id IS "
+                        "'yd_upd_approver:alembic:0010_upload_created_index'"
+                    )
+                )
+        if other_index not in {"none", "same-table"}:
+            await conn.execute(text("CREATE SCHEMA upgrade_marker_other"))
+            schema_created = True
+            await conn.execute(
+                text(
+                    "CREATE TABLE upgrade_marker_other.other_uploads "
+                    "(id pg_catalog.int4 NOT NULL, created_at pg_catalog.timestamptz NOT NULL)"
+                )
+            )
+            keys = "created_at DESC, id" if other_index == "wrong-order" else "created_at, id"
+            await conn.execute(
+                text(
+                    f"CREATE INDEX ix_upload_requests_created_id "  # noqa: S608 -- fixed test keys
+                    f"ON upgrade_marker_other.other_uploads ({keys})"
+                )
+            )
+            if collision:
+                await conn.execute(
+                    text(
+                        "COMMENT ON INDEX upgrade_marker_other.ix_upload_requests_created_id IS "
+                        "'yd_upd_approver:alembic:0010_upload_created_index'"
+                    )
+                )
+            elif other_index == "foreign-comment":
+                await conn.execute(
+                    text(
+                        "COMMENT ON INDEX upgrade_marker_other.ix_upload_requests_created_id IS 'another-owner'"
+                    )
+                )
+        if other_index in {"same-table", "multiple"}:
+            await conn.execute(
+                text(
+                    "CREATE INDEX upgrade_marker_expression ON public.upload_requests "
+                    "((id + 1)) WHERE id > 0"
+                )
+            )
+            same_table_index_created = True
+            await conn.execute(
+                text(
+                    "COMMENT ON INDEX public.upgrade_marker_expression IS "
+                    "'yd_upd_approver:alembic:0010_upload_created_index'"
+                )
+            )
+        state = await _user_index_snapshot(conn)
+        expected_owners = (target_state == "owned") + (
+            2 if other_index == "multiple" else int(collision)
+        )
+        assert sum(row["comment"] == INDEX_OWNERSHIP_MARKER for row in state) == expected_owners
+        return state
+
+    async def cleanup(conn: AsyncConnection) -> None:
+        await conn.execute(text("ROLLBACK"))
+        if schema_created:
+            await conn.execute(text("DROP SCHEMA upgrade_marker_other CASCADE"))
+        if same_table_index_created:
+            await conn.execute(text("DROP INDEX public.upgrade_marker_expression"))
+        # A broken upgrade may have advanced the revision: restore the valid owned
+        # index at 0010/0011 so fixture teardown can still downgrade independently.
+        await _cleanup_test_upload_ordering_index(conn)
+
+    try:
+        command.upgrade(cfg, "0009_db_integrity")
+        before = _with_migration_connection(expected_database, arrange)
+        if collision:
+            reason = (
+                "duplicate ownership markers"
+                if target_state == "owned" or other_index == "multiple"
+                else "ownership conflict"
+            )
+            with pytest.raises(
+                (RuntimeError, SQLAlchemyError, PostgresError), match=reason
+            ) as caught:
+                _run_marker_migration_transition(
+                    cfg,
+                    expected_database,
+                    execution,
+                    "upgrade",
+                    "0009_db_integrity",
+                    "0010_upload_created_index",
+                )
+            if execution == "offline":
+                assert getattr(caught.value, "sqlstate", None) == "P0001"
+
+            async def unchanged(conn: AsyncConnection) -> None:
+                assert await _revision(conn) == "0009_db_integrity"
+                assert await _user_index_snapshot(conn) == before
+
+            _with_migration_connection(expected_database, unchanged)
+            return
+
+        _run_marker_migration_transition(
+            cfg,
+            expected_database,
+            execution,
+            "upgrade",
+            "0009_db_integrity",
+            "0010_upload_created_index",
+        )
+
+        async def check_owned(conn: AsyncConnection) -> int:
+            state = await _user_index_snapshot(conn)
+            owners = [row for row in state if row["comment"] == INDEX_OWNERSHIP_MARKER]
+            assert len(owners) == 1
+            owner = owners[0]
+            assert owner["schema"] == "public" and owner["name"] == "ix_upload_requests_created_id"
+            prior_target = [
+                row
+                for row in before
+                if row["schema"] == "public" and row["name"] == "ix_upload_requests_created_id"
+            ]
+            if prior_target:
+                assert owner["oid"] == prior_target[0]["oid"]
+            others_before = [row for row in before if row not in prior_target]
+            assert [row for row in state if row["oid"] != owner["oid"]] == others_before
+            qa_rows = (
+                (await conn.execute(text(_manual_qa_upload_index_sql("public")))).mappings().all()
+            )
+            assert len(qa_rows) == 1 and qa_rows[0]["qa_pass"] is True
+            assert qa_rows[0]["index_oid"] == owner["oid"]
+            return int(owner["oid"])
+
+        oid = _with_migration_connection(expected_database, check_owned)
+        # Exercise the compatibility contract with 0011 and strict 0010 rollback.
+        for direction, start, destination in (
+            ("upgrade", "0010_upload_created_index", CURRENT_HEAD_REVISION),
+            ("downgrade", CURRENT_HEAD_REVISION, "0010_upload_created_index"),
+        ):
+            _run_marker_migration_transition(
+                cfg, expected_database, execution, direction, start, destination
+            )
+            assert _with_migration_connection(expected_database, check_owned) == oid
+        _run_marker_migration_transition(
+            cfg,
+            expected_database,
+            execution,
+            "downgrade",
+            "0010_upload_created_index",
+            "0009_db_integrity",
+        )
+
+        async def removed(conn: AsyncConnection) -> None:
+            assert await _revision(conn) == "0009_db_integrity"
+            state = await _user_index_snapshot(conn)
+            assert not any(row["comment"] == INDEX_OWNERSHIP_MARKER for row in state)
+            assert not any(
+                row["schema"] == "public" and row["name"] == "ix_upload_requests_created_id"
+                for row in state
+            )
+
+        _with_migration_connection(expected_database, removed)
+        _run_marker_migration_transition(
+            cfg, expected_database, execution, "upgrade", "0009_db_integrity", CURRENT_HEAD_REVISION
+        )
+
+        async def final_head(conn: AsyncConnection) -> None:
+            assert await _revision(conn) == CURRENT_HEAD_REVISION
+            qa = (await conn.execute(text(_manual_qa_upload_index_sql("public")))).mappings().one()
+            assert qa["qa_pass"] is True
+            state = await _user_index_snapshot(conn)
+            assert sum(row["comment"] == INDEX_OWNERSHIP_MARKER for row in state) == 1
+
+        _with_migration_connection(expected_database, final_head)
+    finally:
+        _with_migration_connection(expected_database, cleanup)
+
+
 @pytest.mark.parametrize(
     "ordering",
     ["created_at DESC NULLS LAST, id ASC", "created_at ASC NULLS FIRST, id ASC"],
@@ -2050,7 +2292,8 @@ def test_0010_downgrade_never_removes_unowned_compatible_index(migration_db, rep
         _with_migration_connection(expected_database, cleanup)
 
 
-def test_0010_upgrade_refuses_foreign_index_comment(migration_db):
+@pytest.mark.parametrize("execution", ["online", "offline"])
+def test_0010_upgrade_refuses_foreign_index_comment(migration_db, execution: str):
     cfg, expected_database = migration_db
     command.upgrade(cfg, "0009_db_integrity")
 
@@ -2077,9 +2320,20 @@ def test_0010_upgrade_refuses_foreign_index_comment(migration_db):
 
     try:
         _with_migration_connection(expected_database, prepare)
-        with pytest.raises(RuntimeError, match="ownership conflict"):
-            command.upgrade(cfg, CURRENT_HEAD_REVISION)
+        before = _with_migration_connection(expected_database, _user_index_snapshot)
+        with pytest.raises(
+            (RuntimeError, SQLAlchemyError, PostgresError), match="ownership conflict"
+        ):
+            _run_marker_migration_transition(
+                cfg,
+                expected_database,
+                execution,
+                "upgrade",
+                "0009_db_integrity",
+                "0010_upload_created_index",
+            )
         _with_migration_connection(expected_database, check)
+        assert _with_migration_connection(expected_database, _user_index_snapshot) == before
     finally:
 
         async def drop_conflict(conn: AsyncConnection) -> None:

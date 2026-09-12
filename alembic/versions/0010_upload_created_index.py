@@ -343,25 +343,55 @@ def _validate_existing_index(index: _IndexSignature | None, target: _TargetTable
     )
 
 
+def _owned_index_oids_sql() -> str:
+    """One row per marked index, including unrelated names, schemas and signatures."""
+    return f"""
+        SELECT index_class.oid
+        FROM pg_catalog.pg_class AS index_class
+        JOIN pg_catalog.pg_index AS index_definition
+          ON index_definition.indexrelid OPERATOR(pg_catalog.=) index_class.oid
+        WHERE pg_catalog.obj_description(index_class.oid, 'pg_class')
+              OPERATOR(pg_catalog.=) '{_INDEX_OWNERSHIP_MARKER}'::pg_catalog.text
+        ORDER BY index_class.oid
+    """
+
+
 def _owned_index_oids() -> list[int]:
     """Return every index bearing the exact marker, without target/signature filters."""
-    rows = (
-        op.get_bind()
-        .execute(
-            text("""
-                SELECT index_class.oid
-                FROM pg_catalog.pg_class AS index_class
-                JOIN pg_catalog.pg_index AS index_definition
-                  ON index_definition.indexrelid = index_class.oid
-                WHERE pg_catalog.obj_description(index_class.oid, 'pg_class') OPERATOR(pg_catalog.=) :marker
-                ORDER BY index_class.oid
-            """),
-            {"marker": _INDEX_OWNERSHIP_MARKER},
-        )
-        .scalars()
-        .all()
+    return list(op.get_bind().execute(text(_owned_index_oids_sql())).scalars().all())
+
+
+def _validate_upgrade_owners(index_oid: int | None, *, require_owned: bool = False) -> None:
+    owners = _owned_index_oids()
+    if len(owners) > 1:
+        raise RuntimeError(f"Cannot apply {revision}: duplicate ownership markers.")
+    if owners and owners != [index_oid]:
+        raise RuntimeError(f"Cannot apply {revision}: ownership conflict with another index.")
+    if require_owned and owners != [index_oid]:
+        raise RuntimeError(f"Cannot apply {revision}: ownership marker was not stored.")
+
+
+def _offline_upgrade_owners_sql(*, require_owned: bool = False) -> str:
+    # MIN only transports the OID after the count proves there is one owner.
+    required = (
+        f"""IF owner_count OPERATOR(pg_catalog.<>) 1 THEN
+    RAISE EXCEPTION 'Cannot apply {revision}: ownership marker was not stored';
+  END IF;"""
+        if require_owned
+        else ""
     )
-    return list(rows)
+    return f"""
+  SELECT pg_catalog.count(*), pg_catalog.min(owners.oid) INTO owner_count, owner_oid
+    FROM ({_owned_index_oids_sql()}) AS owners;
+  IF owner_count OPERATOR(pg_catalog.>) 1 THEN
+    RAISE EXCEPTION 'Cannot apply {revision}: duplicate ownership markers';
+  END IF;
+  IF owner_count OPERATOR(pg_catalog.=) 1 AND
+     (index_oid IS NULL OR owner_oid OPERATOR(pg_catalog.<>) index_oid) THEN
+    RAISE EXCEPTION 'Cannot apply {revision}: ownership conflict with another index';
+  END IF;
+  {required}
+"""
 
 
 def _downgrade_candidates() -> list[_IndexSignature]:
@@ -388,49 +418,62 @@ def _mark_owned_index(index: _IndexSignature, target: _TargetTable) -> None:
             f"Cannot apply {revision}: ownership conflict for index {_INDEX_NAME}; "
             "its existing comment belongs to another owner."
         )
+    _validate_upgrade_owners(index.index_oid)
+    # Lock even an already marked index, keeping the selected identity stable until
+    # the final global ownership check and Alembic's revision update commit together.
+    temporary_name = f"__yd_0010_adopt_{index.index_oid}"
+    qualified_name = f"{_quote_identifier(index.schema)}.{_quote_identifier(_INDEX_NAME)}"
+    temporary = f"{_quote_identifier(index.schema)}.{_quote_identifier(temporary_name)}"
+    marker = _INDEX_OWNERSHIP_MARKER.replace("'", "''")
+    op.execute(text(f"ALTER INDEX {qualified_name} RENAME TO {_quote_identifier(temporary_name)}"))
+    locked_rows = _index_rows(
+        "index_class.oid = :index_oid", {"index_oid": index.index_oid}, require_name=False
+    )
+    if (
+        len(locked_rows) != 1
+        or not _matches_renamed_index(locked_rows[0], index, target, temporary_name)
+        or locked_rows[0].ownership_comment != index.ownership_comment
+    ):
+        raise RuntimeError(f"Cannot apply {revision}: locked index validation failure.")
+    _validate_upgrade_owners(index.index_oid)
     if index.ownership_comment is None:
-        temporary_name = f"__yd_0010_adopt_{index.index_oid}"
-        qualified_name = f"{_quote_identifier(index.schema)}.{_quote_identifier(_INDEX_NAME)}"
-        temporary = f"{_quote_identifier(index.schema)}.{_quote_identifier(temporary_name)}"
-        marker = _INDEX_OWNERSHIP_MARKER.replace("'", "''")
-        op.execute(
-            text(f"ALTER INDEX {qualified_name} RENAME TO {_quote_identifier(temporary_name)}")
-        )
-        locked_rows = _index_rows(
-            "index_class.oid = :index_oid", {"index_oid": index.index_oid}, require_name=False
-        )
-        if (
-            len(locked_rows) != 1
-            or not _matches_renamed_index(locked_rows[0], index, target, temporary_name)
-            or locked_rows[0].ownership_comment is not None
-        ):
-            raise RuntimeError(f"Cannot apply {revision}: locked index validation failure.")
         op.execute(text(f"COMMENT ON INDEX {temporary} IS '{marker}'"))
         marked_rows = _index_rows(
             "index_class.oid = :index_oid", {"index_oid": index.index_oid}, require_name=False
         )
         if len(marked_rows) != 1 or marked_rows[0].ownership_comment != _INDEX_OWNERSHIP_MARKER:
             raise RuntimeError(f"Cannot apply {revision}: ownership marker was not stored.")
-        op.execute(text(f"ALTER INDEX {temporary} RENAME TO {_quote_identifier(_INDEX_NAME)}"))
+    op.execute(text(f"ALTER INDEX {temporary} RENAME TO {_quote_identifier(_INDEX_NAME)}"))
     marked = _find_existing_index(target)
     _validate_existing_index(marked, target)
-    if marked is None or marked.ownership_comment != _INDEX_OWNERSHIP_MARKER:
+    if (
+        marked is None
+        or marked.index_oid != index.index_oid
+        or marked.ownership_comment != _INDEX_OWNERSHIP_MARKER
+    ):
         raise RuntimeError(
             f"Cannot apply {revision}: ownership marker was not stored for index {_INDEX_NAME}."
         )
+    _validate_upgrade_owners(index.index_oid, require_owned=True)
 
 
 def _offline_upgrade_sql() -> str:
     anchors = _target_anchor_predicates("c")
     return f"""
 DO $$
-DECLARE target_oid oid; target_schema_oid oid; target_schema text; index_oid oid; existing_comment text;
-        named_count integer; valid_count integer; target_count integer; temporary_name text;
+DECLARE target_oid pg_catalog.oid; target_schema_oid pg_catalog.oid; target_schema pg_catalog.text;
+        index_oid pg_catalog.oid; existing_comment pg_catalog.text; temporary_name pg_catalog.text;
+        named_count pg_catalog.int8; valid_count pg_catalog.int8; target_count pg_catalog.int8;
+        owner_count pg_catalog.int8; owner_oid pg_catalog.oid;
 BEGIN
   SELECT pg_catalog.count(*),pg_catalog.min(c.oid),pg_catalog.min(n.oid),pg_catalog.min(n.nspname) INTO target_count,target_oid,target_schema_oid,target_schema FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace WHERE c.relname='upload_requests' AND c.relkind IN ('r','p') AND pg_catalog.left(n.nspname,3) OPERATOR(pg_catalog.<>) 'pg_' AND n.nspname OPERATOR(pg_catalog.<>) 'information_schema' AND {anchors};
   IF target_count=0 THEN RAISE EXCEPTION 'Cannot apply 0010_upload_created_index: target table upload_requests was not found'; END IF;
   IF target_count>1 THEN RAISE EXCEPTION 'Cannot apply 0010_upload_created_index: application target is ambiguous'; END IF;
-  SELECT pg_catalog.count(*) INTO named_count FROM pg_catalog.pg_class i JOIN pg_catalog.pg_namespace n ON n.oid = i.relnamespace WHERE n.nspname = target_schema AND i.relname = 'ix_upload_requests_created_id';
+  SELECT pg_catalog.count(*), pg_catalog.min(i.oid) INTO named_count, index_oid
+    FROM pg_catalog.pg_class AS i
+    WHERE i.relnamespace OPERATOR(pg_catalog.=) target_schema_oid
+      AND i.relname OPERATOR(pg_catalog.=) '{_INDEX_NAME}'::pg_catalog.name;
+  {_offline_upgrade_owners_sql()}
   IF named_count = 0 THEN EXECUTE pg_catalog.format('CREATE INDEX IF NOT EXISTS %I ON %I.%I (created_at, id)', 'ix_upload_requests_created_id', target_schema, 'upload_requests'); END IF;
   SELECT pg_catalog.count(*) INTO valid_count FROM pg_catalog.pg_class i JOIN pg_catalog.pg_namespace ins ON ins.oid = i.relnamespace JOIN pg_catalog.pg_index x ON x.indexrelid = i.oid JOIN pg_catalog.pg_class t ON t.oid = x.indrelid JOIN pg_catalog.pg_namespace tns ON tns.oid = t.relnamespace JOIN pg_catalog.pg_am am ON am.oid = i.relam WHERE i.relname = 'ix_upload_requests_created_id' AND ins.nspname = target_schema AND x.indrelid = target_oid AND ins.oid = tns.oid AND t.relname = 'upload_requests' AND x.indnkeyatts = 2 AND x.indnatts = 2 AND am.amname = 'btree' AND NOT x.indisunique AND NOT x.indisexclusion AND x.indpred IS NULL AND x.indexprs IS NULL AND x.indisvalid AND x.indisready AND (SELECT pg_catalog.array_agg(a.attname ORDER BY k.ordinality) FROM pg_catalog.unnest(x.indkey) WITH ORDINALITY AS k(attnum, ordinality) JOIN pg_catalog.pg_attribute a ON a.attrelid = x.indrelid AND a.attnum = k.attnum WHERE k.ordinality <= x.indnkeyatts) = ARRAY['created_at', 'id']::pg_catalog.name[] AND (SELECT pg_catalog.array_agg(o.option ORDER BY o.ordinality) FROM pg_catalog.unnest(x.indoption) WITH ORDINALITY AS o(option, ordinality) WHERE o.ordinality <= x.indnkeyatts) = ARRAY[0, 0]::pg_catalog.int2[] AND (SELECT pg_catalog.array_agg(ic.opclass_oid ORDER BY ic.ordinality) FROM pg_catalog.unnest(x.indclass) WITH ORDINALITY AS ic(opclass_oid, ordinality) WHERE ic.ordinality <= x.indnkeyatts) = (SELECT pg_catalog.array_agg(opc.oid ORDER BY k.ordinality) FROM pg_catalog.unnest(x.indkey) WITH ORDINALITY AS k(attnum, ordinality) JOIN pg_catalog.pg_attribute a ON a.attrelid=x.indrelid AND a.attnum=k.attnum JOIN pg_catalog.pg_opclass opc ON opc.opcmethod=(SELECT oid FROM pg_catalog.pg_am WHERE amname='btree') AND opc.opcintype=a.atttypid AND opc.opcdefault WHERE k.ordinality <= x.indnkeyatts);
   IF valid_count = 0 THEN
@@ -443,20 +486,32 @@ BEGIN
   IF existing_comment IS NOT NULL AND existing_comment  OPERATOR(pg_catalog.<>)  '{_INDEX_OWNERSHIP_MARKER}' THEN
     RAISE EXCEPTION 'Cannot apply 0010_upload_created_index: ownership conflict for index ix_upload_requests_created_id; its existing comment belongs to another owner';
   END IF;
-  IF existing_comment IS NULL THEN
-    temporary_name := '__yd_0010_adopt_' || index_oid::pg_catalog.text;
+  {_offline_upgrade_owners_sql()}
+    temporary_name := '__yd_0010_adopt_'::pg_catalog.text OPERATOR(pg_catalog.||) index_oid::pg_catalog.text;
     EXECUTE pg_catalog.format('ALTER INDEX %I.%I RENAME TO %I', target_schema,
                    'ix_upload_requests_created_id', temporary_name);
-    SELECT pg_catalog.count(*) INTO valid_count FROM pg_catalog.pg_class i JOIN pg_catalog.pg_namespace ins ON ins.oid=i.relnamespace JOIN pg_catalog.pg_index x ON x.indexrelid=i.oid JOIN pg_catalog.pg_class t ON t.oid=x.indrelid JOIN pg_catalog.pg_namespace tns ON tns.oid=t.relnamespace JOIN pg_catalog.pg_am am ON am.oid=i.relam WHERE i.oid=index_oid AND i.relname=temporary_name AND ins.oid=target_schema_oid AND ins.nspname=target_schema AND x.indrelid=target_oid AND ins.oid=tns.oid AND t.relname='upload_requests' AND pg_catalog.obj_description(i.oid,'pg_class') IS NULL AND x.indnkeyatts=2 AND x.indnatts=2 AND am.amname='btree' AND NOT x.indisunique AND NOT x.indisexclusion AND x.indpred IS NULL AND x.indexprs IS NULL AND x.indisvalid AND x.indisready AND (SELECT pg_catalog.array_agg(a.attname ORDER BY k.ordinality) FROM pg_catalog.unnest(x.indkey) WITH ORDINALITY k(attnum,ordinality) JOIN pg_catalog.pg_attribute a ON a.attrelid=x.indrelid AND a.attnum=k.attnum WHERE k.ordinality<=x.indnkeyatts)=ARRAY['created_at','id']::pg_catalog.name[] AND (SELECT pg_catalog.array_agg(o.option ORDER BY o.ordinality) FROM pg_catalog.unnest(x.indoption) WITH ORDINALITY o(option,ordinality) WHERE o.ordinality<=x.indnkeyatts)=ARRAY[0,0]::pg_catalog.int2[] AND (SELECT pg_catalog.array_agg(ic.opclass_oid ORDER BY ic.ordinality) FROM pg_catalog.unnest(x.indclass) WITH ORDINALITY ic(opclass_oid,ordinality) WHERE ic.ordinality<=x.indnkeyatts)=(SELECT pg_catalog.array_agg(opc.oid ORDER BY k.ordinality) FROM pg_catalog.unnest(x.indkey) WITH ORDINALITY k(attnum,ordinality) JOIN pg_catalog.pg_attribute a ON a.attrelid=x.indrelid AND a.attnum=k.attnum JOIN pg_catalog.pg_opclass opc ON opc.opcmethod=(SELECT oid FROM pg_catalog.pg_am WHERE amname='btree') AND opc.opcintype=a.atttypid AND opc.opcdefault WHERE k.ordinality<=x.indnkeyatts);
+    SELECT pg_catalog.count(*) INTO valid_count FROM pg_catalog.pg_class i JOIN pg_catalog.pg_namespace ins ON ins.oid=i.relnamespace JOIN pg_catalog.pg_index x ON x.indexrelid=i.oid JOIN pg_catalog.pg_class t ON t.oid=x.indrelid JOIN pg_catalog.pg_namespace tns ON tns.oid=t.relnamespace JOIN pg_catalog.pg_am am ON am.oid=i.relam WHERE i.oid=index_oid AND i.relname=temporary_name AND ins.oid=target_schema_oid AND ins.nspname=target_schema AND x.indrelid=target_oid AND ins.oid=tns.oid AND t.relname='upload_requests' AND ((pg_catalog.obj_description(i.oid,'pg_class') IS NULL AND existing_comment IS NULL) OR pg_catalog.obj_description(i.oid,'pg_class') OPERATOR(pg_catalog.=) existing_comment) AND x.indnkeyatts=2 AND x.indnatts=2 AND am.amname='btree' AND NOT x.indisunique AND NOT x.indisexclusion AND x.indpred IS NULL AND x.indexprs IS NULL AND x.indisvalid AND x.indisready AND (SELECT pg_catalog.array_agg(a.attname ORDER BY k.ordinality) FROM pg_catalog.unnest(x.indkey) WITH ORDINALITY k(attnum,ordinality) JOIN pg_catalog.pg_attribute a ON a.attrelid=x.indrelid AND a.attnum=k.attnum WHERE k.ordinality<=x.indnkeyatts)=ARRAY['created_at','id']::pg_catalog.name[] AND (SELECT pg_catalog.array_agg(o.option ORDER BY o.ordinality) FROM pg_catalog.unnest(x.indoption) WITH ORDINALITY o(option,ordinality) WHERE o.ordinality<=x.indnkeyatts)=ARRAY[0,0]::pg_catalog.int2[] AND (SELECT pg_catalog.array_agg(ic.opclass_oid ORDER BY ic.ordinality) FROM pg_catalog.unnest(x.indclass) WITH ORDINALITY ic(opclass_oid,ordinality) WHERE ic.ordinality<=x.indnkeyatts)=(SELECT pg_catalog.array_agg(opc.oid ORDER BY k.ordinality) FROM pg_catalog.unnest(x.indkey) WITH ORDINALITY k(attnum,ordinality) JOIN pg_catalog.pg_attribute a ON a.attrelid=x.indrelid AND a.attnum=k.attnum JOIN pg_catalog.pg_opclass opc ON opc.opcmethod=(SELECT oid FROM pg_catalog.pg_am WHERE amname='btree') AND opc.opcintype=a.atttypid AND opc.opcdefault WHERE k.ordinality<=x.indnkeyatts);
     IF valid_count  OPERATOR(pg_catalog.<>)  1 THEN RAISE EXCEPTION 'Cannot apply 0010_upload_created_index: locked index validation failure'; END IF;
+  {_offline_upgrade_owners_sql()}
+  IF existing_comment IS NULL THEN
     EXECUTE pg_catalog.format('COMMENT ON INDEX %I.%I IS %L', target_schema,
                    temporary_name, '{_INDEX_OWNERSHIP_MARKER}');
+  END IF;
     EXECUTE pg_catalog.format('ALTER INDEX %I.%I RENAME TO %I', target_schema,
                    temporary_name, 'ix_upload_requests_created_id');
-  END IF;
-  IF pg_catalog.obj_description(index_oid, 'pg_class') IS DISTINCT FROM '{_INDEX_OWNERSHIP_MARKER}' THEN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_catalog.pg_class AS i
+    JOIN pg_catalog.pg_index AS x ON x.indexrelid OPERATOR(pg_catalog.=) i.oid
+    WHERE i.oid OPERATOR(pg_catalog.=) index_oid
+      AND i.relname OPERATOR(pg_catalog.=) '{_INDEX_NAME}'::pg_catalog.name
+      AND i.relnamespace OPERATOR(pg_catalog.=) target_schema_oid
+      AND x.indrelid OPERATOR(pg_catalog.=) target_oid
+      AND pg_catalog.obj_description(i.oid, 'pg_class')
+          OPERATOR(pg_catalog.=) '{_INDEX_OWNERSHIP_MARKER}'::pg_catalog.text
+  ) THEN
     RAISE EXCEPTION 'Cannot apply 0010_upload_created_index: ownership marker was not stored for index ix_upload_requests_created_id';
   END IF;
+  {_offline_upgrade_owners_sql(require_owned=True)}
 END $$;
 """
 
@@ -529,6 +584,8 @@ def upgrade() -> None:
     existing = _find_existing_index(target)
     if existing is not None:
         _validate_existing_index(existing, target)
+    _validate_upgrade_owners(existing.index_oid if existing is not None else None)
+    if existing is not None:
         _mark_owned_index(existing, target)
         return
     op.create_index(
