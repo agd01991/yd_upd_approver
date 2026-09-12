@@ -85,9 +85,97 @@ async function adminViewGeneration() {
   assert.equal(pagination.isAdminView(disk), true);
 }
 
+async function reopenedAdminViewSupersedesPendingWork() {
+  pagination.resetPager("adminUploads");
+  const first = pagination.loadAdmin("uploads");
+  const firstRequest = pending.at(-1);
+  const second = pagination.loadAdmin("uploads");
+  const secondRequest = pending.at(-1);
+  assert.notEqual(firstRequest, secondRequest, "reopening must start a fresh request");
+  secondRequest.resolve(response([{ id: 2, request_code: "new", status: "uploaded" }], "next"));
+  await second;
+  assert.match(document.querySelector("#admin-content").innerHTML, /new/);
+  firstRequest.resolve(response([{ id: 1, request_code: "stale", status: "uploaded" }]));
+  await first;
+  assert.doesNotMatch(document.querySelector("#admin-content").innerHTML, /stale/);
+  assert.equal(pagination.pager("adminUploads").loading, false);
+  assert.equal(pagination.pager("adminUploads").cursor, null);
+
+  const oldNavigation = pagination.guardedPage(
+    "adminUploads", "/old-next", { cursor: "old", previous: [null], page: 2 }, () => false,
+  );
+  pending.at(-1).reject(new Error("stale failure"));
+  await assert.rejects(oldNavigation);
+  assert.equal(pagination.pager("adminUploads").page, 1, "cancelled navigation is not committed");
+
+  pagination.resetPager("userUploads");
+  const user = pagination.guardedPage("userUploads", "/parallel-user");
+  pagination.loadAdmin("users");
+  const usersRequest = pending.at(-1);
+  pending.at(-2).resolve(response(["user-row"]));
+  assert.deepEqual(await user, ["user-row"], "admin views do not invalidate user pagination");
+  usersRequest.resolve(response([]));
+  await Promise.resolve();
+}
+
+async function diskRootSaveSurvivesViewReplacement() {
+  const opened = pagination.loadAdmin("disk-root");
+  pending.at(-1).resolve({ ...response([]), text: async () => JSON.stringify({ value: "old", source: "env" }) });
+  await opened;
+  const input = document.querySelector("#disk-root-input");
+  input.value = "new";
+  const saving = document.querySelector("#save-disk-root").onclick();
+  const putRequest = pending.at(-1);
+  assert.equal(input.disabled, true);
+  // A second click shares the one active save instead of issuing another PUT.
+  assert.equal(document.querySelector("#save-disk-root").onclick(), saving);
+
+  const other = pagination.loadAdmin("users");
+  pending.at(-1).resolve(response([]));
+  await other;
+  const otherHtml = document.querySelector("#admin-content").innerHTML;
+  putRequest.resolve({ ...response([]), text: async () => JSON.stringify({ value: "new" }) });
+  await saving;
+  assert.equal(document.querySelector("#admin-content").innerHTML, otherHtml, "PUT must not repaint another tab");
+
+  const reopened = pagination.loadAdmin("disk-root");
+  pending.at(-1).resolve({ ...response([]), text: async () => JSON.stringify({ value: "new", source: "database" }) });
+  await reopened;
+  assert.match(document.querySelector("#disk-root-current").innerHTML, /new/);
+  assert.match(document.querySelector("#disk-root-message").textContent || document.querySelector("#admin-content").innerHTML, /сохранена/);
+}
+
+async function staleSearchTimerCannotActAsNewView() {
+  const callbacks = [];
+  const originalSetTimeout = global.setTimeout;
+  const originalClearTimeout = global.clearTimeout;
+  global.setTimeout = (callback) => { callbacks.push(callback); return callbacks.length; };
+  global.clearTimeout = () => {};
+  try {
+    const renames = pagination.loadAdmin("renames");
+    pending.at(-1).resolve(response([]));
+    await renames;
+    const search = document.querySelector("#rename-user-search");
+    search.value = "old query";
+    search.oninput();
+    const requestCount = pending.length;
+    const users = pagination.loadAdmin("users");
+    pending.at(-1).resolve(response([]));
+    await users;
+    await callbacks.at(-1)();
+    assert.equal(pending.length, requestCount + 1, "stale timer must not issue a search request");
+  } finally {
+    global.setTimeout = originalSetTimeout;
+    global.clearTimeout = originalClearTimeout;
+  }
+}
+
 (async () => {
   await independentPagersAndReset();
   await atomicNavigationFailureRetryAndDoubleClick();
   await adminViewGeneration();
+  await reopenedAdminViewSupersedesPendingWork();
+  await diskRootSaveSurvivesViewReplacement();
+  await staleSearchTimerCannotActAsNewView();
   process.stdout.write("frontend pagination regressions passed\n");
 })().catch((error) => { console.error(error); process.exitCode = 1; });

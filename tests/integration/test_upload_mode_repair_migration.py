@@ -25,6 +25,7 @@ from sqlalchemy.pool import NullPool
 from alembic import command
 
 CURRENT_HEAD_REVISION = "0011_upload_index_ownership"
+PAGINATION_REVISION = "0012_pagination_created_at"
 TELEGRAM_OUTBOX_REVISION = "0008_telegram_outbox"
 
 MIGRATION_DATABASE_URL = os.getenv("MIGRATION_DATABASE_URL")
@@ -368,11 +369,17 @@ async def _revision(conn: AsyncConnection) -> str | None:
     ).scalar_one_or_none()
 
 
+def _head_revision(cfg: Config) -> str:
+    heads = ScriptDirectory.from_config(cfg).get_heads()
+    assert len(heads) == 1, f"expected one migration head, got {heads}"
+    return heads[0]
+
+
 async def _cleanup_test_upload_ordering_index(conn: AsyncConnection) -> str | None:
     """Reconcile a test-owned ordering index with the recorded revision."""
     revision = await _revision(conn)
     await conn.execute(text("DROP INDEX IF EXISTS public.ix_upload_requests_created_id"))
-    if revision in {"0010_upload_created_index", CURRENT_HEAD_REVISION}:
+    if revision in {"0010_upload_created_index", CURRENT_HEAD_REVISION, PAGINATION_REVISION}:
         await _restore_managed_upload_index(conn)
     elif revision not in {None, TELEGRAM_OUTBOX_REVISION, "0009_db_integrity"}:
         raise AssertionError(f"unexpected revision during test index cleanup: {revision}")
@@ -466,6 +473,7 @@ async def _seed_legacy_0004(conn: AsyncConnection) -> None:
 
 def test_existing_0005_database_is_repaired_by_head(migration_db):
     cfg, expected_database = migration_db
+    head_revision = _head_revision(cfg)
     command.upgrade(cfg, "0005_upload_queue_worker")
 
     async def seed_and_check(conn: AsyncConnection) -> None:
@@ -480,7 +488,7 @@ def test_existing_0005_database_is_repaired_by_head(migration_db):
     async def check_head(conn: AsyncConnection) -> dict[str, str]:
         assert (
             await conn.execute(text("SELECT version_num FROM alembic_version"))
-        ).scalar_one() == CURRENT_HEAD_REVISION
+        ).scalar_one() == head_revision
         return await _modes(conn)
 
     expected = _with_migration_connection(expected_database, check_head)
@@ -513,6 +521,7 @@ def test_existing_0005_database_is_repaired_by_head(migration_db):
 
 def test_clean_install_path_runs_0005_to_head_to_same_modes(migration_db):
     cfg, expected_database = migration_db
+    head_revision = _head_revision(cfg)
     command.upgrade(cfg, "0004_user_folder_names")
     _with_migration_connection(expected_database, _seed_legacy_0004)
     command.upgrade(cfg, "head")
@@ -520,7 +529,7 @@ def test_clean_install_path_runs_0005_to_head_to_same_modes(migration_db):
     async def check(conn: AsyncConnection) -> None:
         assert (
             await conn.execute(text("SELECT version_num FROM alembic_version"))
-        ).scalar_one() == CURRENT_HEAD_REVISION
+        ).scalar_one() == head_revision
         assert await _modes(conn) == {
             "copy_retry": "copy",
             "copy_path_approve": "copy",
@@ -546,6 +555,7 @@ def test_existing_0009_database_receives_upload_ordering_index(
     migration_db, preexisting_index: bool
 ):
     cfg, expected_database = migration_db
+    head_revision = _head_revision(cfg)
     command.upgrade(cfg, "0009_db_integrity")
 
     async def indexes_at_0009(conn: AsyncConnection) -> None:
@@ -586,7 +596,7 @@ def test_existing_0009_database_receives_upload_ordering_index(
     command.upgrade(cfg, "head")
 
     async def index_at_head(conn: AsyncConnection) -> None:
-        assert await _revision(conn) == CURRENT_HEAD_REVISION
+        assert await _revision(conn) == head_revision
         index_columns = (
             await conn.execute(
                 text(
@@ -1216,13 +1226,13 @@ def test_0010_resolves_upload_index_schema_from_target_relation(migration_db, sc
         _with_migration_connection(expected_database, check_resolution)
         if scenario == "conflict":
             with pytest.raises(RuntimeError, match="ix_upload_requests_created_id"):
-                command.upgrade(cfg, "head")
+                command.upgrade(cfg, "0010_upload_created_index")
         else:
-            command.upgrade(cfg, "head")
+            command.upgrade(cfg, "0010_upload_created_index")
 
         async def check_result(conn: AsyncConnection) -> None:
             expected_revision = (
-                "0009_db_integrity" if scenario == "conflict" else CURRENT_HEAD_REVISION
+                "0009_db_integrity" if scenario == "conflict" else "0010_upload_created_index"
             )
             assert await _revision(conn) == expected_revision
             rows = (
@@ -2344,7 +2354,7 @@ def test_0010_upgrade_refuses_foreign_index_comment(migration_db, execution: str
 
 def test_0011_fresh_upgrade_has_owned_index_with_full_signature(migration_db):
     cfg, expected_database = migration_db
-    command.upgrade(cfg, "head")
+    command.upgrade(cfg, CURRENT_HEAD_REVISION)
 
     async def check(conn: AsyncConnection) -> None:
         assert await _revision(conn) == CURRENT_HEAD_REVISION
@@ -2426,7 +2436,7 @@ def test_0011_backfills_legacy_0010_and_preserves_index_oid(migration_db):
         return oid
 
     old_oid = _with_migration_connection(expected_database, make_legacy)
-    command.upgrade(cfg, "head")
+    command.upgrade(cfg, CURRENT_HEAD_REVISION)
 
     async def check_backfill(conn: AsyncConnection) -> None:
         assert await _revision(conn) == CURRENT_HEAD_REVISION
@@ -2812,7 +2822,7 @@ def test_0011_backfills_after_empty_comment_is_removed_by_postgresql(migration_d
         return oid
 
     old_oid = _with_migration_connection(expected_database, remove_comment)
-    command.upgrade(cfg, "head")
+    command.upgrade(cfg, CURRENT_HEAD_REVISION)
 
     async def check(conn: AsyncConnection) -> None:
         assert await _revision(conn) == CURRENT_HEAD_REVISION
@@ -2828,6 +2838,80 @@ def test_0011_backfills_after_empty_comment_is_removed_by_postgresql(migration_d
         assert row == (old_oid, INDEX_OWNERSHIP_MARKER)
 
     _with_migration_connection(expected_database, check)
+
+
+def test_0011_to_0012_to_0011_preserves_owned_index_and_pagination_contract(migration_db):
+    cfg, expected_database = migration_db
+    command.upgrade(cfg, CURRENT_HEAD_REVISION)
+
+    async def seed(conn: AsyncConnection) -> tuple[int, str]:
+        await conn.execute(
+            text(
+                "INSERT INTO users (telegram_id, status, allowed_folders, created_at) "
+                "VALUES (9912001, 'active', '[]'::jsonb, NULL)"
+            )
+        )
+        row = (
+            await conn.execute(
+                text(
+                    "SELECT i.oid, obj_description(i.oid, 'pg_class') "
+                    "FROM pg_class i WHERE i.oid="
+                    "'public.ix_upload_requests_created_id'::regclass"
+                )
+            )
+        ).one()
+        return row.oid, row.obj_description
+
+    index_before = _with_migration_connection(expected_database, seed)
+    command.upgrade(cfg, PAGINATION_REVISION)
+
+    async def at_0012(conn: AsyncConnection) -> None:
+        assert await _revision(conn) == PAGINATION_REVISION
+        assert (
+            await conn.execute(
+                text("SELECT created_at IS NOT NULL FROM users WHERE telegram_id=9912001")
+            )
+        ).scalar_one()
+        nullable = (
+            await conn.execute(
+                text(
+                    "SELECT table_name, is_nullable FROM information_schema.columns "
+                    "WHERE table_schema='public' AND column_name='created_at' "
+                    "AND table_name = ANY(:tables) ORDER BY table_name"
+                ),
+                {"tables": ["users", "upload_requests", "audit_log", "folder_rename_requests"]},
+            )
+        ).all()
+        assert nullable == [
+            ("audit_log", "NO"),
+            ("folder_rename_requests", "NO"),
+            ("upload_requests", "NO"),
+            ("users", "NO"),
+        ]
+        assert (
+            await conn.execute(text("SELECT to_regclass('ix_folder_rename_user_created_id')"))
+        ).scalar_one() is not None
+
+    _with_migration_connection(expected_database, at_0012)
+    command.downgrade(cfg, CURRENT_HEAD_REVISION)
+
+    async def back_at_0011(conn: AsyncConnection) -> None:
+        assert await _revision(conn) == CURRENT_HEAD_REVISION
+        assert (
+            await conn.execute(text("SELECT to_regclass('ix_folder_rename_user_created_id')"))
+        ).scalar_one_or_none() is None
+        row = (
+            await conn.execute(
+                text(
+                    "SELECT i.oid, obj_description(i.oid, 'pg_class') "
+                    "FROM pg_class i WHERE i.oid="
+                    "'public.ix_upload_requests_created_id'::regclass"
+                )
+            )
+        ).one()
+        assert tuple(row) == index_before
+
+    _with_migration_connection(expected_database, back_at_0011)
 
 
 def test_0011_downgrade_preserves_marker_for_strict_0010_downgrade(migration_db):
@@ -3407,6 +3491,7 @@ async def _queued_stable_columns(conn: AsyncConnection) -> dict[str, tuple]:
 
 def test_existing_0006_database_repairs_queued_legacy_retries(migration_db):
     cfg, expected_database = migration_db
+    head_revision = _head_revision(cfg)
     command.upgrade(cfg, "0006_repair_upload_mode_backfill")
 
     async def seed_and_check(conn: AsyncConnection) -> dict[str, tuple]:
@@ -3418,7 +3503,7 @@ def test_existing_0006_database_repairs_queued_legacy_retries(migration_db):
     command.upgrade(cfg, "head")
 
     async def check(conn: AsyncConnection) -> tuple[dict[str, str], dict[str, tuple]]:
-        assert await _revision(conn) == CURRENT_HEAD_REVISION
+        assert await _revision(conn) == head_revision
         return await _queued_modes(conn), await _queued_stable_columns(conn)
 
     expected, after_stable_columns = _with_migration_connection(expected_database, check)
@@ -3454,7 +3539,7 @@ def test_existing_0006_database_repairs_queued_legacy_retries(migration_db):
     command.upgrade(cfg, "head")
 
     async def check_idempotent(conn: AsyncConnection) -> None:
-        assert await _revision(conn) == CURRENT_HEAD_REVISION
+        assert await _revision(conn) == head_revision
         assert await _queued_modes(conn) == expected
 
     _with_migration_connection(expected_database, check_idempotent)
