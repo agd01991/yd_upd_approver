@@ -1339,10 +1339,10 @@ def test_0010_downgrade_finds_only_the_managed_index_across_schemas(migration_db
 
         _with_migration_connection(expected_database, shadow_is_resolved)
         if scenario == "ambiguous":
-            with pytest.raises(RuntimeError, match="ambiguous compatible indexes"):
+            with pytest.raises(RuntimeError, match="duplicate ownership markers"):
                 command.downgrade(cfg, "0009_db_integrity")
         elif scenario in {"missing", "materialized-only"}:
-            with pytest.raises(RuntimeError, match="no compatible managed index"):
+            with pytest.raises(RuntimeError, match="ownership marker was not found"):
                 command.downgrade(cfg, "0009_db_integrity")
         else:
             command.downgrade(cfg, "0009_db_integrity")
@@ -1547,8 +1547,8 @@ def test_0010_online_and_offline_downgrade_target_regressions(
         should_fail = scenario in "BCDE"
         expected_reason = {
             "B": "incompatible managed index target",
-            "C": "incompatible managed index target",
-            "D": "ambiguous compatible indexes",
+            "C": "duplicate ownership markers",
+            "D": "duplicate ownership markers",
             "E": "application target is ambiguous",
         }.get(scenario)
 
@@ -1607,6 +1607,110 @@ def test_0010_online_and_offline_downgrade_target_regressions(
             if active_error is None:
                 raise
             logging.getLogger(__name__).exception("scenario cleanup also failed")
+
+
+@pytest.mark.parametrize("execution", ["online", "offline"], ids=["online", "offline-full-sql"])
+@pytest.mark.parametrize("scenario", list("ABCD"))
+def test_0010_downgrade_rejects_duplicate_ownership_markers_globally(
+    migration_db, execution: str, scenario: str
+):
+    """Marker counting is global and precedes every name/target/signature filter."""
+    cfg, expected_database = migration_db
+
+    async def marker_state(conn: AsyncConnection) -> list[tuple[object, ...]]:
+        return (
+            await conn.execute(
+                text(
+                    "SELECT i.oid, n.nspname, i.relname, pg_catalog.pg_get_indexdef(i.oid), "
+                    "pg_catalog.obj_description(i.oid, 'pg_class') "
+                    "FROM pg_catalog.pg_class AS i "
+                    "JOIN pg_catalog.pg_namespace AS n ON n.oid = i.relnamespace "
+                    "JOIN pg_catalog.pg_index AS x ON x.indexrelid = i.oid "
+                    "WHERE pg_catalog.obj_description(i.oid, 'pg_class') = :marker "
+                    "ORDER BY i.oid"
+                ),
+                {"marker": INDEX_OWNERSHIP_MARKER},
+            )
+        ).all()
+
+    async def arrange(conn: AsyncConnection) -> list[tuple[object, ...]]:
+        if scenario in "AB":
+            await conn.execute(text("CREATE SCHEMA duplicate_owner"))
+            await conn.execute(
+                text(
+                    "CREATE TABLE duplicate_owner.other_uploads "
+                    "(id integer NOT NULL, created_at timestamptz NOT NULL)"
+                )
+            )
+        statements = {
+            "A": "CREATE INDEX ordinary_name ON duplicate_owner.other_uploads (created_at DESC, id)",
+            "B": "CREATE INDEX other_table_marker ON duplicate_owner.other_uploads (id)",
+            "C": "CREATE INDEX alternate_upload_index ON public.upload_requests (id, created_at)",
+            "D": (
+                "CREATE INDEX expression_partial_marker ON public.upload_requests "
+                "((id + 1)) WHERE id > 0"
+            ),
+        }
+        await conn.execute(text(statements[scenario]))
+        schema = "duplicate_owner" if scenario in "AB" else "public"
+        name = {
+            "A": "ordinary_name",
+            "B": "other_table_marker",
+            "C": "alternate_upload_index",
+            "D": "expression_partial_marker",
+        }[scenario]
+        await conn.execute(
+            text(
+                f"COMMENT ON INDEX {schema}.{name} IS "  # noqa: S608 -- fixed test identifiers
+                "'yd_upd_approver:alembic:0010_upload_created_index'"
+            )
+        )
+        state = await marker_state(conn)
+        assert len(state) == 2
+        return state
+
+    async def cleanup(conn: AsyncConnection) -> None:
+        await conn.execute(text("ROLLBACK"))
+        await conn.execute(text("DROP SCHEMA IF EXISTS duplicate_owner CASCADE"))
+        for name in ("alternate_upload_index", "expression_partial_marker"):
+            await conn.execute(text(f"DROP INDEX IF EXISTS public.{name}"))  # noqa: S608
+        if await _revision(conn) == "0010_upload_created_index":
+            await _restore_managed_upload_index(conn)
+
+    try:
+        command.upgrade(cfg, "0010_upload_created_index")
+        before = _with_migration_connection(expected_database, arrange)
+        if execution == "online":
+
+            def operation() -> None:
+                command.downgrade(cfg, "0009_db_integrity")
+
+        else:
+            sql = _generated_0010_downgrade_sql()
+
+            def operation() -> None:
+                async def execute(conn: AsyncConnection) -> None:
+                    try:
+                        await _execute_complete_offline_script(conn, sql)
+                    except Exception:
+                        await conn.execute(text("ROLLBACK"))
+                        raise
+
+                _with_migration_connection(expected_database, execute)
+
+        with pytest.raises(
+            (RuntimeError, SQLAlchemyError, PostgresError), match="duplicate ownership markers"
+        ) as caught:
+            operation()
+        assert "SyntaxError" not in type(caught.value).__name__
+
+        async def verify(conn: AsyncConnection) -> None:
+            assert await _revision(conn) == "0010_upload_created_index"
+            assert await marker_state(conn) == before
+
+        _with_migration_connection(expected_database, verify)
+    finally:
+        _with_migration_connection(expected_database, cleanup)
 
 
 @pytest.mark.parametrize(
@@ -1725,7 +1829,7 @@ def test_0010_offline_runtime_rejects_wrong_order_indexes(migration_db):
                 "ON role_shadow.upload_requests (created_at ASC NULLS FIRST, id ASC)"
             )
         )
-        with pytest.raises(Exception, match="no compatible managed index"):
+        with pytest.raises(Exception, match="ownership marker was not found"):
             await conn.execute(text(migration._offline_downgrade_sql()))
         assert (
             await conn.execute(

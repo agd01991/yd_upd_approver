@@ -286,9 +286,12 @@ def _find_existing_index(target: _TargetTable) -> _IndexSignature | None:
     return indexes[0] if indexes else None
 
 
-def _matches_expected_index(index: _IndexSignature, target: _TargetTable) -> bool:
+def _matches_expected_index(
+    index: _IndexSignature, target: _TargetTable, *, expected_name: str = _INDEX_NAME
+) -> bool:
     return (
-        index.schema == target.schema
+        index.index_name == expected_name
+        and index.schema == target.schema
         and index.index_schema_oid == target.schema_oid
         and index.table_oid == target.oid
         and index.table_schema == target.schema
@@ -321,7 +324,7 @@ def _matches_renamed_index(
         and index.index_schema_oid == original.index_schema_oid == target.schema_oid
         and index.schema == original.schema == target.schema
         and index.index_name == temporary_name
-        and _matches_expected_index(index, target)
+        and _matches_expected_index(index, target, expected_name=temporary_name)
     )
 
 
@@ -340,30 +343,37 @@ def _validate_existing_index(index: _IndexSignature | None, target: _TargetTable
     )
 
 
-def _downgrade_candidates(target: _TargetTable | None = None) -> list[_IndexSignature]:
-    """Return only fully validated marker-owned indexes for the resolved target."""
-    return [
-        index
-        for index in _index_rows(
-            "pg_catalog.obj_description(index_class.oid, 'pg_class') = :marker",
+def _owned_index_oids() -> list[int]:
+    """Return every index bearing the exact marker, without target/signature filters."""
+    rows = (
+        op.get_bind()
+        .execute(
+            text("""
+                SELECT index_class.oid
+                FROM pg_catalog.pg_class AS index_class
+                JOIN pg_catalog.pg_index AS index_definition
+                  ON index_definition.indexrelid = index_class.oid
+                WHERE pg_catalog.obj_description(index_class.oid, 'pg_class') OPERATOR(pg_catalog.=) :marker
+                ORDER BY index_class.oid
+            """),
             {"marker": _INDEX_OWNERSHIP_MARKER},
         )
-        if (target is None or _matches_expected_index(index, target))
-        and index.key_columns == _EXPECTED_KEY_COLUMNS
-        and index.key_options == _EXPECTED_KEY_OPTIONS
-        and index.key_opclasses == index.expected_key_opclasses
-        and len(index.key_opclasses) == 2
-        and index.key_column_count == 2
-        and index.total_column_count == 2
-        and index.access_method == "btree"
-        and not index.is_unique
-        and not index.is_partial
-        and not index.is_expression
-        and not index.is_exclusion
-        and index.is_valid
-        and index.is_ready
-        and index.ownership_comment == _INDEX_OWNERSHIP_MARKER
-    ]
+        .scalars()
+        .all()
+    )
+    return list(rows)
+
+
+def _downgrade_candidates() -> list[_IndexSignature]:
+    """Load all marker owners by OID; validation deliberately happens later."""
+    candidates: list[_IndexSignature] = []
+    for index_oid in _owned_index_oids():
+        candidates.extend(
+            _index_rows(
+                "index_class.oid = :index_oid", {"index_oid": index_oid}, require_name=False
+            )
+        )
+    return candidates
 
 
 def _quote_identifier(value: str) -> str:
@@ -455,7 +465,7 @@ def _offline_downgrade_sql() -> str:
     anchors = _target_anchor_predicates("target_table")
     return f"""
 DO $$
-DECLARE target_count pg_catalog.int8; target_oid pg_catalog.oid; target_schema_oid pg_catalog.oid; target_schema pg_catalog.name; candidate_count pg_catalog.int8; candidate_schema pg_catalog.name; candidate_schema_oid pg_catalog.oid; candidate_schemas pg_catalog.text; candidate_oid pg_catalog.oid; candidate_table_oid pg_catalog.oid; temporary_name pg_catalog.text;
+DECLARE target_count pg_catalog.int8; target_oid pg_catalog.oid; target_schema_oid pg_catalog.oid; target_schema pg_catalog.name; candidate_count pg_catalog.int8; candidate_schema pg_catalog.name; candidate_schema_oid pg_catalog.oid; candidate_schemas pg_catalog.text; candidate_oid pg_catalog.oid; candidate_table_oid pg_catalog.oid; locked_owner_oid pg_catalog.oid; temporary_name pg_catalog.text;
 BEGIN
   SELECT pg_catalog.count(*), pg_catalog.min(target_table.oid), pg_catalog.min(target_namespace.oid), pg_catalog.min(target_namespace.nspname)
     INTO target_count, target_oid, target_schema_oid, target_schema
@@ -469,17 +479,35 @@ BEGIN
       AND {anchors};
   IF target_count = 0 THEN RAISE EXCEPTION 'Cannot downgrade 0010_upload_created_index: application target was not found'; END IF;
   IF target_count > 1 THEN RAISE EXCEPTION 'Cannot downgrade 0010_upload_created_index: application target is ambiguous'; END IF;
-  SELECT pg_catalog.count(*), pg_catalog.min(ins.nspname), pg_catalog.min(ins.oid), pg_catalog.string_agg(pg_catalog.format('%I', ins.nspname), ', ' ORDER BY ins.nspname), pg_catalog.min(i.oid), pg_catalog.min(x.indrelid) INTO candidate_count, candidate_schema, candidate_schema_oid, candidate_schemas, candidate_oid, candidate_table_oid FROM pg_catalog.pg_class i JOIN pg_catalog.pg_namespace ins ON ins.oid = i.relnamespace JOIN pg_catalog.pg_index x ON x.indexrelid = i.oid JOIN pg_catalog.pg_class t ON t.oid = x.indrelid JOIN pg_catalog.pg_namespace tns ON tns.oid = t.relnamespace JOIN pg_catalog.pg_am am ON am.oid = i.relam WHERE i.relname = 'ix_upload_requests_created_id' AND ins.oid = tns.oid AND t.relname = 'upload_requests' AND t.relkind IN ('r', 'p') AND pg_catalog.left(ins.nspname, 3)  OPERATOR(pg_catalog.<>)  'pg_' AND ins.nspname  OPERATOR(pg_catalog.<>)  'information_schema' AND pg_catalog.obj_description(i.oid, 'pg_class') = 'yd_upd_approver:alembic:0010_upload_created_index' AND x.indnkeyatts = 2 AND x.indnatts = 2 AND am.amname = 'btree' AND NOT x.indisunique AND NOT x.indisexclusion AND x.indpred IS NULL AND x.indexprs IS NULL AND x.indisvalid AND x.indisready AND (SELECT pg_catalog.array_agg(a.attname ORDER BY k.ordinality) FROM pg_catalog.unnest(x.indkey) WITH ORDINALITY AS k(attnum, ordinality) JOIN pg_catalog.pg_attribute a ON a.attrelid = x.indrelid AND a.attnum = k.attnum WHERE k.ordinality <= x.indnkeyatts) = ARRAY['created_at', 'id']::pg_catalog.name[] AND (SELECT pg_catalog.array_agg(o.option ORDER BY o.ordinality) FROM pg_catalog.unnest(x.indoption) WITH ORDINALITY AS o(option, ordinality) WHERE o.ordinality <= x.indnkeyatts) = ARRAY[0, 0]::pg_catalog.int2[] AND (SELECT pg_catalog.array_agg(ic.opclass_oid ORDER BY ic.ordinality) FROM pg_catalog.unnest(x.indclass) WITH ORDINALITY AS ic(opclass_oid, ordinality) WHERE ic.ordinality <= x.indnkeyatts) = (SELECT pg_catalog.array_agg(opc.oid ORDER BY k.ordinality) FROM pg_catalog.unnest(x.indkey) WITH ORDINALITY AS k(attnum, ordinality) JOIN pg_catalog.pg_attribute a ON a.attrelid=x.indrelid AND a.attnum=k.attnum JOIN pg_catalog.pg_opclass opc ON opc.opcmethod=(SELECT oid FROM pg_catalog.pg_am WHERE amname='btree') AND opc.opcintype=a.atttypid AND opc.opcdefault WHERE k.ordinality <= x.indnkeyatts);
-  IF candidate_count = 0 THEN RAISE EXCEPTION 'Cannot downgrade 0010_upload_created_index: no compatible managed index was found'; END IF;
-  IF candidate_count > 1 THEN RAISE EXCEPTION 'Cannot downgrade 0010_upload_created_index: ambiguous compatible indexes in schemas: %', candidate_schemas; END IF;
-  IF candidate_table_oid OPERATOR(pg_catalog.<>) target_oid
-     OR candidate_schema_oid OPERATOR(pg_catalog.<>) target_schema_oid
-     OR candidate_schema OPERATOR(pg_catalog.<>) target_schema THEN
+  SELECT pg_catalog.count(*), pg_catalog.min(ins.nspname), pg_catalog.min(ins.oid),
+         pg_catalog.string_agg(pg_catalog.format('%I', ins.nspname), ', ' ORDER BY i.oid),
+         pg_catalog.min(i.oid), pg_catalog.min(x.indrelid)
+    INTO candidate_count, candidate_schema, candidate_schema_oid, candidate_schemas,
+         candidate_oid, candidate_table_oid
+    FROM pg_catalog.pg_class AS i
+    JOIN pg_catalog.pg_namespace AS ins ON ins.oid = i.relnamespace
+    JOIN pg_catalog.pg_index AS x ON x.indexrelid = i.oid
+    WHERE pg_catalog.obj_description(i.oid, 'pg_class') OPERATOR(pg_catalog.=)
+          'yd_upd_approver:alembic:0010_upload_created_index';
+  IF candidate_count = 0 THEN RAISE EXCEPTION 'Cannot downgrade 0010_upload_created_index: ownership marker was not found'; END IF;
+  IF candidate_count > 1 THEN RAISE EXCEPTION 'Cannot downgrade 0010_upload_created_index: duplicate ownership markers in schemas: %', candidate_schemas; END IF;
+  SELECT pg_catalog.count(*) INTO candidate_count FROM pg_catalog.pg_class i JOIN pg_catalog.pg_namespace ins ON ins.oid = i.relnamespace JOIN pg_catalog.pg_index x ON x.indexrelid = i.oid JOIN pg_catalog.pg_class t ON t.oid = x.indrelid JOIN pg_catalog.pg_namespace tns ON tns.oid = t.relnamespace JOIN pg_catalog.pg_am am ON am.oid = i.relam WHERE i.oid = candidate_oid AND i.relname = 'ix_upload_requests_created_id' AND ins.oid = target_schema_oid AND ins.nspname = target_schema AND x.indrelid = target_oid AND ins.oid = tns.oid AND t.relname = 'upload_requests' AND t.relkind IN ('r', 'p') AND pg_catalog.left(ins.nspname, 3) OPERATOR(pg_catalog.<>) 'pg_' AND ins.nspname OPERATOR(pg_catalog.<>) 'information_schema' AND pg_catalog.obj_description(i.oid, 'pg_class') = 'yd_upd_approver:alembic:0010_upload_created_index' AND x.indnkeyatts = 2 AND x.indnatts = 2 AND am.amname = 'btree' AND NOT x.indisunique AND NOT x.indisexclusion AND x.indpred IS NULL AND x.indexprs IS NULL AND x.indisvalid AND x.indisready AND (SELECT pg_catalog.array_agg(a.attname ORDER BY k.ordinality) FROM pg_catalog.unnest(x.indkey) WITH ORDINALITY AS k(attnum, ordinality) JOIN pg_catalog.pg_attribute a ON a.attrelid = x.indrelid AND a.attnum = k.attnum WHERE k.ordinality <= x.indnkeyatts) = ARRAY['created_at', 'id']::pg_catalog.name[] AND (SELECT pg_catalog.array_agg(o.option ORDER BY o.ordinality) FROM pg_catalog.unnest(x.indoption) WITH ORDINALITY AS o(option, ordinality) WHERE o.ordinality <= x.indnkeyatts) = ARRAY[0, 0]::pg_catalog.int2[] AND (SELECT pg_catalog.array_agg(ic.opclass_oid ORDER BY ic.ordinality) FROM pg_catalog.unnest(x.indclass) WITH ORDINALITY AS ic(opclass_oid, ordinality) WHERE ic.ordinality <= x.indnkeyatts) = (SELECT pg_catalog.array_agg(opc.oid ORDER BY k.ordinality) FROM pg_catalog.unnest(x.indkey) WITH ORDINALITY AS k(attnum, ordinality) JOIN pg_catalog.pg_attribute a ON a.attrelid=x.indrelid AND a.attnum=k.attnum JOIN pg_catalog.pg_opclass opc ON opc.opcmethod=(SELECT oid FROM pg_catalog.pg_am WHERE amname='btree') AND opc.opcintype=a.atttypid AND opc.opcdefault WHERE k.ordinality <= x.indnkeyatts);
+  IF candidate_count OPERATOR(pg_catalog.<>) 1 THEN
     RAISE EXCEPTION 'Cannot downgrade 0010_upload_created_index: incompatible managed index target';
   END IF;
   temporary_name := '__yd_0010_drop_' || candidate_oid::pg_catalog.text;
   EXECUTE pg_catalog.format('ALTER INDEX %I.%I RENAME TO %I', candidate_schema,
                             'ix_upload_requests_created_id', temporary_name);
+  SELECT pg_catalog.count(*), pg_catalog.min(i.oid)
+    INTO candidate_count, locked_owner_oid
+    FROM pg_catalog.pg_class AS i
+    JOIN pg_catalog.pg_index AS x ON x.indexrelid = i.oid
+    WHERE pg_catalog.obj_description(i.oid, 'pg_class') OPERATOR(pg_catalog.=)
+          'yd_upd_approver:alembic:0010_upload_created_index';
+  IF candidate_count OPERATOR(pg_catalog.<>) 1
+     OR locked_owner_oid OPERATOR(pg_catalog.<>) candidate_oid THEN
+    RAISE EXCEPTION 'Cannot downgrade 0010_upload_created_index: locked index validation failure';
+  END IF;
   SELECT pg_catalog.count(*) INTO candidate_count FROM pg_catalog.pg_class i JOIN pg_catalog.pg_namespace ins ON ins.oid = i.relnamespace JOIN pg_catalog.pg_index x ON x.indexrelid = i.oid JOIN pg_catalog.pg_class t ON t.oid = x.indrelid JOIN pg_catalog.pg_namespace tns ON tns.oid = t.relnamespace JOIN pg_catalog.pg_am am ON am.oid = i.relam WHERE i.oid = candidate_oid AND i.relname = temporary_name AND ins.oid = candidate_schema_oid AND ins.oid = target_schema_oid AND ins.nspname = target_schema AND x.indrelid = candidate_table_oid AND x.indrelid = target_oid AND ins.oid = tns.oid AND t.relname = 'upload_requests' AND t.relkind IN ('r', 'p') AND pg_catalog.left(ins.nspname, 3)  OPERATOR(pg_catalog.<>)  'pg_' AND ins.nspname  OPERATOR(pg_catalog.<>)  'information_schema' AND pg_catalog.obj_description(i.oid, 'pg_class') = 'yd_upd_approver:alembic:0010_upload_created_index' AND x.indnkeyatts = 2 AND x.indnatts = 2 AND am.amname = 'btree' AND NOT x.indisunique AND NOT x.indisexclusion AND x.indpred IS NULL AND x.indexprs IS NULL AND x.indisvalid AND x.indisready AND (SELECT pg_catalog.array_agg(a.attname ORDER BY k.ordinality) FROM pg_catalog.unnest(x.indkey) WITH ORDINALITY AS k(attnum, ordinality) JOIN pg_catalog.pg_attribute a ON a.attrelid = x.indrelid AND a.attnum = k.attnum WHERE k.ordinality <= x.indnkeyatts) = ARRAY['created_at', 'id']::pg_catalog.name[] AND (SELECT pg_catalog.array_agg(o.option ORDER BY o.ordinality) FROM pg_catalog.unnest(x.indoption) WITH ORDINALITY AS o(option, ordinality) WHERE o.ordinality <= x.indnkeyatts) = ARRAY[0, 0]::pg_catalog.int2[] AND (SELECT pg_catalog.array_agg(ic.opclass_oid ORDER BY ic.ordinality) FROM pg_catalog.unnest(x.indclass) WITH ORDINALITY AS ic(opclass_oid, ordinality) WHERE ic.ordinality <= x.indnkeyatts) = (SELECT pg_catalog.array_agg(opc.oid ORDER BY k.ordinality) FROM pg_catalog.unnest(x.indkey) WITH ORDINALITY AS k(attnum, ordinality) JOIN pg_catalog.pg_attribute a ON a.attrelid=x.indrelid AND a.attnum=k.attnum JOIN pg_catalog.pg_opclass opc ON opc.opcmethod=(SELECT oid FROM pg_catalog.pg_am WHERE amname='btree') AND opc.opcintype=a.atttypid AND opc.opcdefault WHERE k.ordinality <= x.indnkeyatts);
   IF candidate_count OPERATOR(pg_catalog.<>) 1 THEN
     RAISE EXCEPTION 'Cannot downgrade 0010_upload_created_index: locked index validation failure';
@@ -516,16 +544,16 @@ def downgrade() -> None:
     if _is_offline_mode():
         op.execute(_offline_downgrade_sql())
         return
+    target = _resolve_target_table()
     candidates = _downgrade_candidates()
     if not candidates:
-        raise RuntimeError(f"Cannot downgrade {revision}: no compatible managed index was found.")
+        raise RuntimeError(f"Cannot downgrade {revision}: ownership marker was not found.")
     if len(candidates) > 1:
         schemas = ", ".join(repr(index.schema) for index in candidates)
         raise RuntimeError(
-            f"Cannot downgrade {revision}: ambiguous compatible indexes in schemas: {schemas}."
+            f"Cannot downgrade {revision}: duplicate ownership markers in schemas: {schemas}."
         )
     candidate = candidates[0]
-    target = _resolve_target_table()
     if not _matches_expected_index(candidate, target):
         raise RuntimeError(f"Cannot downgrade {revision}: incompatible managed index target.")
     # Rename locks this exact relation until the migration transaction ends.  Re-read
@@ -538,8 +566,10 @@ def downgrade() -> None:
     locked_rows = _index_rows(
         "index_class.oid = :index_oid", {"index_oid": candidate.index_oid}, require_name=False
     )
+    locked_owner_oids = _owned_index_oids()
     if (
-        len(locked_rows) != 1
+        locked_owner_oids != [candidate.index_oid]
+        or len(locked_rows) != 1
         or not _matches_renamed_index(locked_rows[0], candidate, target, temporary_name)
         or locked_rows[0].ownership_comment != _INDEX_OWNERSHIP_MARKER
     ):
