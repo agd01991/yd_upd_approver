@@ -17,6 +17,7 @@ depends_on = None
 
 _INDEX_NAME = "ix_upload_requests_created_id"
 _INDEX_OWNERSHIP_MARKER = "yd_upd_approver:alembic:0010_upload_created_index"
+_OWNERSHIP_LOCK_KEY = 780984123042210011
 _EXPECTED_KEY_COLUMNS = ("created_at", "id")
 _EXPECTED_KEY_OPTIONS = (0, 0)
 _ANCHOR_SIGNATURES = (
@@ -286,6 +287,21 @@ def _quote(value: str) -> str:
     return op.get_bind().dialect.identifier_preparer.quote(value)
 
 
+def _acquire_ownership_lock() -> None:
+    """Enter the shared cooperative marker protocol before catalog decisions."""
+    op.execute(text(f"DO $$ BEGIN {_offline_ownership_lock_sql()} END $$"))
+
+
+def _offline_ownership_lock_sql() -> str:
+    return f"""
+ IF pg_catalog.current_setting('transaction_isolation') OPERATOR(pg_catalog.<>)
+    'read committed'::pg_catalog.text THEN
+   RAISE EXCEPTION 'Cannot apply {revision}: ownership protocol requires READ COMMITTED isolation';
+ END IF;
+ PERFORM pg_catalog.pg_advisory_xact_lock({_OWNERSHIP_LOCK_KEY}::pg_catalog.int8);
+"""
+
+
 def _validate_oid(
     index_oid: int, target: _TargetTable, *, comment: str | None, expected_name: str = _INDEX_NAME
 ) -> _IndexSignature:
@@ -418,6 +434,7 @@ DECLARE owned_count integer; compatible_owned_count integer; target_count intege
  target_oid oid; target_schema_oid oid; target_schema text; candidate_count integer;
  index_oid oid; owned_oid oid; existing_comment text; temporary_name text;
 BEGIN
+ {_offline_ownership_lock_sql()}
  SELECT pg_catalog.count(*),pg_catalog.min(t.oid),pg_catalog.min(n.oid),pg_catalog.min(n.nspname) INTO target_count,target_oid,target_schema_oid,target_schema
  FROM pg_catalog.pg_class t JOIN pg_catalog.pg_namespace n ON n.oid=t.relnamespace
  WHERE t.relname='upload_requests' AND t.relkind IN ('r','p') AND pg_catalog.left(n.nspname,3) OPERATOR(pg_catalog.<>) 'pg_' AND n.nspname OPERATOR(pg_catalog.<>) 'information_schema'
@@ -438,6 +455,7 @@ def upgrade() -> None:
     if context.is_offline_mode():
         op.execute(_offline_sql(backfill=True))
     else:
+        _acquire_ownership_lock()
         _online_upgrade()
 
 
@@ -445,4 +463,5 @@ def downgrade() -> None:
     if context.is_offline_mode():
         op.execute(_offline_sql(backfill=False))
     else:
+        _acquire_ownership_lock()
         _validate_owned(_resolve_application_target())

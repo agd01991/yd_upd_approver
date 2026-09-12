@@ -348,6 +348,29 @@ The 0010 downgrade additionally requires exactly one index object in the entire 
 the exact marker. A second marker fails transactionally even when it is on another schema, table,
 name, or incompatible definition; the migration does not remove or repair either object.
 
+Revisions 0010 and 0011 use one cooperative ownership protocol in both online execution and the
+complete generated offline SQL: an exclusive, transaction-level
+`pg_catalog.pg_advisory_xact_lock(780984123042210011::pg_catalog.int8)` is acquired before the
+first ownership-dependent catalog check. While holding it, the migration resolves and validates
+the global owner set, takes the candidate relation's DDL lock, revalidates its OID, schema, name,
+comment and complete signature, changes the marker, and validates the postconditions. The lock is
+released only with the transaction that commits or rolls back the Alembic version update. This
+protocol covers 0010 create/adopt/already-owned upgrade and its destructive downgrade, plus 0011
+historical adoption/already-owned upgrade and its validating metadata-only downgrade.
+
+Run these migrations and any supported manual marker maintenance at `READ COMMITTED`; they reject
+`REPEATABLE READ` and `SERIALIZABLE`, whose transaction snapshot would not refresh after waiting.
+For manual maintenance, use one explicit transaction, verify it is `READ COMMITTED`, acquire the
+same one-argument `pg_advisory_xact_lock(bigint)` above, then perform a fresh global owner query,
+lock and revalidate the exact candidate relation, issue `COMMENT ON INDEX`, repeat both candidate
+and global validations, and commit. Never obtain the candidate relation lock before the global
+lock.
+
+The advisory lock is cooperative: arbitrary external `COMMENT`/DDL and previously generated SQL
+that do not acquire it are not serialized. Such operations require a maintenance window excluding
+0010/0011 and participating manual writers. The relation lock still protects the selected
+candidate, but cannot protect a different index, and the global owner rescan remains mandatory.
+
 Revision `0011_upload_index_ownership` is a forward-only ownership backfill for databases that
 had already applied the original, unmarked revision `0010`. It identifies the application table
 without relying on `search_path`: the table must be an ordinary or partitioned user table named

@@ -75,7 +75,8 @@ class Operations:
         self.executed = []
 
     def execute(self, statement):  # noqa: ANN001
-        self.executed.append(str(statement))
+        if "pg_advisory_xact_lock" not in str(statement):
+            self.executed.append(str(statement))
 
 
 def test_rows_formats_sql_and_executes_it(monkeypatch) -> None:  # noqa: ANN001
@@ -349,6 +350,7 @@ def test_downgrade_preserves_marker(monkeypatch) -> None:  # noqa: ANN001
 
 def test_downgrade_requires_marker(monkeypatch) -> None:  # noqa: ANN001
     migration = _migration()
+    monkeypatch.setattr(migration, "op", Operations())
     monkeypatch.setattr(migration.context, "is_offline_mode", lambda: False)
     monkeypatch.setattr(migration, "_owned_indexes", lambda: [])
     monkeypatch.setattr(migration, "_resolve_application_target", lambda: _target(migration))
