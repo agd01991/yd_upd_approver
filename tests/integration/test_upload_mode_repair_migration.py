@@ -2621,8 +2621,8 @@ def test_0011_adoption_rechecks_global_owner_after_waiting_for_index_lock(
             ).one() == ("foreign_index", INDEX_OWNERSHIP_MARKER)
             assert (
                 await monitor.execute(
-                    text("SELECT pg_catalog.to_regclass('public.__yd_0011_adopt_' || :oid)"),
-                    {"oid": original.oid},
+                    text("SELECT pg_catalog.to_regclass(:relation_name)"),
+                    {"relation_name": f"public.__yd_0011_adopt_{original.oid}"},
                 )
             ).scalar_one_or_none() is None
         finally:
