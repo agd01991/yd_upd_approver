@@ -19,18 +19,16 @@ class TestElement {
   }
   set innerHTML(html) {
     this._innerHTML = String(html);
-    if (this.id === "admin-content") {
-      dynamicElements = [];
-      const tagPattern = /<(input|button|div|select|textarea)([^>]*)>/g;
-      for (const match of this._innerHTML.matchAll(tagPattern)) {
-        const attrs = {};
-        for (const attr of match[2].matchAll(/([\w-]+)(?:=["']([^"']*)["'])?/g)) attrs[attr[1]] = attr[2] ?? "";
-        if (!attrs.id && !Object.keys(attrs).some((key) => key.startsWith("data-"))) continue;
-        const node = new TestElement({ id: attrs.id, attrs, owner: this });
-        const close = new RegExp(`<${match[1]}[^>]*${attrs.id ? `id=["']${attrs.id}["']` : ""}[^>]*>([^<]*)`);
-        node.textContent = this._innerHTML.match(close)?.[1] || "";
-        dynamicElements.push(node);
-      }
+    if (this.id === "admin-content") dynamicElements = [];
+    const tagPattern = /<(input|button|div|select|textarea)([^>]*)>/g;
+    for (const match of this._innerHTML.matchAll(tagPattern)) {
+      const attrs = {};
+      for (const attr of match[2].matchAll(/([\w-]+)(?:=["']([^"']*)["'])?/g)) attrs[attr[1]] = attr[2] ?? "";
+      if (!attrs.id && !Object.keys(attrs).some((key) => key.startsWith("data-"))) continue;
+      const node = new TestElement({ id: attrs.id, attrs, owner: this });
+      const close = new RegExp(`<${match[1]}[^>]*${attrs.id ? `id=["']${attrs.id}["']` : ""}[^>]*>([^<]*)`);
+      node.textContent = this._innerHTML.match(close)?.[1] || "";
+      dynamicElements.push(node);
     }
   }
   get innerHTML() { return this._innerHTML; }
@@ -49,6 +47,9 @@ function matches(node, selector) {
 }
 function queryAll(selector) { return [...dynamicElements, ...staticElements.values()].filter((node) => matches(node, selector)); }
 function query(selector) { return queryAll(selector)[0] || null; }
+function domSnapshot() {
+  return [...dynamicElements, ...staticElements.values()].map((node) => `${node.textContent} ${node.innerHTML}`).join(" ");
+}
 for (const id of ["auth", "user", "admin", "admin-content", "up", "selected-files", "upmsg", "files", "reqs"]) {
   staticElements.set(`#${id}`, new TestElement({ id }));
 }
@@ -58,7 +59,8 @@ global.document = {
   createElement: () => new TestElement(),
   body: new TestElement(),
 };
-global.alert = () => {};
+const alerts = [];
+global.alert = (message) => alerts.push(message);
 
 const pagination = require("../../app/webapp/static/app.js");
 const pending = [];
@@ -147,8 +149,14 @@ async function reopenedAdminViewSupersedesPendingWork() {
     "adminUploads", "/old-next", { cursor: "old", previous: [null], page: 2 }, () => false,
   );
   pending.at(-1).reject(new Error("stale failure"));
-  await assert.rejects(oldNavigation);
+  assert.equal(await oldNavigation, null);
   assert.equal(pagination.pager("adminUploads").page, 1, "cancelled navigation is not committed");
+
+  const currentNavigation = pagination.guardedPage(
+    "adminUploads", "/current-next", { cursor: "current", previous: [null], page: 2 },
+  );
+  pending.at(-1).reject(new Error("current failure"));
+  await assert.rejects(currentNavigation, /Нет соединения/);
 
   pagination.resetPager("userUploads");
   const user = pagination.guardedPage("userUploads", "/parallel-user");
@@ -272,36 +280,57 @@ async function diskRootSaveLockDoesNotWaitForRefresh() {
 }
 
 async function diskRootPutFailureAndRefreshFailure() {
-  let opened = pagination.loadAdmin("disk-root");
-  pending.at(-1).resolve(diskRootResponse("disk:/before-failure"));
+  const opened = pagination.loadAdmin("disk-root");
+  pending.at(-1).resolve(diskRootResponse("disk:/initial"));
   await opened;
+
+  // A succeeds and its refresh publishes the success in the current form.
   let input = document.querySelector("#disk-root-input");
-  input.value = "disk:/will-fail"; input.oninput();
-  const failedSave = document.querySelector("#save-disk-root").click();
-  const failedPut = pending.at(-1);
-  const users = pagination.loadAdmin("users"); pending.at(-1).resolve(response([])); await users;
-  opened = pagination.loadAdmin("disk-root");
-  const pendingGet = pending.at(-1);
-  failedPut.reject(new Error("PUT failed"));
-  await failedSave;
+  input.value = "disk:/a"; input.oninput();
+  const saveA = document.querySelector("#save-disk-root").click();
+  pending.at(-1).resolve(diskRootResponse("disk:/a"));
+  await saveA;
+  pending.at(-1).resolve(diskRootResponse("disk:/a"));
+  await drainMicrotasks();
+  assert.match(document.querySelector("#disk-root-message").textContent, /сохранена/);
+
+  // B clears A's rendered success synchronously, then preserves its own value on failure.
+  input = document.querySelector("#disk-root-input");
+  input.value = "disk:/b"; input.oninput();
+  const saveB = document.querySelector("#save-disk-root").click();
+  assert.equal(document.querySelector("#disk-root-message").textContent, "");
+  pending.at(-1).reject(new Error("PUT B failed"));
+  await saveB;
   assert.match(document.querySelector("#admin-error").textContent, /Нет соединения/);
-  assert.equal(document.querySelector("#save-disk-root").disabled, true);
-  pendingGet.resolve(diskRootResponse("disk:/still-current")); await opened;
+  assert.doesNotMatch(document.querySelector("#disk-root-message").textContent, /сохранена/);
+  assert.equal(input.value, "disk:/b");
+  assert.equal(input.disabled, false);
   assert.equal(document.querySelector("#save-disk-root").disabled, false);
 
+  // C clears B's error immediately and replaces it with a new success.
+  input.value = "disk:/c"; input.oninput();
+  const saveC = document.querySelector("#save-disk-root").click();
+  assert.equal(document.querySelector("#admin-error").textContent, "");
+  pending.at(-1).resolve(diskRootResponse("disk:/c"));
+  await saveC;
+  pending.at(-1).resolve(diskRootResponse("disk:/c"));
+  await drainMicrotasks();
+  assert.match(document.querySelector("#disk-root-message").textContent, /сохранена/);
+
+  // A successful PUT remains truthful when only its follow-up refresh fails.
   input = document.querySelector("#disk-root-input");
-  input.value = "disk:/saved"; input.oninput();
-  const successfulSave = document.querySelector("#save-disk-root").click();
-  pending.at(-1).resolve(diskRootResponse("disk:/saved"));
-  await successfulSave;
-  const failedRefresh = pending.at(-1);
-  failedRefresh.reject(new Error("refresh failed"));
+  input.value = "disk:/d"; input.oninput();
+  const saveD = document.querySelector("#save-disk-root").click();
+  assert.equal(document.querySelector("#disk-root-message").textContent, "");
+  pending.at(-1).resolve(diskRootResponse("disk:/d"));
+  await saveD;
+  pending.at(-1).reject(new Error("refresh failed"));
   await drainMicrotasks();
   assert.match(document.querySelector("#disk-root-message").textContent, /сохранена/);
   assert.match(document.querySelector("#admin-error").textContent, /Не удалось загрузить/);
   const putsBeforeRetry = pending.filter((item) => requestMethod(item) === "PUT").length;
   const retry = document.querySelector("#retry-disk-root").click();
-  pending.at(-1).resolve(diskRootResponse("disk:/saved")); await retry;
+  pending.at(-1).resolve(diskRootResponse("disk:/d")); await retry;
   assert.equal(pending.filter((item) => requestMethod(item) === "PUT").length, putsBeforeRetry);
   assert.equal(document.querySelector("#save-disk-root").disabled, false);
 }
@@ -331,6 +360,64 @@ async function staleSearchTimerCannotActAsNewView() {
   }
 }
 
+const adminPagerCases = [
+  ["uploads", "adminUploads", (marker) => ({ id: marker, request_code: marker, status: "uploaded" })],
+  ["users", "adminUsers", (marker) => ({ id: marker, full_name: marker, telegram_id: marker, status: "active" })],
+  ["renames", "renames", (marker) => ({ id: marker, requested_folder_name: marker, user: { telegram_id: marker } })],
+  ["audit", "audit", (marker) => ({ id: marker, action: marker, actor_telegram_id: marker, new_value: { marker } })],
+];
+
+async function adminPagerHandlersDiscardStaleErrorsAndRetryCurrentErrors() {
+  for (const [tab, name, row] of adminPagerCases) {
+    const initial = pagination.loadAdmin(tab);
+    pending.at(-1).resolve(response([row(`${name}-initial`)], `${name}-next`));
+    await initial;
+
+    const staleNext = document.querySelector(`[data-page-next="${name}"]`);
+    assert.ok(staleNext, `${name}: next handler must be rendered`);
+    staleNext.click();
+    const staleRequest = pending.at(-1);
+
+    const reopened = pagination.loadAdmin(tab);
+    const currentRequest = pending.at(-1);
+    assert.equal(pagination.pager(name).loading, true);
+    const alertsBeforeStaleFailure = alerts.length;
+    staleRequest.reject(new Error(`${name} stale failure`));
+    await drainMicrotasks();
+    assert.equal(pagination.pager(name).loading, true, `${name}: stale finally must not unlock the new request`);
+    assert.equal(document.querySelector("#admin-error").textContent, "", `${name}: stale error must not reach the current view`);
+    assert.equal(alerts.length, alertsBeforeStaleFailure, `${name}: stale error must not alert`);
+
+    currentRequest.resolve(response([row(`${name}-current`)], `${name}-current-next`));
+    await reopened;
+    assert.match(domSnapshot(), new RegExp(`${name}-current`));
+    assert.doesNotMatch(domSnapshot(), /stale failure/);
+    assert.deepEqual(
+      { cursor: pagination.pager(name).cursor, previous: pagination.pager(name).previous, page: pagination.pager(name).page },
+      { cursor: null, previous: [], page: 1 },
+      `${name}: stale navigation must not commit`,
+    );
+
+    // A current handler failure is displayed, leaves navigation uncommitted, and unlocks retry.
+    document.querySelector(`[data-page-next="${name}"]`).click();
+    pending.at(-1).reject(new Error(`${name} current failure`));
+    await drainMicrotasks();
+    assert.match(document.querySelector("#admin-error").textContent, /Нет соединения/, `${name}: current error must be visible`);
+    assert.deepEqual(
+      { cursor: pagination.pager(name).cursor, previous: pagination.pager(name).previous, page: pagination.pager(name).page },
+      { cursor: null, previous: [], page: 1 },
+      `${name}: failed navigation must not commit`,
+    );
+    assert.equal(pagination.pager(name).loading, false);
+
+    document.querySelector(`[data-page-next="${name}"]`).click();
+    pending.at(-1).resolve(response([row(`${name}-retry`)], null));
+    await drainMicrotasks();
+    assert.equal(pagination.pager(name).page, 2, `${name}: retry must commit`);
+    assert.match(domSnapshot(), new RegExp(`${name}-retry`));
+  }
+}
+
 (async () => {
   await independentPagersAndReset();
   await atomicNavigationFailureRetryAndDoubleClick();
@@ -341,5 +428,6 @@ async function staleSearchTimerCannotActAsNewView() {
   await diskRootPutFailureAndRefreshFailure();
   await diskRootSaveSurvivesViewReplacement();
   await staleSearchTimerCannotActAsNewView();
+  await adminPagerHandlersDiscardStaleErrorsAndRetryCurrentErrors();
   process.stdout.write("frontend pagination regressions passed\n");
 })().catch((error) => { console.error(error); process.exitCode = 1; });
