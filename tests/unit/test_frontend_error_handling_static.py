@@ -186,3 +186,21 @@ def test_upload_selection_change_remains_available_after_upload() -> None:
     assert "input.disabled = false;" in upload_body
     assert "input.onchange = () => {" in js
     assert 'if (!setSelectedUploadFiles(input.files)) input.value = "";' in js
+
+
+def test_upload_resets_user_uploads_pager_only_after_success_before_refresh() -> None:
+    js = source()
+    upload_body = js[
+        js.index("async function uploadSelectedFiles") : js.index("async function loadUserLists")
+    ]
+    success_count_index = upload_body.index(
+        'const successCount = selectedUploadEntries.filter((entry) => entry.status === "done").length;'
+    )
+    retain_failed_index = upload_body.index(
+        'selectedUploadEntries = selectedUploadEntries.filter((entry) => entry.status !== "done");'
+    )
+    reset_index = upload_body.index('if (successCount > 0) resetPager("userUploads");')
+    refresh_index = upload_body.index("await loadUserLists();")
+    assert success_count_index < retain_failed_index < reset_index < refresh_index
+    assert 'headers: { "Idempotency-Key": entry.idempotencyKey }' in upload_body
+    assert "createIdempotencyKey()" not in upload_body

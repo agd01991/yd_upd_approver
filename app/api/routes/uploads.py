@@ -1,21 +1,22 @@
 import asyncio
 import re
 
-from fastapi import APIRouter, Depends, File, Form, Header, UploadFile, status
+from fastapi import APIRouter, Depends, File, Form, Header, Query, UploadFile, status
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import current_user_dep, get_db, settings_dep
 from app.api.errors import ApiError
+from app.api.pagination import apply_cursor, page_response, pagination_limit
 from app.config import Settings
-from app.db.models import UploadRequest, User, UserStatus
-from app.db.repositories import create_upload_request, list_user_requests, next_request_code
+from app.db.models import UploadRequest, UploadStatus, User, UserStatus
+from app.db.repositories import create_upload_request, next_request_code
 from app.services.commit_safety import cleanup_staged_if_unowned, commit_cancellation_safe
 from app.services.naming import join_disk_path, sanitize_filename
 from app.services.storage import TempStorage
 from app.services.telegram_outbox import enqueue_admin_upload_pending
-from app.services.user_folders import resolve_user_folder_for_current_root
+from app.services.user_folders import UserFolderConflictError, resolve_user_folder_for_current_root
 
 _ORIGINAL_RESOLVE_USER_FOLDER = resolve_user_folder_for_current_root
 ensure_user_folder_for_current_root = resolve_user_folder_for_current_root
@@ -56,11 +57,25 @@ def upload_json(upload) -> dict:
 
 @router.get("")
 async def list_uploads(
-    current: tuple[User, bool] = Depends(current_user_dep), session: AsyncSession = Depends(get_db)
-) -> list[dict]:
+    status_filter: str | None = Query(default=None, alias="status"),
+    limit: int = Depends(pagination_limit),
+    cursor: str | None = None,
+    current: tuple[User, bool] = Depends(current_user_dep),
+    session: AsyncSession = Depends(get_db),
+) -> dict:
     user, _ = current
+    stmt = select(UploadRequest).where(UploadRequest.user_id == user.id)
+    if status_filter and status_filter != "all":
+        try:
+            stmt = stmt.where(UploadRequest.status == UploadStatus(status_filter))
+        except ValueError as exc:
+            raise ApiError(400, "invalid_request", "Неизвестный статус заявки") from exc
+    stmt = apply_cursor(stmt, UploadRequest, cursor).order_by(
+        UploadRequest.created_at.desc(), UploadRequest.id.desc()
+    )
+    rows = list((await session.scalars(stmt.limit(limit + 1))).all())
     await session.commit()
-    return [upload_json(r) for r in await list_user_requests(session, user.id, limit=50)]
+    return page_response(rows, limit, upload_json)
 
 
 @router.post("")
@@ -145,6 +160,14 @@ async def create_upload(
         outcome = await commit_cancellation_safe(session)
         if outcome.cancelled:
             raise asyncio.CancelledError()
+    except UserFolderConflictError as exc:
+        await session.rollback()
+        storage.delete_safe(destination)
+        raise ApiError(
+            status.HTTP_409_CONFLICT,
+            "folder_conflict",
+            "Папка уже назначена другому пользователю. Обратитесь к администратору.",
+        ) from exc
     except IntegrityError:
         await session.rollback()
         existing = await session.scalar(

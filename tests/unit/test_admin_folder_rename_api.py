@@ -122,6 +122,56 @@ async def test_admin_rename_folder_calls_rename_flow(monkeypatch) -> None:
     assert result["user"]["folder_name"] == "new"
 
 
+@pytest.mark.parametrize(
+    ("failure", "status", "code"),
+    [
+        ("conflict", 409, "folder_conflict"),
+        ("disk", 503, "yandex_disk_unavailable"),
+    ],
+)
+async def test_put_disk_root_rolls_back_with_specific_error(
+    monkeypatch, failure, status, code
+) -> None:
+    from app.api.routes import admin
+    from app.api.schemas import DiskRootUpdate
+    from app.api.security import TelegramWebAppUser
+    from app.config import Settings
+    from app.services.user_folders import UserFolderConflictError
+
+    calls = []
+
+    class Session:
+        async def commit(self):
+            calls.append("commit")
+
+        async def rollback(self):
+            calls.append("rollback")
+
+    class Client:
+        def __init__(self, _token):
+            pass
+
+        async def close(self):
+            calls.append("close")
+
+    async def change(*_args):
+        if failure == "conflict":
+            raise UserFolderConflictError("occupied")
+        raise RuntimeError("remote unavailable")
+
+    monkeypatch.setattr(admin, "YandexDiskClient", Client)
+    monkeypatch.setattr(admin, "change_yandex_disk_root_for_active_users", change)
+    with pytest.raises(admin.ApiError) as exc:
+        await admin.put_disk_root(
+            DiskRootUpdate(root="disk:/New"),
+            TelegramWebAppUser(telegram_id=99),
+            Session(),
+            Settings(yandex_disk_token="token"),
+        )
+    assert (exc.value.status_code, exc.value.code) == (status, code)
+    assert calls == ["rollback", "close"]
+
+
 async def test_unknown_moderation_action_still_returns_404() -> None:
     from app.api.routes.admin import moderate_user
     from app.api.security import TelegramWebAppUser

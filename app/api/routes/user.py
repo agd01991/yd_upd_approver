@@ -1,9 +1,11 @@
 from fastapi import APIRouter, Depends
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import current_user_dep, get_db, settings_dep
 from app.api.errors import ApiError
+from app.api.pagination import apply_cursor, page_response, pagination_limit
 from app.api.schemas import FolderProfileBody, FolderRenameRequestCreate
 from app.config import Settings
 from app.db.models import FolderRenameRequest, FolderRenameRequestStatus, User, UserStatus
@@ -115,7 +117,19 @@ async def create_my_folder_rename_request(
         contract_full_name=body.contract_full_name.strip(),
     )
     session.add(req)
-    await session.flush()
+    try:
+        await session.flush()
+    except IntegrityError:
+        await session.rollback()
+        existing = await session.scalar(
+            select(FolderRenameRequest).where(
+                FolderRenameRequest.user_id == user.id,
+                FolderRenameRequest.status == FolderRenameRequestStatus.pending,
+            )
+        )
+        if existing:
+            return {"id": existing.id, "status": existing.status.value}
+        raise
     for admin_id in settings.telegram_admin_ids:
         await enqueue_telegram_event(
             session,
@@ -135,26 +149,26 @@ async def create_my_folder_rename_request(
 
 @router.get("/me/folder-rename-requests")
 async def my_folder_rename_requests(
-    current: tuple[User, bool] = Depends(current_user_dep), session: AsyncSession = Depends(get_db)
+    limit: int = Depends(pagination_limit),
+    cursor: str | None = None,
+    current: tuple[User, bool] = Depends(current_user_dep),
+    session: AsyncSession = Depends(get_db),
 ) -> dict:
     user, _ = current
-    rows = (
-        await session.scalars(
-            select(FolderRenameRequest)
-            .where(FolderRenameRequest.user_id == user.id)
-            .order_by(FolderRenameRequest.created_at.desc())
-            .limit(20)
-        )
-    ).all()
-    return {
-        "items": [
-            {
-                "id": r.id,
-                "requested_folder_name": r.requested_folder_name,
-                "status": r.status.value,
-                "reject_reason": r.reject_reason,
-                "target_folder": r.target_folder,
-            }
-            for r in rows
-        ]
-    }
+    stmt = apply_cursor(
+        select(FolderRenameRequest).where(FolderRenameRequest.user_id == user.id),
+        FolderRenameRequest,
+        cursor,
+    ).order_by(FolderRenameRequest.created_at.desc(), FolderRenameRequest.id.desc())
+    rows = list((await session.scalars(stmt.limit(limit + 1))).all())
+
+    def item(r: FolderRenameRequest) -> dict:
+        return {
+            "id": r.id,
+            "requested_folder_name": r.requested_folder_name,
+            "status": r.status.value,
+            "reject_reason": r.reject_reason,
+            "target_folder": r.target_folder,
+        }
+
+    return page_response(rows, limit, item)

@@ -234,3 +234,191 @@ PostgreSQL is the source of truth for durable Telegram notifications. Redis is n
 3. Open a Yandex Disk folder containing more than 50 objects in the Mini App. Expected: the first page renders quickly, the “Показать ещё” button appends the next page, and repeated clicks while loading do not start parallel page requests.
 4. Approve an upload and wait for the worker. Expected: after DB state becomes `uploaded`, local temp cleanup can remove the file and the request eventually becomes `deleted_temp`.
 5. Start Docker Compose and check `cleanup-worker` health with `docker compose ps cleanup-worker`; logs should show aggregate checked/deleted counts only, not local paths or tokens.
+
+## PR 6: pagination and DB integrity QA
+
+1. Prepare a dataset with more than 25 uploads, users, audit entries, and folder rename requests.
+2. Open the Mini App and verify every paginated list shows the contract-backed controls: previous page, next page, current page number, disabled buttons while loading, and no visible total count.
+3. Change each status chip/search field and confirm the list returns to page 1 and fetches filtered data from the server. In particular, `needs_action` must be sent as `status=needs_action` and not derived from the first page in the browser.
+4. Navigate forward and backward across pages with rows sharing identical `created_at` values; confirm there are no duplicates or missing rows.
+5. Approve/reject/block users, uploads, and folder rename requests from a non-first page; confirm the current page refreshes instead of always resetting to the first page.
+6. In two browser sessions, try to create two pending folder rename requests for the same user and assign/rename two users to the same canonical folder. One operation should succeed and the other should return a safe validation/conflict response, not a 500.
+7. Before production migration, create a database backup. Run `alembic upgrade head`, verify
+   `alembic current` reports the new head `0011_upload_index_ownership`, then verify the upload
+   ordering index exists exactly once on the application `upload_requests` table with columns
+   `(created_at, id)`. Before running the query, replace
+   `REPLACE_WITH_APPLICATION_SCHEMA` with the trusted name of the schema that contains the
+   application table (do not infer it from `search_path`):
+
+<!-- upload-index-managed-signature-sql:start -->
+```sql
+WITH qa_parameters(application_schema) AS (
+    VALUES ('REPLACE_WITH_APPLICATION_SCHEMA'::pg_catalog.name)
+), target_table AS (
+    SELECT t.oid, t.relnamespace, n.nspname
+    FROM qa_parameters AS q
+    JOIN pg_catalog.pg_namespace AS n
+      ON n.nspname OPERATOR(pg_catalog.=) q.application_schema
+    JOIN pg_catalog.pg_class AS t
+      ON t.relnamespace OPERATOR(pg_catalog.=) n.oid
+     AND t.relname OPERATOR(pg_catalog.=) 'upload_requests'::pg_catalog.name
+     AND (t.relkind OPERATOR(pg_catalog.=) 'r'::pg_catalog."char"
+       OR t.relkind OPERATOR(pg_catalog.=) 'p'::pg_catalog."char")
+), managed_index AS (
+    SELECT t.nspname, t.oid AS table_oid, i.oid AS index_oid,
+           i.relname::pg_catalog.text AS index_name,
+           i.relnamespace AS index_schema_oid, x.indnkeyatts, x.indnatts,
+           am.amname::pg_catalog.text AS access_method,
+           x.indisunique, x.indisexclusion, x.indpred, x.indexprs,
+           x.indisvalid, x.indisready,
+           pg_catalog.pg_get_indexdef(i.oid) AS index_definition,
+           pg_catalog.obj_description(i.oid, 'pg_class') AS ownership_comment,
+           pg_catalog.array_agg(a.attname::pg_catalog.text ORDER BY k.ordinality)
+             FILTER (WHERE k.ordinality OPERATOR(pg_catalog.<=) x.indnkeyatts::pg_catalog.int8)
+             AS key_columns,
+           pg_catalog.array_agg(o.option ORDER BY k.ordinality)
+             FILTER (WHERE k.ordinality OPERATOR(pg_catalog.<=) x.indnkeyatts::pg_catalog.int8)
+             AS key_options,
+           pg_catalog.array_agg(opc.oid ORDER BY k.ordinality)
+             FILTER (WHERE k.ordinality OPERATOR(pg_catalog.<=) x.indnkeyatts::pg_catalog.int8)
+             AS actual_opclasses,
+           pg_catalog.array_agg(default_opc.oid ORDER BY k.ordinality)
+             FILTER (WHERE k.ordinality OPERATOR(pg_catalog.<=) x.indnkeyatts::pg_catalog.int8)
+             AS default_opclasses,
+           pg_catalog.count(*) FILTER
+             (WHERE k.ordinality OPERATOR(pg_catalog.<=) x.indnkeyatts::pg_catalog.int8)
+             AS joined_key_count
+    FROM target_table AS t
+    JOIN pg_catalog.pg_index AS x ON x.indrelid OPERATOR(pg_catalog.=) t.oid
+    JOIN pg_catalog.pg_class AS i
+      ON i.oid OPERATOR(pg_catalog.=) x.indexrelid
+     AND i.relnamespace OPERATOR(pg_catalog.=) t.relnamespace
+     AND i.relname OPERATOR(pg_catalog.=) 'ix_upload_requests_created_id'::pg_catalog.name
+    JOIN pg_catalog.pg_am AS am ON am.oid OPERATOR(pg_catalog.=) i.relam
+    LEFT JOIN LATERAL pg_catalog.unnest(x.indkey) WITH ORDINALITY AS k(attnum, ordinality) ON true
+    LEFT JOIN LATERAL pg_catalog.unnest(x.indoption) WITH ORDINALITY AS o(option, ordinality)
+      ON o.ordinality OPERATOR(pg_catalog.=) k.ordinality
+    LEFT JOIN pg_catalog.pg_attribute AS a
+      ON a.attrelid OPERATOR(pg_catalog.=) x.indrelid
+     AND a.attnum OPERATOR(pg_catalog.=) k.attnum
+    LEFT JOIN LATERAL pg_catalog.unnest(x.indclass) WITH ORDINALITY AS ic(opclass_oid, ordinality)
+      ON ic.ordinality OPERATOR(pg_catalog.=) k.ordinality
+    LEFT JOIN pg_catalog.pg_opclass AS opc ON opc.oid OPERATOR(pg_catalog.=) ic.opclass_oid
+    LEFT JOIN pg_catalog.pg_opclass AS default_opc
+      ON default_opc.opcmethod OPERATOR(pg_catalog.=) am.oid
+     AND default_opc.opcintype OPERATOR(pg_catalog.=) a.atttypid
+     AND default_opc.opcdefault
+    GROUP BY t.nspname, t.oid, i.oid, i.relname, i.relnamespace, x.indnkeyatts,
+             x.indnatts, am.amname, x.indisunique, x.indisexclusion, x.indpred,
+             x.indexprs, x.indisvalid, x.indisready
+)
+SELECT nspname::pg_catalog.text AS application_schema, table_oid, index_oid, index_name,
+       index_definition, ownership_comment, key_columns,
+       key_options::pg_catalog.text[] AS key_options,
+       actual_opclasses, default_opclasses, access_method, indnkeyatts AS key_count,
+       indnatts AS total_column_count, indisunique, indisexclusion,
+       (indpred IS NULL) AS is_not_partial, (indexprs IS NULL) AS is_not_expression,
+       indisvalid, indisready,
+       (index_schema_oid OPERATOR(pg_catalog.=)
+          (SELECT relnamespace FROM target_table)
+        AND joined_key_count OPERATOR(pg_catalog.=) 2
+        AND indnkeyatts OPERATOR(pg_catalog.=) 2
+        AND indnatts OPERATOR(pg_catalog.=) 2
+        AND key_columns OPERATOR(pg_catalog.=) ARRAY['created_at','id']::pg_catalog.text[]
+        AND key_options OPERATOR(pg_catalog.=) ARRAY[0,0]::pg_catalog.int2[]
+        AND actual_opclasses OPERATOR(pg_catalog.=) default_opclasses
+        AND pg_catalog.cardinality(actual_opclasses) OPERATOR(pg_catalog.=) 2
+        AND access_method OPERATOR(pg_catalog.=) 'btree'::pg_catalog.text
+        AND NOT indisunique AND NOT indisexclusion
+        AND indpred IS NULL AND indexprs IS NULL AND indisvalid AND indisready
+        AND ownership_comment OPERATOR(pg_catalog.=)
+          'yd_upd_approver:alembic:0010_upload_created_index'::pg_catalog.text) AS qa_pass
+FROM managed_index;
+```
+<!-- upload-index-managed-signature-sql:end -->
+
+The correct result is exactly one row whose `application_schema` equals the trusted schema and
+whose `qa_pass` is SQL `TRUE`; every diagnostic field must also match the displayed structural
+contract. Zero or multiple rows, `FALSE`, SQL `NULL`, or any mismatch is a QA failure: do not
+proceed with the downgrade. The query validates the current state of this explicitly named index;
+it neither replaces the migrations' global target/ownership checks nor prevents the object from
+changing between this query and downgrade. A matching definition without the exact marker is not
+owned by revision 0010 and will not be removed by its downgrade.
+The 0010 downgrade additionally requires exactly one index object in the entire database to bear
+the exact marker. A second marker fails transactionally even when it is on another schema, table,
+name, or incompatible definition; the migration does not remove or repair either object.
+
+Revisions 0010 and 0011 use one cooperative ownership protocol in both online execution and the
+complete generated offline SQL: an exclusive, transaction-level
+`pg_catalog.pg_advisory_xact_lock(780984123042210011::pg_catalog.int8)` is acquired before the
+first ownership-dependent catalog check. While holding it, the migration resolves and validates
+the global owner set, takes the candidate relation's DDL lock, revalidates its OID, schema, name,
+comment and complete signature, changes the marker, and validates the postconditions. The lock is
+released only with the transaction that commits or rolls back the Alembic version update. This
+protocol covers 0010 create/adopt/already-owned upgrade and its destructive downgrade, plus 0011
+historical adoption/already-owned upgrade and its validating metadata-only downgrade.
+
+Run these migrations and any supported manual marker maintenance at `READ COMMITTED`; they reject
+`REPEATABLE READ` and `SERIALIZABLE`, whose transaction snapshot would not refresh after waiting.
+For manual maintenance, use one explicit transaction, verify it is `READ COMMITTED`, acquire the
+same one-argument `pg_advisory_xact_lock(bigint)` above, then perform a fresh global owner query,
+lock and revalidate the exact candidate relation, issue `COMMENT ON INDEX`, repeat both candidate
+and global validations, and commit. Never obtain the candidate relation lock before the global
+lock.
+
+The advisory lock is cooperative: arbitrary external `COMMENT`/DDL and previously generated SQL
+that do not acquire it are not serialized. Such operations require a maintenance window excluding
+0010/0011 and participating manual writers. The relation lock still protects the selected
+candidate, but cannot protect a different index, and the global owner rescan remains mandatory.
+
+Revision `0011_upload_index_ownership` is a forward-only ownership backfill for databases that
+had already applied the original, unmarked revision `0010`. It identifies the application table
+without relying on `search_path`: the table must be an ordinary or partitioned user table named
+`upload_requests`, and the full ordinary btree signatures of both
+`ix_upload_requests_user_created_id (user_id, created_at, id)` and
+`ix_upload_requests_status_created_id (status, created_at, id)` must belong to the same table OID.
+The managed index must have the full `(created_at, id)` ascending/default-null-order signature.
+
+Two database layouts can therefore report revision `0009_db_integrity`. The historical 0009
+created an unmarked `ix_upload_requests_created_id`; the current 0009 leaves its creation to
+0010. A direct `0009_db_integrity` to `0008_telegram_outbox` downgrade succeeds for the current
+layout when that index is absent. If an index with that name is attached to the fingerprinted
+application table, the downgrade stops transactionally before removing any other 0009 object:
+neither an absent marker nor a matching shape proves that the historical migration owns it.
+
+For a compatible historical index, run `alembic upgrade 0011_upload_index_ownership`, repeat the
+ownership query above and require the exact managed marker, then run
+`alembic downgrade 0008_telegram_outbox`. Reconciliation in 0010/0011 validates the target and
+complete index signature before adoption; a conflicting definition or a foreign comment is an
+explicit failure and must be investigated rather than overwritten. `alembic stamp` is not a
+repair: it only changes the recorded revision and neither validates nor removes schema objects.
+
+For a database already at an old, unmarked `0010_upload_created_index`, **first run**
+`alembic upgrade head`, verify the current revision and exact ownership comment above, and only
+then perform a rollback. A direct downgrade from an unmarked `0010` intentionally fails safely;
+it does not guess that an unmarked object is owned. Downgrading `0011` to `0010` validates and
+preserves the marker so that the strict `0010` downgrade can remove only the managed index.
+A SQL `NULL` from `obj_description` means that no comment is stored. PostgreSQL treats
+`COMMENT ON INDEX ... IS ''` like `IS NULL`: it removes the comment, so a subsequent catalog
+read returns SQL `NULL`. Such an unmarked index may be adopted only after all identity and
+signature checks succeed. Any actually stored, non-empty foreign comment remains foreign
+ownership and is never overwritten.
+
+One unavoidable limitation applies only to this one-time backfill: an unmarked, structurally
+identical replacement index on the correctly fingerprinted application table cannot be
+distinguished from the historical index created by the old `0010`. This limited adoption rule
+does not apply to the normal `0010` downgrade, which continues to require the exact marker.
+
+Then verify workers still claim upload and Telegram outbox jobs.
+
+If `0010_upload_created_index` reports an incompatible index named
+`ix_upload_requests_created_id`, inspect its table and key columns first. Do not remove an
+index blindly: take a backup, analyze the conflicting object, and only then rename or remove it
+before retrying the migration.
+8. With Docker, validate configuration and service health:
+
+```bash
+docker compose -f docker-compose.yml config --quiet
+docker compose -f docker-compose.yml -f docker-compose.dev.yml config --quiet
+docker compose up --build
+```
