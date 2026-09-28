@@ -10,11 +10,15 @@ const adminContent = document.querySelector("#admin-content");
 
 let userUploads = [];
 const pagers = { userUploads: {}, adminUploads: {}, adminUsers: {}, audit: {}, renames: {} };
-let requestVersion = 0;
+const pagerGenerations = { userUploads: 0, adminUploads: 0, adminUsers: 0, audit: 0, renames: 0 };
+let adminView = { generation: 0, tab: null };
 let userStatusFilter = "all";
 let adminStatusFilter = "all";
 let adminUserQuery = "";
 let adminSearchTimer;
+let diskRootGetOperation = 0;
+const diskRootSave = { operation: 0, promise: null, status: "", error: "" };
+let diskRootForm = null;
 let selectedRenameUser = null;
 let renameFolderCandidates = [];
 let renameSelectionVersion = 0;
@@ -140,13 +144,64 @@ function showAdminError(message) {
   if (error) error.textContent = message; else alert(message);
 }
 
-function resetPager(name) { pagers[name] = { cursor: null, previous: [], page: 1, nextCursor: null, hasMore: false, loading: false }; }
+function resetPager(name) { const generation = ++pagerGenerations[name]; pagers[name] = { cursor: null, previous: [], page: 1, nextCursor: null, hasMore: false, loading: false, generation, operation: 0 }; }
+function invalidatePager(name) {
+  const p = pager(name);
+  p.generation = ++pagerGenerations[name];
+  p.operation += 1;
+  p.loading = false;
+}
 function pager(name) { if (!pagers[name].page) resetPager(name); return pagers[name]; }
-function pageParams(name, extra = {}) { const p = pager(name); const params = new URLSearchParams({ limit: "25" }); if (p.cursor) params.set("cursor", p.cursor); Object.entries(extra).forEach(([k, v]) => { if (v !== undefined && v !== null && v !== "") params.set(k, v); }); return params; }
+function pageParams(name, extra = {}, navigation = null) { const p = navigation || pager(name); const params = new URLSearchParams({ limit: "25" }); if (p.cursor) params.set("cursor", p.cursor); Object.entries(extra).forEach(([k, v]) => { if (v !== undefined && v !== null && v !== "") params.set(k, v); }); return params; }
 function pagerHtml(name) { const p = pager(name); return `<div class="pager"><button data-page-prev="${name}" ${p.loading || p.page <= 1 ? "disabled" : ""}>Назад</button><span>Страница ${p.page}</span><button data-page-next="${name}" ${p.loading || !p.hasMore ? "disabled" : ""}>${p.loading ? "Загрузка…" : "Далее"}</button></div>`; }
-function bindPager(name, renderFn) { const prev = document.querySelector(`[data-page-prev="${name}"]`); const next = document.querySelector(`[data-page-next="${name}"]`); if (prev) prev.onclick = () => { const p = pager(name); if (p.loading || p.page <= 1) return; p.cursor = p.previous.pop() || null; p.page = Math.max(1, p.page - 1); renderFn(); }; if (next) next.onclick = () => { const p = pager(name); if (p.loading || !p.hasMore) return; p.previous.push(p.cursor); p.cursor = p.nextCursor; p.page += 1; renderFn(); }; }
-function applyPage(name, page) { const p = pager(name); p.hasMore = Boolean(page.has_more); p.nextCursor = page.next_cursor || null; return page.items || []; }
-async function guardedPage(name, url) { const p = pager(name); if (p.loading) return null; const version = ++requestVersion; p.loading = true; try { const page = await api(url); if (version !== requestVersion) return null; return applyPage(name, page); } finally { p.loading = false; } }
+function bindPager(name, renderFn) {
+  const navigate = (direction) => {
+    const p = pager(name);
+    if (p.loading || (direction === "back" ? p.page <= 1 : !p.hasMore)) return;
+    const previous = [...p.previous];
+    const navigation = direction === "back"
+      ? { cursor: previous.pop() || null, previous, page: p.page - 1 }
+      : { cursor: p.nextCursor, previous: [...previous, p.cursor], page: p.page + 1 };
+    // The state is only proposed here; guardedPage commits it after success.
+    const request = renderFn(navigation);
+    const requestPager = pagers[name];
+    const generation = requestPager?.generation;
+    const operation = requestPager?.operation;
+    request.catch((err) => {
+      if (pagers[name] !== requestPager || requestPager.generation !== generation || requestPager.operation !== operation) return;
+      showAdminError(safeErrorMessage(err));
+    });
+  };
+  const prev = document.querySelector(`[data-page-prev="${name}"]`);
+  const next = document.querySelector(`[data-page-next="${name}"]`);
+  if (prev) prev.onclick = () => navigate("back");
+  if (next) next.onclick = () => navigate("next");
+}
+async function guardedPage(name, url, navigation = null, isCurrent = () => true) {
+  const p = pager(name);
+  if (p.loading) return null;
+  const generation = p.generation;
+  const operation = ++p.operation;
+  p.loading = true;
+  const isActive = () => isCurrent() && pagers[name] === p && p.generation === generation && p.operation === operation;
+  try {
+    const page = await api(url);
+    if (!isActive()) return null;
+    if (navigation) {
+      p.cursor = navigation.cursor;
+      p.previous = navigation.previous;
+      p.page = navigation.page;
+    }
+    p.hasMore = Boolean(page.has_more);
+    p.nextCursor = page.next_cursor || null;
+    return page.items || [];
+  } catch (err) {
+    if (!isActive()) return null;
+    throw err;
+  } finally {
+    if (pagers[name] === p && p.generation === generation && p.operation === operation) p.loading = false;
+  }
+}
 
 async function renderUser(me) {
   if (me.status === "pending") {
@@ -299,10 +354,10 @@ async function loadUserLists() {
   await refreshFiles();
 }
 
-async function loadUserRequests() {
+async function loadUserRequests(navigation = null) {
   const extra = {};
   if (userStatusFilter !== "all") extra.status = userStatusFilter;
-  const rows = await guardedPage("userUploads", `/api/uploads?${pageParams("userUploads", extra)}`);
+  const rows = await guardedPage("userUploads", `/api/uploads?${pageParams("userUploads", extra, navigation)}`, navigation);
   if (rows === null) return;
   userUploads = rows;
   renderUserRequests();
@@ -360,29 +415,34 @@ function renderUserRequests() {
 }
 
 async function loadAdmin(tab) {
+  const view = { generation: adminView.generation + 1, tab };
+  adminView = view;
+  clearTimeout(adminSearchTimer);
+  const pagerName = { uploads: "adminUploads", users: "adminUsers", renames: "renames", audit: "audit" }[tab];
+  if (pagerName) invalidatePager(pagerName);
   adminContent.innerHTML = '<div id="admin-error" class="muted"></div>';
   try {
-    if (tab === "users") return await renderAdminUsers();
-    if (tab === "renames") return await renderRenameRequests();
-    if (tab === "audit") return await renderAudit();
-    if (tab === "disk-root") return await renderDiskRootSettings();
-    await renderAdminUploads();
-  } catch (err) { showAdminError(safeErrorMessage(err)); }
+    if (tab === "users") return await renderAdminUsers(null, view);
+    if (tab === "renames") return await renderRenameRequests(null, view);
+    if (tab === "audit") return await renderAudit(null, view);
+    if (tab === "disk-root") return await renderDiskRootSettings(view);
+    await renderAdminUploads(null, view);
+  } catch (err) { if (adminView === view) showAdminError(safeErrorMessage(err)); }
 }
 
-async function renderAdminUploads() {
+async function renderAdminUploads(navigation = null, view = adminView) {
   const params = new URLSearchParams();
   if (adminStatusFilter !== "all") params.set("status", adminStatusFilter);
   if (adminUserQuery.trim()) params.set("user_query", adminUserQuery.trim());
-  const pageUrl = `/api/admin/uploads?${pageParams("adminUploads", Object.fromEntries(params))}`;
-  const rows = await guardedPage("adminUploads", pageUrl);
-  if (rows === null) return;
+  const pageUrl = `/api/admin/uploads?${pageParams("adminUploads", Object.fromEntries(params), navigation)}`;
+  const rows = await guardedPage("adminUploads", pageUrl, navigation, () => adminView === view && view.tab === "uploads");
+  if (rows === null || adminView !== view || view.tab !== "uploads") return;
   adminContent.innerHTML = `
     <div id="admin-error" class="muted"></div>
     <div class="admin-tools">${chipHtml(ADMIN_FILTERS, adminStatusFilter, "admin")}
       <div class="search-row"><input id="admin-search" value="${escapeHtml(adminUserQuery)}" placeholder="Поиск по Telegram ID, username или имени"><button id="clear-search" class="secondary">Очистить</button></div>
     </div>` + (rows.map(adminUploadCard).join("") || '<div class="card empty">Заявки не найдены.</div>') + pagerHtml("adminUploads");
-  bindAdminUploadControls();
+  bindAdminUploadControls(view);
 }
 
 function adminUploadCard(r) {
@@ -410,21 +470,21 @@ function adminUploadActions(r) {
   return `${open}<div><b>Загрузка</b>${approve}${conflict}</div>${edit}${reject}`;
 }
 
-function bindAdminUploadControls() {
+function bindAdminUploadControls(view = adminView) {
   document.querySelectorAll("[data-admin-filter]").forEach((button) => {
-    button.onclick = () => { adminStatusFilter = button.dataset.adminFilter; resetPager("adminUploads"); renderAdminUploads(); };
+    button.onclick = () => { if (adminView !== view) return; adminStatusFilter = button.dataset.adminFilter; resetPager("adminUploads"); renderAdminUploads(null, view); };
   });
   document.querySelectorAll("[data-download-id]").forEach((button) => {
     button.onclick = () => downloadTemp(Number.parseInt(button.dataset.downloadId, 10), button.dataset.downloadName || "file");
   });
   const search = document.querySelector("#admin-search");
-  search.oninput = () => { clearTimeout(adminSearchTimer); adminSearchTimer = setTimeout(() => { adminUserQuery = search.value; resetPager("adminUploads"); renderAdminUploads(); }, 300); };
-  document.querySelector("#clear-search").onclick = () => { adminUserQuery = ""; resetPager("adminUploads"); renderAdminUploads(); }; bindPager("adminUploads", renderAdminUploads);
+  search.oninput = () => { clearTimeout(adminSearchTimer); adminSearchTimer = setTimeout(() => { if (adminView !== view || view.tab !== "uploads") return; adminUserQuery = search.value; resetPager("adminUploads"); renderAdminUploads(null, view); }, 300); };
+  document.querySelector("#clear-search").onclick = () => { if (adminView !== view) return; adminUserQuery = ""; resetPager("adminUploads"); renderAdminUploads(null, view); }; bindPager("adminUploads", (navigation) => renderAdminUploads(navigation, view));
 }
 
-async function renderAdminUsers() {
-  const rows = await guardedPage("adminUsers", `/api/admin/users?${pageParams("adminUsers")}`);
-  if (rows === null) return;
+async function renderAdminUsers(navigation = null, view = adminView) {
+  const rows = await guardedPage("adminUsers", `/api/admin/users?${pageParams("adminUsers", {}, navigation)}`, navigation, () => adminView === view && view.tab === "users");
+  if (rows === null || adminView !== view || view.tab !== "users") return;
   adminContent.innerHTML = '<div id="admin-error" class="muted"></div>' + rows.map((u) => `
     <div class="card user-card"><div class="card-head"><b>${escapeHtml(u.full_name || "—")}</b><span class="badge">${escapeHtml(statusLabel(u.status))}</span></div>
       <div class="meta">@${escapeHtml(u.username || "—")} · ID Telegram: ${escapeHtml(u.telegram_id)}</div>
@@ -432,41 +492,114 @@ async function renderAdminUsers() {
       <div class="row">${u.status === "pending" ? ["approve", "reject", "block"].map((a) => `<button onclick="moderateUser(${u.id}, '${a}')">${userActionLabel(a)}</button>`).join("") : ""}</div>
     </div>`).join("") || '<div class="card empty">Пользователей пока нет.</div>';
   adminContent.innerHTML += pagerHtml("adminUsers");
-  bindPager("adminUsers", renderAdminUsers);
+  bindPager("adminUsers", (next) => renderAdminUsers(next, view));
 }
 
 
-async function renderDiskRootSettings() {
-  const current = await api("/api/admin/disk-root");
-  const source = current.source === "env" ? ".env" : "задано администратором";
+async function renderDiskRootSettings(view = adminView) {
+  const getOperation = ++diskRootGetOperation;
   adminContent.innerHTML = `
     <div id="admin-error" class="muted"></div>
     <div class="card">
       <h3>Корневая папка</h3>
-      <div class="meta">Текущая корневая папка: <b>${escapeHtml(current.value)}</b></div>
-      <div class="meta">Источник: ${escapeHtml(source)}</div>
+      <div id="disk-root-current" class="meta">Загрузка…</div>
       <p class="muted">Это общая папка, внутри которой создаются папки пользователей.<br>
       После изменения новые загрузки всех пользователей будут идти в папки внутри новой корневой папки.<br>
       Если папки пользователя там ещё нет, она будет создана повторно.<br>
       Старые файлы не переносятся.</p>
-      <label>Новая корневая папка<input id="disk-root-input" value="${escapeHtml(current.value)}" placeholder="disk:/Telegram Uploads"></label>
-      <button id="save-disk-root">Сохранить корневую папку</button>
-      <div id="disk-root-message" class="status-message"></div>
+      <label>Новая корневая папка<input id="disk-root-input" placeholder="disk:/Telegram Uploads" disabled></label>
+      <button id="save-disk-root" disabled>${diskRootSave.promise ? "Сохранение…" : "Сохранить корневую папку"}</button>
+      <button id="retry-disk-root" class="secondary" disabled>Повторить загрузку</button>
+      <div id="disk-root-message" class="status-message">${escapeHtml(diskRootSave.status)}</div>
     </div>`;
-  document.querySelector("#save-disk-root").onclick = async () => {
-    const msg = document.querySelector("#disk-root-message");
-    try {
-      const root = document.querySelector("#disk-root-input").value;
-      await api("/api/admin/disk-root", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ root }) });
-      msg.textContent = "Корневая папка сохранена.";
-      await renderDiskRootSettings();
-    } catch (err) { showAdminError(safeErrorMessage(err)); }
+  if (diskRootSave.error) showAdminError(diskRootSave.error);
+  const form = {
+    view, getOperation, ready: false,
+    input: document.querySelector("#disk-root-input"),
+    button: document.querySelector("#save-disk-root"),
+    retry: document.querySelector("#retry-disk-root"),
+  };
+  diskRootForm = form;
+  bindDiskRootSave(form);
+  form.retry.onclick = () => {
+    if (!isCurrentDiskRootForm(form)) return;
+    return renderDiskRootSettings(view);
+  };
+  let current;
+  try { current = await api("/api/admin/disk-root"); }
+  catch (err) {
+    if (isCurrentDiskRootForm(form)) {
+      showAdminError(`Не удалось загрузить корневую папку: ${safeErrorMessage(err)}`);
+      form.retry.disabled = false;
+      updateDiskRootControls(form);
+    }
+    return;
+  }
+  if (!isCurrentDiskRootForm(form)) return;
+  const source = current.source === "env" ? ".env" : "задано администратором";
+  document.querySelector("#disk-root-current").innerHTML = `Текущая корневая папка: <b>${escapeHtml(current.value)}</b><div class="meta">Источник: ${escapeHtml(source)}</div>`;
+  form.input.value = current.value;
+  form.ready = true;
+  form.retry.disabled = true;
+  showAdminError(diskRootSave.error);
+  updateDiskRootControls(form);
+}
+
+function isCurrentDiskRootForm(form) {
+  return diskRootForm === form && adminView === form.view && form.view.tab === "disk-root"
+    && form.getOperation === diskRootGetOperation
+    && document.querySelector("#disk-root-input") === form.input
+    && document.querySelector("#save-disk-root") === form.button;
+}
+
+function updateDiskRootControls(form) {
+  if (!isCurrentDiskRootForm(form)) return;
+  const saving = Boolean(diskRootSave.promise);
+  form.input.disabled = !form.ready || saving;
+  form.button.disabled = !form.ready || !form.input.value.trim() || saving;
+  form.button.textContent = saving ? "Сохранение…" : "Сохранить корневую папку";
+}
+
+function bindDiskRootSave(form) {
+  form.input.oninput = () => updateDiskRootControls(form);
+  form.button.onclick = () => {
+    if (diskRootSave.promise) return diskRootSave.promise;
+    if (!isCurrentDiskRootForm(form) || !form.ready) return null;
+    const root = form.input.value.trim();
+    if (!root) { updateDiskRootControls(form); return null; }
+    const operation = ++diskRootSave.operation;
+    diskRootSave.status = ""; diskRootSave.error = "";
+    document.querySelector("#disk-root-message").textContent = "";
+    showAdminError("");
+    const savePromise = api("/api/admin/disk-root", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ root }) })
+      .then(() => {
+        if (operation !== diskRootSave.operation) return;
+        diskRootSave.status = "Корневая папка сохранена.";
+      })
+      .catch((err) => {
+        if (operation !== diskRootSave.operation) return;
+        diskRootSave.error = safeErrorMessage(err);
+        if (adminView.tab === "disk-root") showAdminError(diskRootSave.error);
+      })
+      .finally(() => {
+        if (operation !== diskRootSave.operation || diskRootSave.promise !== savePromise) return;
+        diskRootSave.promise = null;
+        if (adminView.tab === "disk-root") {
+          if (diskRootSave.error) updateDiskRootControls(diskRootForm);
+          else renderDiskRootSettings(adminView).catch((err) => {
+            if (adminView.tab === "disk-root") showAdminError(`Не удалось обновить корневую папку: ${safeErrorMessage(err)}`);
+          });
+        }
+      });
+    diskRootSave.promise = savePromise;
+    updateDiskRootControls(form);
+    return savePromise;
   };
 }
 
-async function renderRenameRequests() {
-  const renameRows = await guardedPage("renames", `/api/admin/folder-rename-requests?${pageParams("renames", { status: "pending" })}`);
-  if (renameRows === null) return;
+async function renderRenameRequests(navigation = null, view = adminView) {
+  const renameRows = await guardedPage("renames", `/api/admin/folder-rename-requests?${pageParams("renames", { status: "pending" }, navigation)}`, navigation, () => adminView === view && view.tab === "renames");
+  if (renameRows === null || adminView !== view || view.tab !== "renames") return;
   const requests = { items: renameRows };
   adminContent.innerHTML = `<div id="admin-error" class="muted"></div>
     <div class="card"><h3>Переименовать папку</h3>
@@ -478,19 +611,21 @@ async function renderRenameRequests() {
     </div>
     <div class="card"><h3>Заявки на переименование</h3><div id="rename-requests"></div></div>`;
   renameSelectionVersion += 1;
-  bindRenameUserSearch();
+  bindRenameUserSearch(view);
   document.querySelector("#rename-user-button").onclick = renameSelectedUserFolder;
   document.querySelector("#rename-requests").innerHTML = (requests.items || []).map((r) => `<div class="request-card"><b>${escapeHtml(r.requested_folder_name)}</b><div class="meta">${escapeHtml(r.user?.telegram_id || "—")} · ${escapeHtml(r.contract_full_name || "—")}</div><button onclick="approveRenameRequest(${r.id}, ${r.user_id})">Одобрить</button><button class="danger" onclick="rejectRenameRequest(${r.id})">Отклонить</button></div>`).join("") || '<div class="empty">Нет pending-заявок.</div>';
   document.querySelector("#rename-requests").innerHTML += pagerHtml("renames");
-  bindPager("renames", renderRenameRequests);
+  bindPager("renames", (next) => renderRenameRequests(next, view));
 }
-function bindRenameUserSearch() {
+function bindRenameUserSearch(view = adminView) {
   const input = document.querySelector("#rename-user-search");
   input.oninput = () => { clearTimeout(adminSearchTimer); adminSearchTimer = setTimeout(async () => {
+    if (adminView !== view || view.tab !== "renames") return;
     const q = input.value.trim(); const box = document.querySelector("#rename-user-results");
     if (!q) { box.innerHTML = ""; return; }
     let data;
-    try { data = await api(`/api/admin/users/search?query=${encodeURIComponent(q)}`); } catch (err) { showAdminError(safeErrorMessage(err)); return; }
+    try { data = await api(`/api/admin/users/search?query=${encodeURIComponent(q)}`); } catch (err) { if (adminView === view) showAdminError(safeErrorMessage(err)); return; }
+    if (adminView !== view || view.tab !== "renames" || document.querySelector("#rename-user-search") !== input) return;
     box.innerHTML = (data.items || []).map((u) => `<button class="dropdown-item" data-user-id="${u.id}">${escapeHtml(u.telegram_id)} · ${escapeHtml(u.contract_full_name || u.full_name || "—")}<br><span class="muted">${escapeHtml(u.folder_name || "—")}</span></button>`).join("");
     box.querySelectorAll("[data-user-id]").forEach((b, i) => b.onclick = () => selectRenameUser(data.items[i]));
   }, 300); };
@@ -558,16 +693,16 @@ async function renameSelectedUserFolder() {
 async function approveRenameRequest(id, userId) { try { const selected = await selectRenameUser({ id: userId }, { showErrors: false }); if (!selected) return; const source_folder = selectedRenameSourceFolder(); if (!source_folder) return showAdminError("Выберите актуальную папку пользователя из списка."); await api(`/api/admin/folder-rename-requests/${id}/approve`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ source_folder }) }); await renderRenameRequests(); } catch (err) { showAdminError(safeErrorMessage(err)); } }
 async function rejectRenameRequest(id) { try { const reason = prompt("Причина", "Отклонено администратором") || "Отклонено администратором"; await api(`/api/admin/folder-rename-requests/${id}/reject`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ reason }) }); await renderRenameRequests(); } catch (err) { showAdminError(safeErrorMessage(err)); } }
 
-async function renderAudit() {
-  const rows = await guardedPage("audit", `/api/admin/audit?${pageParams("audit")}`);
-  if (rows === null) return;
+async function renderAudit(navigation = null, view = adminView) {
+  const rows = await guardedPage("audit", `/api/admin/audit?${pageParams("audit", {}, navigation)}`, navigation, () => adminView === view && view.tab === "audit");
+  if (rows === null || adminView !== view || view.tab !== "audit") return;
   adminContent.innerHTML = '<div id="admin-error" class="muted"></div>' + rows.map((a) => `
     <div class="card audit-card"><b>${escapeHtml(auditLabel(a.action))}</b><br>
       <span class="meta">Администратор: ${escapeHtml(a.actor_telegram_id)}; заявка: ${escapeHtml(a.request_id || "—")}</span>
       <pre>${escapeHtml(JSON.stringify(a.new_value, null, 2))}</pre>
     </div>`).join("") || '<div class="card empty">Аудит пока пуст.</div>';
   adminContent.innerHTML += pagerHtml("audit");
-  bindPager("audit", renderAudit);
+  bindPager("audit", (next) => renderAudit(next, view));
 }
 
 async function downloadTemp(id, filename) {
@@ -594,9 +729,24 @@ async function load() {
     const title = escapeHtml(me.full_name || me.username || me.telegram_id);
     auth.innerHTML = `<div class="card-head"><b>${title}</b><span class="badge">${escapeHtml(statusLabel(me.status))}</span></div><div class="muted">Папка на Яндекс.Диске: ${escapeHtml(userFolderLabel(me))}</div>`;
     await renderUser(me);
-    if (me.is_admin) { adminEl.classList.remove("hidden"); await renderAdminUploads(); }
+    if (me.is_admin) { adminEl.classList.remove("hidden"); await loadAdmin("uploads"); }
   } catch (err) { auth.textContent = safeErrorMessage(err); }
 }
 
 document.querySelectorAll("nav button").forEach((button) => { button.onclick = () => loadAdmin(button.dataset.tab); });
-load();
+if (typeof module !== "undefined" && module.exports && globalThis.__PAGINATION_TEST__) {
+  module.exports = {
+    bindPager,
+    guardedPage,
+    pageParams,
+    pager,
+    resetPager,
+    invalidatePager,
+    loadAdmin,
+    renderDiskRootSettings,
+    setAdminView: (tab) => { adminView = { generation: adminView.generation + 1, tab }; return adminView; },
+    isAdminView: (view) => adminView === view,
+  };
+} else {
+  load();
+}

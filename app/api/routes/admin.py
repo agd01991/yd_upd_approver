@@ -48,7 +48,10 @@ from app.services.upload_queue import (
     enqueue_upload_request,
     reject_upload_request,
 )
-from app.services.user_folders import change_yandex_disk_root_for_active_users
+from app.services.user_folders import (
+    UserFolderConflictError,
+    change_yandex_disk_root_for_active_users,
+)
 from app.services.yandex_disk import YandexDiskClient
 
 router = APIRouter(prefix="/admin", dependencies=[Depends(admin_user_dep)])
@@ -312,6 +315,10 @@ async def put_disk_root(
             session, settings, client, body.root, actor.telegram_id
         )
         await session.commit()
+    except UserFolderConflictError as exc:
+        if hasattr(session, "rollback"):
+            await session.rollback()
+        raise ApiError(409, "folder_conflict", "Папка уже назначена другому пользователю") from exc
     except Exception as exc:
         if hasattr(session, "rollback"):
             await session.rollback()

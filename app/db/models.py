@@ -94,7 +94,9 @@ class User(Base):
         JSONB, default=list, server_default=text("'[]'::jsonb"), nullable=False
     )
     quota_mb: Mapped[int | None] = mapped_column(Integer)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
     approved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     approved_by: Mapped[int | None] = mapped_column(BigInteger)
 
@@ -108,6 +110,7 @@ class FolderRenameRequest(Base):
     __tablename__ = "folder_rename_requests"
     __table_args__ = (
         Index("ix_folder_rename_status_created_id", "status", "created_at", "id"),
+        Index("ix_folder_rename_user_created_id", "user_id", "created_at", "id"),
         Index(
             "uq_folder_rename_pending_user",
             "user_id",
@@ -128,7 +131,9 @@ class FolderRenameRequest(Base):
     source_folder: Mapped[str | None] = mapped_column(String(1024))
     target_folder: Mapped[str | None] = mapped_column(String(1024))
     reject_reason: Mapped[str | None] = mapped_column(Text)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
     reviewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     reviewed_by: Mapped[int | None] = mapped_column(BigInteger)
 
@@ -168,7 +173,9 @@ class UploadRequest(Base):
     )
     admin_comment: Mapped[str | None] = mapped_column(Text)
     reject_reason: Mapped[str | None] = mapped_column(Text)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
     approved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     approved_by: Mapped[int | None] = mapped_column(BigInteger)
     uploaded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -259,4 +266,6 @@ class AuditLog(Base):
     user_id: Mapped[int | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"))
     old_value: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
     new_value: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )

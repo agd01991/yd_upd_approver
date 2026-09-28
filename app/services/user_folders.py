@@ -86,11 +86,12 @@ async def ensure_user_folder_for_current_root(
         if _is_folder_inside_root(user.root_folder, root)
         else stable_user_folder_for_root(root, user)
     )
-    await client.mkdir_recursive(expected)
     if user.root_folder != expected:
         conflict = await find_user_folder_conflict(session, expected, exclude_user_id=user.id)
         if conflict:
             raise UserFolderConflictError("Папка уже назначена другому пользователю")
+    await client.mkdir_recursive(expected)
+    if user.root_folder != expected:
         user.root_folder = expected
         user.allowed_folders = [expected]
         if hasattr(session, "flush"):
@@ -107,8 +108,8 @@ async def change_yandex_disk_root_for_active_users(
 ) -> str:
     old_root = await get_yandex_disk_root(session, settings)
     normalized = validate_yandex_disk_root(root)
-    await client.mkdir_recursive(normalized)
     if normalized == old_root:
+        await client.mkdir_recursive(normalized)
         return old_root
     if hasattr(session, "scalars"):
         users = list(
@@ -117,14 +118,21 @@ async def change_yandex_disk_root_for_active_users(
     else:
         users = []
     updates: list[tuple[User, str]] = []
+    target_owners: dict[str, int] = {}
     for user in users:
         folder = stable_user_folder_for_root(normalized, user)
-        await client.mkdir_recursive(folder)
-        updates.append((user, folder))
-    for user, folder in updates:
+        if folder in target_owners and target_owners[folder] != user.id:
+            raise UserFolderConflictError("Папка уже назначена другому пользователю")
+        target_owners[folder] = user.id
         conflict = await find_user_folder_conflict(session, folder, exclude_user_id=user.id)
         if conflict:
             raise UserFolderConflictError("Папка уже назначена другому пользователю")
+        updates.append((user, folder))
+    # Known database conflicts are checked before any remote side effect.
+    await client.mkdir_recursive(normalized)
+    for _user, folder in updates:
+        await client.mkdir_recursive(folder)
+    for user, folder in updates:
         user.root_folder = folder
         user.allowed_folders = [folder]
     new_root = await set_yandex_disk_root(session, normalized, actor_telegram_id)
