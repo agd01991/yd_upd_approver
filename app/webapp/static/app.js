@@ -163,7 +163,14 @@ function bindPager(name, renderFn) {
       ? { cursor: previous.pop() || null, previous, page: p.page - 1 }
       : { cursor: p.nextCursor, previous: [...previous, p.cursor], page: p.page + 1 };
     // The state is only proposed here; guardedPage commits it after success.
-    renderFn(navigation).catch((err) => showAdminError(safeErrorMessage(err)));
+    const request = renderFn(navigation);
+    const requestPager = pagers[name];
+    const generation = requestPager?.generation;
+    const operation = requestPager?.operation;
+    request.catch((err) => {
+      if (pagers[name] !== requestPager || requestPager.generation !== generation || requestPager.operation !== operation) return;
+      showAdminError(safeErrorMessage(err));
+    });
   };
   const prev = document.querySelector(`[data-page-prev="${name}"]`);
   const next = document.querySelector(`[data-page-next="${name}"]`);
@@ -176,9 +183,10 @@ async function guardedPage(name, url, navigation = null, isCurrent = () => true)
   const generation = p.generation;
   const operation = ++p.operation;
   p.loading = true;
+  const isActive = () => isCurrent() && pagers[name] === p && p.generation === generation && p.operation === operation;
   try {
     const page = await api(url);
-    if (!isCurrent() || pagers[name] !== p || p.generation !== generation || p.operation !== operation) return null;
+    if (!isActive()) return null;
     if (navigation) {
       p.cursor = navigation.cursor;
       p.previous = navigation.previous;
@@ -187,6 +195,9 @@ async function guardedPage(name, url, navigation = null, isCurrent = () => true)
     p.hasMore = Boolean(page.has_more);
     p.nextCursor = page.next_cursor || null;
     return page.items || [];
+  } catch (err) {
+    if (!isActive()) return null;
+    throw err;
   } finally {
     if (pagers[name] === p && p.generation === generation && p.operation === operation) p.loading = false;
   }
@@ -558,6 +569,8 @@ function bindDiskRootSave(form) {
     if (!root) { updateDiskRootControls(form); return null; }
     const operation = ++diskRootSave.operation;
     diskRootSave.status = ""; diskRootSave.error = "";
+    document.querySelector("#disk-root-message").textContent = "";
+    showAdminError("");
     const savePromise = api("/api/admin/disk-root", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ root }) })
       .then(() => {
         if (operation !== diskRootSave.operation) return;
